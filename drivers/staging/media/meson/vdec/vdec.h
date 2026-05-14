@@ -373,6 +373,7 @@ struct amvdec_pending_frame {
 	u32 buf_idx;
 	u32 offset;
 	u32 field;
+	bool is_error;
 };
 
 struct amvdec_session {
