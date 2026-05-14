@@ -504,7 +504,8 @@ EXPORT_SYMBOL_GPL(amvdec_dst_buf_done_ts);
 
 void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
 				struct vb2_v4l2_buffer *vbuf,
-				u32 offset, u32 field, bool allow_drop)
+				u32 offset, u32 field, bool allow_drop,
+				bool is_error)
 {
 	struct device *dev = sess->core->dev_dec;
 	struct amvdec_timestamp *match = NULL;
@@ -604,7 +605,7 @@ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
 	sess->last_ts_done = timestamp;
 
 	dst_buf_done(sess, vbuf, field, timestamp, timecode, vbuf_flags,
-		     VB2_BUF_STATE_DONE);
+		     is_error ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 	/*
 	 * Decrement whether or not offset matched: the firmware produced a
 	 * frame, consuming one queued source slot, regardless of whether we
@@ -661,7 +662,8 @@ void amvdec_dst_buf_done_idx(struct amvdec_session *sess,
 	}
 
 	if (offset != -1)
-		amvdec_dst_buf_done_offset(sess, vbuf, offset, field, true);
+		amvdec_dst_buf_done_offset(sess, vbuf, offset, field, true,
+					   false);
 	else
 		amvdec_dst_buf_done(sess, vbuf, field);
 }
@@ -683,7 +685,8 @@ void amvdec_flush_pending_frames(struct amvdec_session *sess)
 		if (vbuf) {
 			if (pf->offset != -1)
 				amvdec_dst_buf_done_offset(sess, vbuf,
-					pf->offset, pf->field, true);
+					pf->offset, pf->field, true,
+					pf->is_error);
 			else
 				amvdec_dst_buf_done(sess, vbuf, pf->field);
 			list_del(&pf->list);

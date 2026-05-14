@@ -110,7 +110,8 @@ void amvdec_dst_buf_done_ts(struct amvdec_session *sess,
 			    u32 flags);
 void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
 				struct vb2_v4l2_buffer *vbuf,
-				u32 offset, u32 field, bool allow_drop);
+				u32 offset, u32 field, bool allow_drop,
+				bool is_error);
 
 /**
  * amvdec_add_ts() - Add a timestamp to the list
