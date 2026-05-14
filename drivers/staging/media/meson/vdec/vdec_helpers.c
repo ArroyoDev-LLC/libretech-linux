@@ -402,7 +402,8 @@ EXPORT_SYMBOL_GPL(amvdec_remove_ts);
 static void dst_buf_done(struct amvdec_session *sess,
 			 struct vb2_v4l2_buffer *vbuf,
 			 u32 field, u64 timestamp,
-			 struct v4l2_timecode timecode, u32 flags)
+			 struct v4l2_timecode timecode, u32 flags,
+			 u32 state)
 {
 	struct device *dev = sess->core->dev_dec;
 	u32 output_size = amvdec_get_output_size(sess);
@@ -449,7 +450,7 @@ static void dst_buf_done(struct amvdec_session *sess,
 	dev_dbg(dev, "Buffer %u done, ts = %llu, flags = %08X\n",
 		vbuf->vb2_buf.index, timestamp, flags);
 	vbuf->field = field;
-	v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
+	v4l2_m2m_buf_done(vbuf, state);
 
 	/* Buffer done probably means the vififo got freed */
 	schedule_work(&sess->esparser_queue_work);
@@ -484,7 +485,8 @@ void amvdec_dst_buf_done(struct amvdec_session *sess,
 	kfree(tmp);
 	spin_unlock_irqrestore(&sess->ts_spinlock, flags);
 
-	dst_buf_done(sess, vbuf, field, timestamp, timecode, vbuf_flags);
+	dst_buf_done(sess, vbuf, field, timestamp, timecode, vbuf_flags,
+		     VB2_BUF_STATE_DONE);
 	atomic_dec(&sess->esparser_queued_bufs);
 	wake_up(&sess->esparser_queue_done_wq);
 }
@@ -495,7 +497,8 @@ void amvdec_dst_buf_done_ts(struct amvdec_session *sess,
 			    u64 timestamp, struct v4l2_timecode timecode,
 			    u32 flags)
 {
-	dst_buf_done(sess, vbuf, field, timestamp, timecode, flags);
+	dst_buf_done(sess, vbuf, field, timestamp, timecode, flags,
+		     VB2_BUF_STATE_DONE);
 }
 EXPORT_SYMBOL_GPL(amvdec_dst_buf_done_ts);
 
@@ -600,7 +603,8 @@ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
 		timestamp = sess->last_ts_done + 1;
 	sess->last_ts_done = timestamp;
 
-	dst_buf_done(sess, vbuf, field, timestamp, timecode, vbuf_flags);
+	dst_buf_done(sess, vbuf, field, timestamp, timecode, vbuf_flags,
+		     VB2_BUF_STATE_DONE);
 	/*
 	 * Decrement whether or not offset matched: the firmware produced a
 	 * frame, consuming one queued source slot, regardless of whether we
