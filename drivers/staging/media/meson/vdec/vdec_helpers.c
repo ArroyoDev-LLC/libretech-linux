@@ -618,8 +618,9 @@ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
 }
 EXPORT_SYMBOL_GPL(amvdec_dst_buf_done_offset);
 
-void amvdec_dst_buf_done_idx(struct amvdec_session *sess,
-			     u32 buf_idx, u32 offset, u32 field)
+static void dst_buf_done_idx(struct amvdec_session *sess,
+			     u32 buf_idx, u32 offset, u32 field,
+			     bool is_error)
 {
 	struct vb2_v4l2_buffer *vbuf;
 
@@ -650,6 +651,7 @@ void amvdec_dst_buf_done_idx(struct amvdec_session *sess,
 			pf->buf_idx = buf_idx;
 			pf->offset = offset;
 			pf->field = field;
+			pf->is_error = is_error;
 			spin_lock(&sess->pending_frames_lock);
 			list_add_tail(&pf->list, &sess->pending_frames);
 			spin_unlock(&sess->pending_frames_lock);
@@ -663,11 +665,24 @@ void amvdec_dst_buf_done_idx(struct amvdec_session *sess,
 
 	if (offset != -1)
 		amvdec_dst_buf_done_offset(sess, vbuf, offset, field, true,
-					   false);
+					   is_error);
 	else
 		amvdec_dst_buf_done(sess, vbuf, field);
 }
+
+void amvdec_dst_buf_done_idx(struct amvdec_session *sess,
+			     u32 buf_idx, u32 offset, u32 field)
+{
+	dst_buf_done_idx(sess, buf_idx, offset, field, false);
+}
 EXPORT_SYMBOL_GPL(amvdec_dst_buf_done_idx);
+
+void amvdec_dst_buf_done_idx_error(struct amvdec_session *sess,
+				   u32 buf_idx, u32 offset, u32 field)
+{
+	dst_buf_done_idx(sess, buf_idx, offset, field, true);
+}
+EXPORT_SYMBOL_GPL(amvdec_dst_buf_done_idx_error);
 
 void amvdec_flush_pending_frames(struct amvdec_session *sess)
 {

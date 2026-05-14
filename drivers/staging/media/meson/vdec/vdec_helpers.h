@@ -102,6 +102,8 @@ u32 amvdec_am21c_size(u32 width, u32 height, bool is_10bit);
  */
 void amvdec_dst_buf_done_idx(struct amvdec_session *sess, u32 buf_idx,
 			     u32 offset, u32 field);
+void amvdec_dst_buf_done_idx_error(struct amvdec_session *sess, u32 buf_idx,
+				   u32 offset, u32 field);
 void amvdec_dst_buf_done(struct amvdec_session *sess,
 			 struct vb2_v4l2_buffer *vbuf, u32 field);
 void amvdec_dst_buf_done_ts(struct amvdec_session *sess,
