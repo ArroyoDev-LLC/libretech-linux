@@ -1794,33 +1794,32 @@ static void codec_h264_frames_ready(struct amvdec_session *sess, u32 status)
 		u32 offset = (frame_status >> OFFSET_BIT) & OFFSET_MASK;
 		u32 field = V4L2_FIELD_NONE;
 
-		/*
-		 * A buffer decode error means it was decoded,
-		 * but part of the picture will have artifacts.
-		 * Typical reason is a temporarily corrupted bitstream.
-		 * error_proc_policy bit 0 (send_error_frame_flag) controls
-		 * whether error frames are output to userspace or dropped.
-		 * BSP vmh264.c: send_error_frame_flag (bit 0).
-		 */
-		if (frame_status & ERROR_FLAG) {
-			dev_dbg(core->dev, "Buffer %d decode error\n",
-				buffer_index);
-			if (!(sess->error_proc_policy & BIT(0))) {
-				/* Drop error frame -- return DPB slot to firmware
-				 * without delivering the buffer to userspace.
-				 * Use the same recycle path as normal buffer return.
-				 */
-				codec_h264_recycle(core, buffer_index);
-				continue;
-			}
-		}
-
 		if (pic_struct == PIC_TOP_BOT)
 			field = V4L2_FIELD_INTERLACED_TB;
 		else if (pic_struct == PIC_BOT_TOP)
 			field = V4L2_FIELD_INTERLACED_BT;
 
 		offset |= get_offset_msb(core, i);
+
+		/*
+		 * A decode error means the frame was still decoded but part
+		 * of the picture will have artifacts.  error_proc_policy
+		 * bit 0 (send_error_frame_flag) controls whether it is
+		 * delivered as-is or flagged V4L2_BUF_FLAG_ERROR so userspace
+		 * can drop it.  Either way the buffer MUST be delivered: it
+		 * consumes a timestamp-list entry and an esparser_queued_bufs
+		 * slot.  Silently recycling it leaks both and starves
+		 * userspace of a capture buffer.
+		 */
+		if ((frame_status & ERROR_FLAG) &&
+		    !(sess->error_proc_policy & BIT(0))) {
+			dev_dbg(core->dev, "Buffer %d decode error\n",
+				buffer_index);
+			amvdec_dst_buf_done_idx_error(sess, buffer_index,
+						      offset, field);
+			continue;
+		}
+
 		amvdec_dst_buf_done_idx(sess, buffer_index, offset, field);
 	}
 
