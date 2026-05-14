@@ -11,6 +11,7 @@
 #include <linux/device.h>
 #include <linux/ethtool.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/ioport.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -19,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/stmmac.h>
 
+#include "dwmac_dma.h"
 #include "stmmac_platform.h"
 
 #define PRG_ETH0			0x0
@@ -389,6 +391,49 @@ static int meson8b_init_prg_eth(struct meson8b_dwmac *dwmac)
 	return 0;
 }
 
+/*
+ * meson8b_dwmac_fix_reset - DMA reset with PRG_ETH0 re-initialization
+ *
+ * U-Boot may leave the MAC DMA and PRG_ETH0 glue registers in a dirty state
+ * (pending TX descriptors, wrong clock/PHY mode bits). The standard DMA soft
+ * reset only clears the MAC/DMA core but not the Amlogic-specific PRG_ETH0
+ * register, which controls PHY mode, TX clock, and reference clock enables.
+ *
+ * Since meson8b_init_prg_eth() and set_phy_mode() are only called at probe
+ * time, a corrupted PRG_ETH0 persists through every dev_close/dev_open reset
+ * cycle (including TX timeout recovery), causing an infinite TX timeout loop.
+ *
+ * This callback is invoked by stmmac_reset() on every DMA init -- both the
+ * initial dev_open and any subsequent TX timeout reset. It re-writes the
+ * meson-specific glue registers to a known-good state before issuing the
+ * standard DMA soft reset.
+ */
+static int meson8b_dwmac_fix_reset(void *priv, void __iomem *ioaddr)
+{
+	struct plat_stmmacenet_data *plat_dat = priv;
+	struct meson8b_dwmac *dwmac = plat_dat->bsp_priv;
+	u32 value;
+	int ret;
+
+	/* Re-initialize the Amlogic-specific PHY mode and clock registers */
+	ret = dwmac->data->set_phy_mode(dwmac);
+	if (ret)
+		return ret;
+
+	ret = meson8b_init_prg_eth(dwmac);
+	if (ret)
+		return ret;
+
+	/* Standard DMA soft reset */
+	value = readl(ioaddr + DMA_BUS_MODE);
+	value |= DMA_BUS_MODE_SFT_RESET;
+	writel(value, ioaddr + DMA_BUS_MODE);
+
+	return readl_poll_timeout(ioaddr + DMA_BUS_MODE, value,
+				  !(value & DMA_BUS_MODE_SFT_RESET),
+				  10000, 200000);
+}
+
 static int meson8b_dwmac_probe(struct platform_device *pdev)
 {
 	struct plat_stmmacenet_data *plat_dat;
@@ -476,6 +521,7 @@ static int meson8b_dwmac_probe(struct platform_device *pdev)
 		return ret;
 
 	plat_dat->bsp_priv = dwmac;
+	plat_dat->fix_soc_reset = meson8b_dwmac_fix_reset;
 
 	return stmmac_dvr_probe(&pdev->dev, plat_dat, &stmmac_res);
 }

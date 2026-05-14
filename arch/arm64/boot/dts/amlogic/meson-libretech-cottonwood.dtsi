@@ -63,28 +63,24 @@
 	};
 
 	led-blue {
-		compatible = "pwm-leds";
+		compatible = "gpio-leds";
 
 		led {
 			color = <LED_COLOR_ID_BLUE>;
 			function = LED_FUNCTION_ACTIVITY;
-			linux,default-trigger = "heartbeat";
-			max-brightness = <255>;
-			pwms = <&pwm_ab 1 1250 0>;
-			active-low;
+			linux,default-trigger = "activity";
+			gpios = <&gpio GPIOX_7 GPIO_ACTIVE_LOW>;
 		};
 	};
 
 	led-green {
-		compatible = "pwm-leds";
+		compatible = "gpio-leds";
 
 		led {
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_STATUS;
 			linux,default-trigger = "default-on";
-			max-brightness = <255>;
-			pwms = <&pwm_cd 1 1250 0>;
-			active-low;
+			gpios = <&gpio GPIOX_3 GPIO_ACTIVE_LOW>;
 		};
 	};
 
@@ -462,22 +458,6 @@
 	clock-names = "clkin1";
 };
 
-&pwm_ab {
-	status = "okay";
-	pinctrl-0 = <&pwm_b_x7_pins>;
-	pinctrl-names = "default";
-	clocks = <&xtal>;
-	clock-names = "clkin1";
-};
-
-&pwm_cd {
-	status = "okay";
-	pinctrl-0 = <&pwm_d_x3_pins>;
-	pinctrl-names = "default";
-	clocks = <&xtal>;
-	clock-names = "clkin1";
-};
-
 &saradc {
 	status = "okay";
 	vref-supply = <&vddio_ao18>;
@@ -492,8 +472,6 @@
 
 	bus-width = <4>;
 	cap-sd-highspeed;
-	sd-uhs-sdr12;
-	sd-uhs-sdr25;
 	sd-uhs-sdr50;
 	sd-uhs-sdr104;
 	max-frequency = <200000000>;
@@ -539,7 +517,7 @@
 		reg = <0>;
 		#address-cells = <1>;
 		#size-cells = <1>;
-		spi-max-frequency = <80000000>;
+		spi-max-frequency = <83333333>;
 	};
 };
 

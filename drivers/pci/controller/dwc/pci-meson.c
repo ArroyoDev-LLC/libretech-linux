@@ -110,7 +110,7 @@ static int meson_pcie_get_mems(struct platform_device *pdev,
 {
 	struct dw_pcie *pci = &mp->pci;
 
-	pci->dbi_base = devm_platform_ioremap_resource_byname(pdev, "elbi");
+	pci->dbi_base = devm_platform_ioremap_resource_byname(pdev, "dbi");
 	if (IS_ERR(pci->dbi_base))
 		return PTR_ERR(pci->dbi_base);
 

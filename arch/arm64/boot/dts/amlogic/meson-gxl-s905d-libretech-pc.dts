@@ -14,3 +14,16 @@
 		     "amlogic,meson-gxl";
 	model = "Libre Computer AML-S905D-PC";
 };
+
+/ {
+	reserved-memory {
+		linux,cma {
+			/*
+			 * AML-S905D-PC comes in up to 2 GiB RAM variants. Set CMA
+			 * to 448 MiB (max formula for 2 GiB). U-boot caps to
+			 * min(DT, calculated) based on detected RAM.
+			 */
+			size = <0x0 0x1C000000>;
+		};
+	};
+};

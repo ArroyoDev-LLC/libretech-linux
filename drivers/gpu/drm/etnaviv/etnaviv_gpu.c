@@ -23,6 +23,14 @@
 #include "etnaviv_perfmon.h"
 #include "etnaviv_sched.h"
 #include "common.xml.h"
+
+/* WIP r79: NN drain udelay parameterized for empirical sweep.
+ * Default 5000us (current production for A311D). Override via:
+ *   echo N > /sys/module/etnaviv/parameters/npu_drain_udelay
+ * Audit r79: probe minimum value that still produces correct
+ * mobilenet_v1 output. */
+static int npu_drain_udelay = 5000;
+module_param_named(npu_drain_udelay, npu_drain_udelay, int, 0644);
 #include "state.xml.h"
 #include "state_hi.xml.h"
 #include "cmdstream.xml.h"
@@ -182,6 +190,18 @@ int etnaviv_gpu_get_param(struct etnaviv_gpu *gpu, u32 param, u64 *value)
 
 	case ETNAVIV_PARAM_GPU_AXI_SRAM_SIZE:
 		*value = gpu->identity.axi_sram_size;
+		break;
+
+	case ETNAVIV_PARAM_GPU_AXI_SRAM_START:
+		/*
+		 * Only reports non-zero when the kernel coherent alloc
+		 * succeeded AND the chip actually has AXI SRAM. Userspace
+		 * treats 0 as "skip OCB_REMAP programming".
+		 */
+		if (priv->mmu_global && priv->mmu_global->axi_sram_cpu)
+			*value = ETNAVIV_AXI_SRAM_VA;
+		else
+			*value = 0;
 		break;
 
 	default:
@@ -355,7 +375,10 @@ static void etnaviv_hw_identify(struct etnaviv_gpu *gpu)
 {
 	u32 chipIdentity;
 
+	dev_info(gpu->dev, "hw_identify: reading CHIP_IDENTITY at %pR\n",
+		 gpu->mmio);
 	chipIdentity = gpu_read(gpu, VIVS_HI_CHIP_IDENTITY);
+	dev_info(gpu->dev, "hw_identify: CHIP_IDENTITY=0x%08x\n", chipIdentity);
 
 	/* Special case for older graphic cores. */
 	if (etnaviv_field(chipIdentity, VIVS_HI_CHIP_IDENTITY_FAMILY) == 0x01) {
@@ -683,6 +706,10 @@ static void etnaviv_gpu_enable_mlcg(struct etnaviv_gpu *gpu)
 	pmc |= VIVS_PM_MODULE_CONTROLS_DISABLE_MODULE_CLOCK_GATING_RA_HZ;
 	pmc |= VIVS_PM_MODULE_CONTROLS_DISABLE_MODULE_CLOCK_GATING_RA_EZ;
 
+	/* Disable NN clock gating on NPU cores to prevent FE register write stalls */
+	if (gpu->identity.nn_core_count > 0)
+		pmc |= VIVS_PM_MODULE_CONTROLS_DISABLE_MODULE_CLOCK_GATING_NN;
+
 	gpu_write_power(gpu, VIVS_PM_MODULE_CONTROLS, pmc);
 }
 
@@ -700,6 +727,934 @@ void etnaviv_gpu_start_fe(struct etnaviv_gpu *gpu, u32 address, u16 prefetch)
 	}
 }
 
+/*
+ * NN flop reset: run a minimal NN convolution to initialize hardware state.
+ * This is required on NPU-only devices (VIPNano/VIPPico) to reset internal
+ * flip-flop state. Based on galcore's gckHARDWARE_ResetFlopWithNN.
+ *
+ * The nn_data buffer layout (GPU VA mapped via sualloc):
+ *   0x000: NN instruction (128 bytes)
+ *   0x100: NN kernel coefficients (128 bytes)
+ *   0x200: NN input data (64 bytes)
+ *   0x300: NN output data (64 bytes)
+ */
+
+/* PS/PA/GL_API_MODE registers used by NPU paths -- definitions live in state.xml.h */
+
+/* BSP NN instruction data for VIPPico v3 (customerID 0x99, INT8) */
+static const u32 nn_flop_ins[32] = {
+	0xA0100048, 0x001000C0, 0xC8000000, 0x00080080,
+	0x02084001, 0x037FD200, 0xDFF6F000, 0xDFF6E000,
+	0x00012004, 0x00000000, 0x00000000, 0x00000800,
+	0x00000880, 0x00000000, 0x00000800, 0x00000000,
+	0x00020003, 0x01000002, 0x00000000, 0x03FFFFFF,
+	0x00000000, 0x03FFFFFF, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000
+};
+
+/* BSP NN kernel coefficients for VIPPico v3 (2x2x1 INT8 conv) */
+static const u32 nn_flop_ker[32] = {
+	0x01020411, 0x00000100, 0x00000000, 0x00000000,
+	0x00000000, 0x26540781, 0x00000000, 0x00000069,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x0073FFE0, 0xC0003800, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000
+};
+
+static void etnaviv_gpu_nn_flop_reset(struct etnaviv_gpu *gpu)
+{
+	struct etnaviv_cmdbuf *buffer = &gpu->buffer;
+	struct etnaviv_iommu_context *context = gpu->mmu_context;
+	struct drm_mm_node *nn_node = &gpu->nn_flop_node;
+	void *data_cpu = gpu->nn_data_vaddr;
+	dma_addr_t data_paddr = gpu->nn_data_paddr;
+	u32 data_va, inst_va, ker_va, in_va, out_va;
+	u32 *inst;
+	u16 prefetch;
+	u32 cmd_va;
+	int i, ret;
+
+	if (gpu->identity.nn_core_count == 0 || !data_cpu)
+		return;
+
+	/* NN flop reset uses VIPPico v3 (0x99) NNCmd instruction encoding.
+	 * A311D (0x88, VIPNano-QI) has different NN instruction format --
+	 * running the wrong encoding leaves NN in undefined state, producing
+	 * all-zero inference output. Disable until A311D template is added.
+	 */
+	if (gpu->identity.customer_id != 0x99)
+		return;
+
+	/*
+	 * Flop reset is a one-time hardware init. The NN engine retains
+	 * register state from this reset and must not be re-initialized
+	 * on every context switch -- the reserved VAs are stored in the
+	 * gpu struct so they persist across client contexts. Use
+	 * drm_mm_node_allocated() to detect previous success (handles
+	 * partial completion where TP reset failed on a prior call).
+	 */
+	if (drm_mm_node_allocated(nn_node))
+		return;
+
+	/*
+	 * Map the NN data page into GPU VA space above the VIP SRAM window.
+	 * SRAM_REMAP_ADDRESS=0x400000 makes VAs [0x400000, 0x400000+sram_size)
+	 * map to VIP SRAM instead of the MMU. Our data must be above this
+	 * window so the NN engine reads/writes DDR via MMU, not SRAM.
+	 */
+	{
+		u32 sram_end = 0x00400000 + gpu->identity.on_chip_sram_size;
+
+		/* Align up to page boundary */
+		sram_end = ALIGN(sram_end, PAGE_SIZE);
+		if (sram_end < ETNAVIV_SOFTPIN_START_ADDRESS)
+			sram_end = ETNAVIV_SOFTPIN_START_ADDRESS;
+
+		mutex_lock(&context->lock);
+		ret = drm_mm_insert_node_in_range(&context->mm, nn_node,
+						  PAGE_SIZE, 0, 0,
+						  sram_end,
+						  U64_MAX, DRM_MM_INSERT_LOW);
+	}
+	mutex_unlock(&context->lock);
+	if (ret) {
+		dev_err(gpu->dev, "NN flop reset: VA alloc failed: %d\n", ret);
+		return;
+	}
+
+	data_va = nn_node->start;
+	ret = context->global->ops->map(context, data_va, data_paddr,
+					PAGE_SIZE,
+					ETNAVIV_PROT_READ | ETNAVIV_PROT_WRITE);
+	if (ret) {
+		dev_err(gpu->dev, "NN flop reset: IOMMU map failed: %d\n", ret);
+		goto out_remove;
+	}
+
+	inst_va = data_va + 0x000;
+	ker_va  = data_va + 0x100;
+	in_va   = data_va + 0x200;
+	out_va  = data_va + 0x300;
+
+	/* Copy BSP NN instruction and patch addresses */
+	inst = data_cpu;
+	memcpy(inst, nn_flop_ins, sizeof(nn_flop_ins));
+	inst[5] = (ker_va >> 6) & 0x03FFFFFF;
+	inst[6] = in_va;
+	inst[7] = out_va;
+
+	/* Copy NN kernel coefficients at offset 0x100 */
+	memcpy(data_cpu + 0x100, nn_flop_ker, sizeof(nn_flop_ker));
+
+	/* Fill input at offset 0x200: 6 bytes of 0x33 (3x2x1 INT8) */
+	memset(data_cpu + 0x200, 0x33, 64);
+
+	/* Pre-fill output at offset 0x300 with 0xAA to detect NN writes */
+	memset(data_cpu + 0x300, 0xAA, 64);
+
+	wmb();
+
+	dev_info(gpu->dev,
+		 "NN flop reset: inst[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+		 inst[0], inst[1], inst[2], inst[3],
+		 inst[4], inst[5], inst[6], inst[7]);
+	dev_info(gpu->dev,
+		 "NN flop reset: inst[8..15]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+		 inst[8], inst[9], inst[10], inst[11],
+		 inst[12], inst[13], inst[14], inst[15]);
+	dev_info(gpu->dev,
+		 "NN flop reset: data_paddr=0x%llx data_va=0x%08x\n",
+		 (u64)data_paddr, data_va);
+
+	/*
+	 * Build the NNCmd in the ring buffer.
+	 * SRAM_REMAP_ADDRESS=0x400000: VAs 0-0x3FFFFF → VIP SRAM,
+	 * VAs >= 0x400000 → MMU. NN cache uses SRAM, data uses MMU.
+	 *
+	 * Note: GL registers like SRAM_REMAP and NN_CONFIG cannot be read
+	 * via AHB on this chip (sync abort), but can be written via FE
+	 * LOAD_STATE commands.
+	 */
+#define LS(reg, val) do {					\
+	cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE |	\
+		   VIV_FE_LOAD_STATE_HEADER_COUNT(1) |		\
+		   VIV_FE_LOAD_STATE_HEADER_OFFSET(		\
+			(reg) >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR); \
+	cmd[i++] = (val);					\
+} while (0)
+
+	{
+		u32 *cmd = buffer->vaddr;
+
+		i = 0;
+		/*
+		 * HI_REORDER fix: set bit 6 of reg 0x0090 for NN chips
+		 * without AXI SRAM. Cannot read this register via AHB
+		 * (sync abort), so write via FE LOAD_STATE. After reset
+		 * the register is 0, so just write 0x40.
+		 */
+		LS(VIVS_HI_COMPRESSION_FLAGS, 0x40);
+		/*
+		 * Flush MMU TLB: new IOMMU mapping was just created
+		 * for the NN data page. Without this, the GPU's TLB
+		 * may not see the mapping and NN reads/writes go to
+		 * the safe address.
+		 */
+		LS(VIVS_MMUv2_CONFIGURATION,
+		   VIVS_MMUv2_CONFIGURATION_MODE_MASK |
+		   VIVS_MMUv2_CONFIGURATION_FLUSH_FLUSH |
+		   etnaviv_iommuv2_get_mtlb_addr(context));
+		/* WAIT for TLB flush to complete (no PE for STALL) */
+		cmd[i++] = VIV_FE_WAIT_HEADER_OP_WAIT | 32000;
+		cmd[i++] = 0; /* pad to 64-bit alignment */
+		/*
+		 * PA_SYSTEM_MODE and GL_API_MODE must be set before
+		 * NN_INST_ADDR — without OPENCL mode the NN engine
+		 * ignores NN_INST_ADDR writes entirely.
+		 */
+		LS(VIVS_PA_SYSTEM_MODE, 0x11);
+		LS(VIVS_GL_API_MODE, VIVS_GL_API_MODE_OPENCL);
+		LS(VIVS_GL_SRAM_REMAP_ADDRESS, 0x00400000);
+		LS(VIVS_GL_SRAM_REMAP_ADDRESS, 0x00400000);
+		LS(VIVS_GL_OCB_REMAP_START, 0x0);
+		LS(VIVS_GL_OCB_REMAP_END, 0x0);
+		LS(VIVS_GL_NN_CONFIG, VIVS_GL_NN_CONFIG_SMALL_BATCH);
+		LS(VIVS_GL_UNK03950, 0x0);
+		LS(VIVS_GL_SHADER_INDEX, 0x0);
+		LS(VIVS_PS_NN_INST_ADDR, (inst_va >> 6) << 6);
+		LS(VIVS_PS_UNK10A4, 0x0);
+		/*
+		 * No FLUSH_CACHE here! SMALL_BATCH doesn't stall the
+		 * FE on NN_INST_ADDR on this chip, so FE would race
+		 * ahead to FLUSH_CACHE while the NN is still running,
+		 * causing the SH/FE to hang permanently. Instead we
+		 * END here, poll for NN idle, then issue FLUSH_CACHE
+		 * in a separate FE execution.
+		 */
+		cmd[i++] = VIV_FE_END_HEADER_OP_END;
+		cmd[i++] = 0;
+
+		buffer->user_size = i * 4;
+	}
+#undef LS
+
+	prefetch = buffer->user_size / 8;
+	cmd_va = etnaviv_cmdbuf_get_va(buffer,
+				       &gpu->mmu_context->cmdbuf_mapping);
+
+	/* Wait for FE to be fully idle before kicking */
+	if (etnaviv_gpu_wait_idle(gpu, 200)) {
+		dev_warn(gpu->dev,
+			 "NN flop reset: FE not idle before kick, idle=0x%08x\n",
+			 gpu_read(gpu, VIVS_HI_IDLE_STATE));
+	}
+
+	{
+		u32 *cmd = buffer->vaddr;
+		dev_info(gpu->dev,
+			 "NN flop reset: cmd_va=0x%08x data_va=0x%08x idle=0x%08x prefetch=%u\n",
+			 cmd_va, data_va, gpu_read(gpu, VIVS_HI_IDLE_STATE), prefetch);
+		dev_info(gpu->dev,
+			 "NN flop reset: cmd[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 cmd[0], cmd[1], cmd[2], cmd[3],
+			 cmd[4], cmd[5], cmd[6], cmd[7]);
+	}
+
+	etnaviv_gpu_start_fe(gpu, cmd_va, prefetch);
+
+	/*
+	 * Poll for NN idle. SMALL_BATCH doesn't stall the FE on this
+	 * chip, so the FE reaches END while the NN is still running.
+	 * We must wait for the NN to complete before issuing FLUSH_CACHE.
+	 */
+	for (i = 0; i < 50000; i++) {
+		u32 idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
+
+		if (idle == 0x7FFFFFFF)
+			break;
+		udelay(10);
+	}
+
+	{
+		u32 idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
+		u32 dma = gpu_read(gpu, VIVS_FE_DMA_ADDRESS);
+		u8 *out = data_cpu + 0x300;
+
+		dev_info(gpu->dev,
+			 "NN flop reset: after NN idle=0x%08x dma=0x%08x loops=%d out=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+			 idle, dma, i, out[0], out[1], out[2], out[3],
+			 out[4], out[5], out[6], out[7]);
+
+		if (idle != 0x7FFFFFFF) {
+			dev_warn(gpu->dev,
+				 "NN flop reset: NN did not complete, mmu_status=0x%08x exc[0..3]=%08x %08x %08x %08x\n",
+				 gpu_read(gpu, VIVS_MMUv2_STATUS),
+				 gpu_read(gpu, VIVS_MMUv2_EXCEPTION_ADDR(0)),
+				 gpu_read(gpu, VIVS_MMUv2_EXCEPTION_ADDR(1)),
+				 gpu_read(gpu, VIVS_MMUv2_EXCEPTION_ADDR(2)),
+				 gpu_read(gpu, VIVS_MMUv2_EXCEPTION_ADDR(3)));
+			goto out_unmap;
+		}
+	}
+
+	/*
+	 * NN completed. Now issue FLUSH_CACHE in a separate FE
+	 * execution — safe because SH is idle now.
+	 */
+	{
+		u32 *cmd = buffer->vaddr;
+
+		i = 0;
+		cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE |
+			   VIV_FE_LOAD_STATE_HEADER_COUNT(1) |
+			   VIV_FE_LOAD_STATE_HEADER_OFFSET(
+				VIVS_GL_FLUSH_CACHE >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR);
+		cmd[i++] = 0x00000C23;
+		cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE |
+			   VIV_FE_LOAD_STATE_HEADER_COUNT(1) |
+			   VIV_FE_LOAD_STATE_HEADER_OFFSET(
+				VIVS_GL_FLUSH_CACHE >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR);
+		cmd[i++] = 0x00000C23;
+		cmd[i++] = VIV_FE_END_HEADER_OP_END;
+		cmd[i++] = 0;
+
+		buffer->user_size = i * 4;
+		prefetch = buffer->user_size / 8;
+		etnaviv_gpu_start_fe(gpu, cmd_va, prefetch);
+
+		if (etnaviv_gpu_wait_idle(gpu, 200))
+			dev_warn(gpu->dev,
+				 "NN flop reset: FLUSH_CACHE timeout idle=0x%08x\n",
+				 gpu_read(gpu, VIVS_HI_IDLE_STATE));
+		else
+			dev_info(gpu->dev, "NN flop reset: FLUSH_CACHE OK\n");
+	}
+
+	/*
+	 * Second NN run: verify we can run another NN operation after
+	 * FLUSH_CACHE. Reset output and re-run the same instruction.
+	 */
+	{
+		u8 *out = data_cpu + 0x300;
+
+		memset(data_cpu + 0x300, 0xBB, 64);
+		wmb();
+
+		/* Re-build the NNCmd (same as above) */
+		i = 0;
+#define LS(reg, val) do { \
+	cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE | \
+		   VIV_FE_LOAD_STATE_HEADER_COUNT(1) | \
+		   VIV_FE_LOAD_STATE_HEADER_OFFSET( \
+			(reg) >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR); \
+	cmd[i++] = (val); \
+} while (0)
+		{
+			u32 *cmd = buffer->vaddr;
+
+			LS(VIVS_PA_SYSTEM_MODE, 0x11);
+			LS(VIVS_GL_API_MODE, VIVS_GL_API_MODE_OPENCL);
+			LS(VIVS_GL_SRAM_REMAP_ADDRESS, 0x00400000);
+			LS(VIVS_GL_SRAM_REMAP_ADDRESS, 0x00400000);
+			LS(VIVS_GL_OCB_REMAP_START, 0x0);
+			LS(VIVS_GL_OCB_REMAP_END, 0x0);
+			LS(VIVS_GL_NN_CONFIG, 0x10);
+			LS(VIVS_GL_SHADER_INDEX, 0x0);
+			LS(VIVS_PS_NN_INST_ADDR, (inst_va >> 6) << 6);
+			LS(VIVS_PS_UNK10A4, 0x0);
+			cmd[i++] = VIV_FE_END_HEADER_OP_END;
+			cmd[i++] = 0;
+
+			buffer->user_size = i * 4;
+			prefetch = buffer->user_size / 8;
+			etnaviv_gpu_start_fe(gpu, cmd_va, prefetch);
+		}
+#undef LS
+
+		for (i = 0; i < 50000; i++) {
+			u32 idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
+			if (idle == 0x7FFFFFFF)
+				break;
+			udelay(10);
+		}
+
+		dev_info(gpu->dev,
+			 "NN flop reset 2nd: idle=0x%08x loops=%d out=[%02x %02x %02x %02x]\n",
+			 gpu_read(gpu, VIVS_HI_IDLE_STATE), i,
+			 out[0], out[1], out[2], out[3]);
+
+		/* FLUSH_CACHE after 2nd run */
+		{
+			u32 *cmd = buffer->vaddr;
+			i = 0;
+			cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE |
+				   VIV_FE_LOAD_STATE_HEADER_COUNT(1) |
+				   VIV_FE_LOAD_STATE_HEADER_OFFSET(
+					VIVS_GL_FLUSH_CACHE >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR);
+			cmd[i++] = 0x00000C23;
+			cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE |
+				   VIV_FE_LOAD_STATE_HEADER_COUNT(1) |
+				   VIV_FE_LOAD_STATE_HEADER_OFFSET(
+					VIVS_GL_FLUSH_CACHE >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR);
+			cmd[i++] = 0x00000C23;
+			cmd[i++] = VIV_FE_END_HEADER_OP_END;
+			cmd[i++] = 0;
+
+			buffer->user_size = i * 4;
+			prefetch = buffer->user_size / 8;
+			etnaviv_gpu_start_fe(gpu, cmd_va, prefetch);
+
+			if (etnaviv_gpu_wait_idle(gpu, 200))
+				dev_warn(gpu->dev,
+					 "NN flop reset 2nd: FLUSH_CACHE timeout idle=0x%08x\n",
+					 gpu_read(gpu, VIVS_HI_IDLE_STATE));
+			else
+				dev_info(gpu->dev, "NN flop reset 2nd: FLUSH_CACHE OK\n");
+		}
+	}
+
+	/*
+	 * Keep the NN data page mapped in GPU VA space. The NN/TP engines
+	 * retain stale register state referencing the flop reset's VAs.
+	 * If we unmap, subsequent mesa TP/NN operations hit MMU faults
+	 * at these stale addresses (observed: fault at 0x00480400).
+	 * The DMA-coherent page persists for the GPU's lifetime anyway.
+	 */
+	return;
+
+out_unmap:
+	context->global->ops->unmap(context, data_va, PAGE_SIZE);
+out_remove:
+	mutex_lock(&context->lock);
+	drm_mm_remove_node(nn_node);
+	mutex_unlock(&context->lock);
+}
+
+/*
+ * TP flop reset: run a minimal TP transpose to initialize TP hardware state.
+ * Required on VIPPico v3 (customerID 0x99) and VIPNano-SI+ (0x88) where
+ * TP flip-flops are in undefined state after power-on.
+ * Based on galcore's gckHARDWARE_ResetFlopWithTP.
+ *
+ * Data layout within the nn_data buffer (2 pages):
+ *   0x400: TP instructions (8 cores x 128 bytes = 1024 bytes)
+ *   0x800: TP input (64 bytes)
+ *   0x840: TP output (64 bytes)
+ *   0x1000: TP kernel (2048 bytes)
+ */
+
+/* TP dimensions: 1x1x2 input, 1x1x2 kernel (64 units), 1x64x1 output */
+#define TP_CORE_COUNT		8
+
+/*
+ * BSP TP instruction template for VIPPico v3 (customerID 0x99, INT8).
+ * 8 cores x 32 dwords each. Words [10], [11], [13] are patched with
+ * GPU addresses for input, kernel, and output respectively.
+ * Word [12] has the chain bit: 0xC0000002 for cores 0-6, 0x80000002 for core 7.
+ * Kernel addresses differ per core (+0x100 each), output addresses differ (+8 each).
+ */
+static const u32 tp_flop_ins[256] = {
+	/* Core 0 */
+	0x00000001, 0x00020001, 0x00000001, 0x00000001,
+	0x00000000, 0x00000000, 0xA0000E1B, 0x00000000,
+	0x00010001, 0x00010001, 0xDFF6F000, 0xDFF62000,
+	0xC0000002, 0xDFF6E000, 0x00000000, 0x00000000,
+	0x00010001, 0x00000000, 0x00000000, 0x00010001,
+	0x00000001, 0x00000000, 0x00010008, 0x00000000,
+	0x0000240A, 0x00000000, 0x03FFFFFF, 0x00000000,
+	0x03FFFFFF, 0x00000000, 0x00008100, 0x00000000,
+	/* Core 1 */
+	0x00000001, 0x00020001, 0x00000001, 0x00000001,
+	0x00000000, 0x00000000, 0xA0000E1B, 0x00000000,
+	0x00010001, 0x00010001, 0xDFF6F000, 0xDFF62100,
+	0xC0000002, 0xDFF6E008, 0x00000000, 0x00000000,
+	0x00010001, 0x00000000, 0x00000000, 0x00010001,
+	0x00000001, 0x00000000, 0x00010008, 0x00000000,
+	0x0000240A, 0x00000000, 0x03FFFFFF, 0x00000000,
+	0x03FFFFFF, 0x00000000, 0x00008100, 0x00000000,
+	/* Core 2 */
+	0x00000001, 0x00020001, 0x00000001, 0x00000001,
+	0x00000000, 0x00000000, 0xA0000E1B, 0x00000000,
+	0x00010001, 0x00010001, 0xDFF6F000, 0xDFF62200,
+	0xC0000002, 0xDFF6E010, 0x00000000, 0x00000000,
+	0x00010001, 0x00000000, 0x00000000, 0x00010001,
+	0x00000001, 0x00000000, 0x00010008, 0x00000000,
+	0x0000240A, 0x00000000, 0x03FFFFFF, 0x00000000,
+	0x03FFFFFF, 0x00000000, 0x00008100, 0x00000000,
+	/* Core 3 */
+	0x00000001, 0x00020001, 0x00000001, 0x00000001,
+	0x00000000, 0x00000000, 0xA0000E1B, 0x00000000,
+	0x00010001, 0x00010001, 0xDFF6F000, 0xDFF62300,
+	0xC0000002, 0xDFF6E018, 0x00000000, 0x00000000,
+	0x00010001, 0x00000000, 0x00000000, 0x00010001,
+	0x00000001, 0x00000000, 0x00010008, 0x00000000,
+	0x0000240A, 0x00000000, 0x03FFFFFF, 0x00000000,
+	0x03FFFFFF, 0x00000000, 0x00008100, 0x00000000,
+	/* Core 4 */
+	0x00000001, 0x00020001, 0x00000001, 0x00000001,
+	0x00000000, 0x00000000, 0xA0000E1B, 0x00000000,
+	0x00010001, 0x00010001, 0xDFF6F000, 0xDFF62400,
+	0xC0000002, 0xDFF6E020, 0x00000000, 0x00000000,
+	0x00010001, 0x00000000, 0x00000000, 0x00010001,
+	0x00000001, 0x00000000, 0x00010008, 0x00000000,
+	0x0000240A, 0x00000000, 0x03FFFFFF, 0x00000000,
+	0x03FFFFFF, 0x00000000, 0x00008100, 0x00000000,
+	/* Core 5 */
+	0x00000001, 0x00020001, 0x00000001, 0x00000001,
+	0x00000000, 0x00000000, 0xA0000E1B, 0x00000000,
+	0x00010001, 0x00010001, 0xDFF6F000, 0xDFF62500,
+	0xC0000002, 0xDFF6E028, 0x00000000, 0x00000000,
+	0x00010001, 0x00000000, 0x00000000, 0x00010001,
+	0x00000001, 0x00000000, 0x00010008, 0x00000000,
+	0x0000240A, 0x00000000, 0x03FFFFFF, 0x00000000,
+	0x03FFFFFF, 0x00000000, 0x00008100, 0x00000000,
+	/* Core 6 */
+	0x00000001, 0x00020001, 0x00000001, 0x00000001,
+	0x00000000, 0x00000000, 0xA0000E1B, 0x00000000,
+	0x00010001, 0x00010001, 0xDFF6F000, 0xDFF62600,
+	0xC0000002, 0xDFF6E030, 0x00000000, 0x00000000,
+	0x00010001, 0x00000000, 0x00000000, 0x00010001,
+	0x00000001, 0x00000000, 0x00010008, 0x00000000,
+	0x0000240A, 0x00000000, 0x03FFFFFF, 0x00000000,
+	0x03FFFFFF, 0x00000000, 0x00008100, 0x00000000,
+	/* Core 7 (last: chain bit = 0) */
+	0x00000001, 0x00020001, 0x00000001, 0x00000001,
+	0x00000000, 0x00000000, 0xA0000E1B, 0x00000000,
+	0x00010001, 0x00010001, 0xDFF6F000, 0xDFF62700,
+	0x80000002, 0xDFF6E038, 0x00000000, 0x00000000,
+	0x00010001, 0x00000000, 0x00000000, 0x00010001,
+	0x00000001, 0x00000000, 0x00010008, 0x00000000,
+	0x0000240A, 0x00000000, 0x03FFFFFF, 0x00000000,
+	0x03FFFFFF, 0x00000000, 0x00008100, 0x00000000,
+};
+
+/*
+ * BSP TP kernel data for VIPPico v3 (0x99).
+ * 512 dwords = 2048 bytes (TPkerLen=0x800).
+ * 8 blocks of 64 dwords each. Each block has a header word (0x21),
+ * followed by zeros and two sets of {0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F}.
+ */
+static const u32 tp_flop_ker[512] = {
+	/* Block 0 */
+	0x00000021, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	/* Block 1 */
+	0x00000021, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	/* Block 2 */
+	0x00000021, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	/* Block 3 */
+	0x00000021, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	/* Block 4 */
+	0x00000021, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	/* Block 5 */
+	0x00000021, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	/* Block 6 */
+	0x00000021, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	/* Block 7 */
+	0x00000021, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0xFFFFFFF0, 0xFFFFFFFF, 0x0000000F, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+};
+
+static void etnaviv_gpu_tp_flop_reset(struct etnaviv_gpu *gpu)
+{
+	struct etnaviv_cmdbuf *buffer = &gpu->buffer;
+	struct etnaviv_iommu_context *context = gpu->mmu_context;
+	struct drm_mm_node *tp_node = &gpu->tp_flop_node;
+	void *data_cpu = gpu->nn_data_vaddr;
+	dma_addr_t data_paddr = gpu->nn_data_paddr;
+	u32 data_va, inst_va, ker_va, in_va, out_va;
+	u32 *inst;
+	u16 prefetch;
+	u32 cmd_va;
+	u32 ker_anchor, out_anchor;
+	int i, k, ret;
+
+	if (gpu->identity.nn_core_count == 0 || !data_cpu)
+		return;
+
+	/* Only for customerID 0x99 (S905D3 VIPPico v3).
+	 * A311D (0x88, VIPNano-QI) has 4 TP cores vs 8 in S905D3, with
+	 * different TP instruction encoding.  The current tp_flop_ins[]
+	 * template is S905D3-specific and crashes A311D by accessing
+	 * nonexistent TP cores 4-7.  Disable until A311D template is added.
+	 */
+	if (gpu->identity.customer_id != 0x99)
+		return;
+
+	/*
+	 * Flop reset is a one-time hardware init. The TP engine retains
+	 * register state referencing the reserved VAs, so the mapping and
+	 * its drm_mm node live in the gpu struct across the driver's
+	 * lifetime. Use drm_mm_node_allocated() to detect previous success.
+	 */
+	if (drm_mm_node_allocated(tp_node))
+		return;
+
+	/*
+	 * Map 2 pages into GPU VA space for TP data.
+	 * Page 1: TP instructions (0x400), TP input (0x800), TP output (0x840)
+	 * Page 2: TP kernel (0x1000)
+	 */
+	{
+		u32 sram_end = 0x00400000 + gpu->identity.on_chip_sram_size;
+
+		sram_end = ALIGN(sram_end, PAGE_SIZE);
+		if (sram_end < ETNAVIV_SOFTPIN_START_ADDRESS)
+			sram_end = ETNAVIV_SOFTPIN_START_ADDRESS;
+
+		mutex_lock(&context->lock);
+		ret = drm_mm_insert_node_in_range(&context->mm, tp_node,
+						  ETNAVIV_FLOP_DATA_SIZE, 0, 0,
+						  sram_end,
+						  U64_MAX, DRM_MM_INSERT_LOW);
+	}
+	mutex_unlock(&context->lock);
+	if (ret) {
+		dev_err(gpu->dev, "TP flop reset: VA alloc failed: %d\n", ret);
+		return;
+	}
+
+	data_va = tp_node->start;
+	/* Map each page individually (IOMMU only supports SZ_4K per call) */
+	ret = context->global->ops->map(context, data_va, data_paddr,
+					SZ_4K,
+					ETNAVIV_PROT_READ | ETNAVIV_PROT_WRITE);
+	if (ret) {
+		dev_err(gpu->dev, "TP flop reset: IOMMU map page 0 failed: %d\n", ret);
+		goto out_remove;
+	}
+	ret = context->global->ops->map(context, data_va + SZ_4K,
+					data_paddr + SZ_4K,
+					SZ_4K,
+					ETNAVIV_PROT_READ | ETNAVIV_PROT_WRITE);
+	if (ret) {
+		dev_err(gpu->dev, "TP flop reset: IOMMU map page 1 failed: %d\n", ret);
+		goto out_unmap_p0;
+	}
+
+	inst_va = data_va + 0x400;
+	in_va   = data_va + 0x800;
+	out_va  = data_va + 0x840;
+	ker_va  = data_va + 0x1000;
+
+	/* Copy TP instructions and patch addresses */
+	inst = data_cpu + 0x400;
+	memcpy(inst, tp_flop_ins, sizeof(tp_flop_ins));
+
+	/*
+	 * Patch per-core addresses in TP instructions.
+	 * BSP patches: word[10] = inputAddress (same for all cores)
+	 *              word[11] = kernelAddress + (orig[11] - anchor)
+	 *              word[13] = outputAddress + (orig[13] - anchor)
+	 * Anchors are from the BSP template's core 0 values.
+	 */
+	ker_anchor = tp_flop_ins[11]; /* 0xDFF62000 */
+	out_anchor = tp_flop_ins[13]; /* 0xDFF6E000 */
+	for (k = 0; k < TP_CORE_COUNT; k++) {
+		u32 orig_ker = tp_flop_ins[k * 32 + 11];
+		u32 orig_out = tp_flop_ins[k * 32 + 13];
+
+		inst[k * 32 + 10] = in_va;
+		inst[k * 32 + 11] = ker_va + (orig_ker - ker_anchor);
+		inst[k * 32 + 13] = out_va + (orig_out - out_anchor);
+	}
+
+	/* Copy TP kernel at offset 0x1000 */
+	memcpy(data_cpu + 0x1000, tp_flop_ker, sizeof(tp_flop_ker));
+
+	/* Fill TP input at offset 0x800: 2 bytes of 0x33 (1x1x2 INT8) */
+	memset(data_cpu + 0x800, 0x33, 64);
+
+	/* Pre-fill TP output at offset 0x840 with 0xCC to detect writes */
+	memset(data_cpu + 0x840, 0xCC, 64);
+
+	wmb();
+
+	dev_info(gpu->dev,
+		 "TP flop reset: inst_va=0x%08x ker_va=0x%08x in_va=0x%08x out_va=0x%08x\n",
+		 inst_va, ker_va, in_va, out_va);
+
+	/*
+	 * Build the TPCmd in the ring buffer.
+	 * For each core: SRAM_REMAP, OCB_REMAP_START/END, TP_CONFIG=2,
+	 * UNK03950=8, SHADER_INDEX=0, TP_INST_ADDR with chain bit.
+	 * Last core: UNK03950=0, no chain bit.
+	 * Then: PS_UNK10A4=0, END (poll idle, then FLUSH_CACHE separately).
+	 */
+#define LS(reg, val) do {					\
+	cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE |	\
+		   VIV_FE_LOAD_STATE_HEADER_COUNT(1) |		\
+		   VIV_FE_LOAD_STATE_HEADER_OFFSET(		\
+			(reg) >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR); \
+	cmd[i++] = (val);					\
+} while (0)
+
+	{
+		u32 *cmd = buffer->vaddr;
+		u32 core_inst_va;
+
+		i = 0;
+
+		/*
+		 * HI_COMPRESSION_FLAGS and MMU TLB flush, same as NN reset.
+		 */
+		LS(VIVS_HI_COMPRESSION_FLAGS, 0x40);
+		LS(VIVS_MMUv2_CONFIGURATION,
+		   VIVS_MMUv2_CONFIGURATION_MODE_MASK |
+		   VIVS_MMUv2_CONFIGURATION_FLUSH_FLUSH |
+		   etnaviv_iommuv2_get_mtlb_addr(context));
+		cmd[i++] = VIV_FE_WAIT_HEADER_OP_WAIT | 32000;
+		cmd[i++] = 0;
+		LS(VIVS_PA_SYSTEM_MODE, 0x11);
+		LS(VIVS_GL_API_MODE, VIVS_GL_API_MODE_OPENCL);
+
+		for (k = 0; k < TP_CORE_COUNT; k++) {
+			LS(VIVS_GL_SRAM_REMAP_ADDRESS, 0x00400000);
+			LS(VIVS_GL_OCB_REMAP_START, 0x0);
+			LS(VIVS_GL_OCB_REMAP_END, 0x0);
+			LS(VIVS_GL_TP_CONFIG, 0x2);
+
+			if (k < TP_CORE_COUNT - 1) {
+				LS(VIVS_GL_UNK03950, 0x8);
+				LS(VIVS_GL_SHADER_INDEX, 0x0);
+
+				/* TP_INST_ADDR with chain bit for cores 0..6 */
+				core_inst_va = ((inst_va + k * 128) & 0xFFFFFFC0) | 0x1;
+				LS(VIVS_PS_TP_INST_ADDR, core_inst_va);
+			} else {
+				/* Last core: UNK03950=0, no chain bit */
+				LS(VIVS_GL_UNK03950, 0x0);
+				LS(VIVS_GL_SHADER_INDEX, 0x0);
+
+				core_inst_va = (inst_va + k * 128) & 0xFFFFFFC0;
+				LS(VIVS_PS_TP_INST_ADDR, core_inst_va);
+			}
+		}
+
+		LS(VIVS_PS_UNK10A4, 0x0);
+		cmd[i++] = VIV_FE_END_HEADER_OP_END;
+		cmd[i++] = 0;
+
+		buffer->user_size = i * 4;
+	}
+#undef LS
+
+	prefetch = buffer->user_size / 8;
+	cmd_va = etnaviv_cmdbuf_get_va(buffer,
+				       &gpu->mmu_context->cmdbuf_mapping);
+
+	if (etnaviv_gpu_wait_idle(gpu, 200)) {
+		dev_warn(gpu->dev,
+			 "TP flop reset: FE not idle before kick, idle=0x%08x\n",
+			 gpu_read(gpu, VIVS_HI_IDLE_STATE));
+	}
+
+	dev_info(gpu->dev,
+		 "TP flop reset: cmd_va=0x%08x idle=0x%08x prefetch=%u\n",
+		 cmd_va, gpu_read(gpu, VIVS_HI_IDLE_STATE), prefetch);
+
+	etnaviv_gpu_start_fe(gpu, cmd_va, prefetch);
+
+	/* Poll for TP idle */
+	for (i = 0; i < 50000; i++) {
+		u32 idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
+
+		if (idle == 0x7FFFFFFF)
+			break;
+		udelay(10);
+	}
+
+	{
+		u32 idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
+		u8 *out = data_cpu + 0x840;
+
+		dev_info(gpu->dev,
+			 "TP flop reset: idle=0x%08x loops=%d out=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+			 idle, i, out[0], out[1], out[2], out[3],
+			 out[4], out[5], out[6], out[7]);
+
+		if (idle != 0x7FFFFFFF) {
+			dev_warn(gpu->dev,
+				 "TP flop reset: TP did not complete, mmu_status=0x%08x exc[0..3]=%08x %08x %08x %08x\n",
+				 gpu_read(gpu, VIVS_MMUv2_STATUS),
+				 gpu_read(gpu, VIVS_MMUv2_EXCEPTION_ADDR(0)),
+				 gpu_read(gpu, VIVS_MMUv2_EXCEPTION_ADDR(1)),
+				 gpu_read(gpu, VIVS_MMUv2_EXCEPTION_ADDR(2)),
+				 gpu_read(gpu, VIVS_MMUv2_EXCEPTION_ADDR(3)));
+			goto out_unmap;
+		}
+	}
+
+	/* FLUSH_CACHE after TP completion */
+	{
+		u32 *cmd = buffer->vaddr;
+
+		i = 0;
+		cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE |
+			   VIV_FE_LOAD_STATE_HEADER_COUNT(1) |
+			   VIV_FE_LOAD_STATE_HEADER_OFFSET(
+				VIVS_GL_FLUSH_CACHE >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR);
+		cmd[i++] = 0x00000C23;
+		cmd[i++] = VIV_FE_LOAD_STATE_HEADER_OP_LOAD_STATE |
+			   VIV_FE_LOAD_STATE_HEADER_COUNT(1) |
+			   VIV_FE_LOAD_STATE_HEADER_OFFSET(
+				VIVS_GL_FLUSH_CACHE >> VIV_FE_LOAD_STATE_HEADER_OFFSET__SHR);
+		cmd[i++] = 0x00000C23;
+		cmd[i++] = VIV_FE_END_HEADER_OP_END;
+		cmd[i++] = 0;
+
+		buffer->user_size = i * 4;
+		prefetch = buffer->user_size / 8;
+		etnaviv_gpu_start_fe(gpu, cmd_va, prefetch);
+
+		if (etnaviv_gpu_wait_idle(gpu, 200))
+			dev_warn(gpu->dev,
+				 "TP flop reset: FLUSH_CACHE timeout idle=0x%08x\n",
+				 gpu_read(gpu, VIVS_HI_IDLE_STATE));
+		else
+			dev_info(gpu->dev, "TP flop reset: FLUSH_CACHE OK\n");
+	}
+
+	/*
+	 * Keep TP data pages mapped. gpu->tp_flop_node is persistent, so
+	 * the drm_mm rbtree has a valid long-lived pointer that will not
+	 * be invalidated by stack reuse. The node is detected on the next
+	 * call via drm_mm_node_allocated() and the function returns early.
+	 */
+	return;
+
+out_unmap:
+	context->global->ops->unmap(context, data_va + SZ_4K, SZ_4K);
+out_unmap_p0:
+	context->global->ops->unmap(context, data_va, SZ_4K);
+out_remove:
+	mutex_lock(&context->lock);
+	drm_mm_remove_node(tp_node);
+	mutex_unlock(&context->lock);
+}
+
 static void etnaviv_gpu_start_fe_idleloop(struct etnaviv_gpu *gpu,
 					  struct etnaviv_iommu_context *context)
 {
@@ -710,6 +1665,10 @@ static void etnaviv_gpu_start_fe_idleloop(struct etnaviv_gpu *gpu,
 
 	/* setup the MMU */
 	etnaviv_iommu_restore(gpu, context);
+
+	/* Run NN + TP flop reset on NPU devices before starting normal FE loop */
+	etnaviv_gpu_nn_flop_reset(gpu);
+	etnaviv_gpu_tp_flop_reset(gpu);
 
 	/* Start command processor */
 	prefetch = etnaviv_buffer_init(gpu);
@@ -794,9 +1753,13 @@ static void etnaviv_gpu_hw_init(struct etnaviv_gpu *gpu)
 	}
 
 	if (gpu->sec_mode == ETNA_SEC_KERNEL) {
-		u32 val = gpu_read(gpu, VIVS_MMUv2_AHB_CONTROL);
-		val |= VIVS_MMUv2_AHB_CONTROL_NONSEC_ACCESS;
-		gpu_write(gpu, VIVS_MMUv2_AHB_CONTROL, val);
+		/* Deassert AHB reset (set during etnaviv_hw_reset), then
+		 * enable non-secure AHB access. Galcore does:
+		 * write 1 (reset), write 0 (deassert), write 2 (nonsec).
+		 */
+		gpu_write(gpu, VIVS_MMUv2_AHB_CONTROL, 0);
+		gpu_write(gpu, VIVS_MMUv2_AHB_CONTROL,
+			  VIVS_MMUv2_AHB_CONTROL_NONSEC_ACCESS);
 	}
 
 	/* setup the pulse eater */
@@ -807,19 +1770,26 @@ static void etnaviv_gpu_hw_init(struct etnaviv_gpu *gpu)
 	gpu->state = ETNA_GPU_STATE_INITIALIZED;
 }
 
+static void etnaviv_gpu_npu_poll_work(struct work_struct *work);
+
 int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 {
 	struct etnaviv_drm_private *priv = gpu->drm->dev_private;
 	dma_addr_t cmdbuf_paddr;
 	int ret, i;
 
+	dev_info(gpu->dev, "gpu_init: pm_runtime_get_sync\n");
 	ret = pm_runtime_get_sync(gpu->dev);
 	if (ret < 0) {
 		dev_err(gpu->dev, "Failed to enable GPU power domain\n");
 		goto pm_put;
 	}
+	dev_info(gpu->dev, "gpu_init: pm_runtime done ret=%d\n", ret);
 
+	dev_info(gpu->dev, "gpu_init: hw_identify start\n");
 	etnaviv_hw_identify(gpu);
+	dev_info(gpu->dev, "gpu_init: hw_identify done model=0x%x rev=0x%x\n",
+		 gpu->identity.model, gpu->identity.revision);
 
 	if (gpu->identity.model == 0) {
 		dev_err(gpu->dev, "Unknown GPU model\n");
@@ -867,6 +1837,19 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 		goto fail;
 	}
 
+	/* Allocate NN/TP flop reset data buffer for NPU devices */
+	if (gpu->identity.nn_core_count > 0) {
+		gpu->nn_data_vaddr = dma_alloc_wc(gpu->drm->dev,
+						  ETNAVIV_FLOP_DATA_SIZE,
+						  &gpu->nn_data_paddr,
+						  GFP_KERNEL);
+		if (!gpu->nn_data_vaddr) {
+			dev_err(gpu->dev, "could not alloc NN/TP data buffer\n");
+			ret = -ENOMEM;
+			goto fail;
+		}
+	}
+
 	/*
 	 * Set the GPU linear window to cover the cmdbuf region, as the GPU
 	 * won't be able to start execution otherwise. The alignment to 128M is
@@ -901,6 +1884,34 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 	bitmap_zero(gpu->event_bitmap, ETNA_NR_EVENTS);
 	for (i = 0; i < ARRAY_SIZE(gpu->event); i++)
 		complete(&gpu->event_free);
+
+	/*
+	 * NPU completion strategy:
+	 *
+	 * All NPU chips use GL_EVENT FROM_FE for interrupt delivery.
+	 *
+	 * VIPNano-QI (A311D, customer_id 0x88): SMALL_BATCH stalls FE
+	 * at NN_INST_ADDR until NN completes. GL_EVENT fires at the
+	 * right time. ISR signals fence immediately (npu_poll=false).
+	 *
+	 * VIPPico v3 (S905D3, customer_id 0x99): SMALL_BATCH does NOT
+	 * stall FE. GL_EVENT fires before NN completes. ISR defers
+	 * fence to npu_poll_work which waits for NN/TP idle (npu_poll=true).
+	 */
+	if (gpu->identity.nn_core_count > 0) {
+		if (gpu->identity.customer_id == 0x99) {
+			gpu->npu_poll_completion = true;
+			dev_info(gpu->dev,
+				 "NPU: GL_EVENT + deferred poll (VIPPico v3)\n");
+		} else {
+			gpu->npu_poll_completion = false;
+			dev_info(gpu->dev,
+				 "NPU: GL_EVENT immediate (FE stalls)\n");
+		}
+		gpu->npu_poll_event = -1;
+		INIT_DELAYED_WORK(&gpu->npu_poll_work,
+				  etnaviv_gpu_npu_poll_work);
+	}
 
 	/* Now program the hardware */
 	mutex_lock(&gpu->lock);
@@ -1457,6 +2468,56 @@ out_unlock:
 	return gpu_fence;
 }
 
+/*
+ * NPU deferred completion work: called from ISR via schedule_work when
+ * GL_EVENT fires before NN/TP complete (VIPPico v3 where SMALL_BATCH
+ * doesn't stall FE). Waits for NN/TP idle then signals the fence.
+ *
+ * Unlike the old CMD_END approach, FE stays alive (GL_EVENT path),
+ * so no FE restart needed. Just poll idle and signal.
+ */
+static void etnaviv_gpu_npu_poll_work(struct work_struct *work)
+{
+	struct etnaviv_gpu *gpu = container_of(work, struct etnaviv_gpu,
+					       npu_poll_work.work);
+	int event = gpu->npu_poll_event;
+	struct dma_fence *fence;
+	u32 idle;
+	int i;
+
+	if (event < 0 || event >= ETNA_NR_EVENTS)
+		return;
+
+	/*
+	 * Poll for NN and TP idle. The GL_EVENT already fired (FE
+	 * processed the command buffer) but NN/TP are still executing.
+	 * Typical NN ops take 1-500ms depending on layer size.
+	 */
+	for (i = 0; i < 100000; i++) {
+		idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
+		if ((idle & VIVS_HI_IDLE_STATE_NN) &&
+		    (idle & VIVS_HI_IDLE_STATE_TP))
+			break;
+		usleep_range(100, 200);
+	}
+
+	if (i >= 100000)
+		dev_err(gpu->dev,
+			"NPU poll: timeout idle=0x%08x\n", idle);
+
+	/* Signal the fence -- NN/TP data is in DDR (AXI write-through) */
+	fence = gpu->event[event].fence;
+	if (fence) {
+		gpu->event[event].fence = NULL;
+		if (fence_after(fence->seqno, gpu->completed_fence))
+			gpu->completed_fence = fence->seqno;
+		dma_fence_signal(fence);
+	}
+
+	event_free(gpu, event);
+	gpu->npu_poll_event = -1;
+}
+
 static void sync_point_worker(struct work_struct *work)
 {
 	struct etnaviv_gpu *gpu = container_of(work, struct etnaviv_gpu,
@@ -1479,7 +2540,78 @@ void etnaviv_gpu_recover_hang(struct etnaviv_gem_submit *submit)
 	struct task_struct *task;
 	unsigned int i;
 
-	dev_err(gpu->dev, "recover hung GPU!\n");
+	{
+		u32 dma_addr = gpu_read(gpu, VIVS_FE_DMA_ADDRESS);
+		u32 idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
+		u32 fe_debug = gpu_read(gpu, VIVS_FE_DMA_DEBUG_STATE);
+		u32 intr_enbl = gpu_read(gpu, VIVS_HI_INTR_ENBL);
+		u32 intr_ack = gpu_read(gpu, VIVS_HI_INTR_ACKNOWLEDGE);
+		u32 pmc = gpu_read_power(gpu, VIVS_PM_MODULE_CONTROLS);
+		u32 pms = gpu_read_power(gpu, VIVS_PM_MODULE_STATUS);
+		u32 ppc = gpu_read_power(gpu, VIVS_PM_POWER_CONTROLS);
+
+		dev_err(gpu->dev, "recover hung GPU! dma=0x%08x idle=0x%08x fe_dbg=0x%08x intr_en=0x%08x\n",
+			dma_addr, idle, fe_debug, intr_enbl);
+		dev_err(gpu->dev, "  intr_ack=0x%08x pmc=0x%08x pms=0x%08x ppc=0x%08x\n",
+			intr_ack, pmc, pms, ppc);
+
+		/* r91: dump cmdbuf bytes around the hang dma_addr to identify
+		 * the stuck instruction. dma_addr is GPU VA; cmdbuf_va is
+		 * the active submit's cmdbuf GPU VA. Dump 16 words before +
+		 * 16 words after the hang point.
+		 *
+		 * R44 (2026-05-06): also dump kernel ring buffer when hang is
+		 * in ring range -- needed for c64a/0x99 MMU-flush prelude
+		 * stall (dma=0x10b0 in ring at va 0x1000). Pre-R44 only
+		 * dumped per-op cmdbuf, missing ring-buffer hangs entirely.
+		 */
+		if (submit && submit->cmdbuf.vaddr && submit->cmdbuf.size) {
+			u32 cmdbuf_va = etnaviv_cmdbuf_get_va(&submit->cmdbuf,
+				&gpu->mmu_context->cmdbuf_mapping);
+			if (dma_addr >= cmdbuf_va &&
+			    dma_addr < cmdbuf_va + submit->cmdbuf.size) {
+				u32 dma_off = dma_addr - cmdbuf_va;
+				u32 *words = submit->cmdbuf.vaddr;
+				int center = dma_off / 4;
+				int start = center - 8;
+				int end = center + 16;
+				int w;
+				if (start < 0) start = 0;
+				if (end > (int)(submit->cmdbuf.size / 4))
+					end = submit->cmdbuf.size / 4;
+				dev_err(gpu->dev, "cmdbuf hang dump (cmdbuf_va=0x%08x dma_off=0x%x word=%d):\n",
+					cmdbuf_va, dma_off, center);
+				for (w = start; w < end; w++) {
+					dev_err(gpu->dev, "  %s word[%4d]=0x%08x\n",
+						w == center ? "**" : "  ",
+						w, words[w]);
+				}
+			}
+		}
+		if (gpu->buffer.vaddr && gpu->buffer.size) {
+			u32 ring_va = etnaviv_cmdbuf_get_va(&gpu->buffer,
+				&gpu->mmu_context->cmdbuf_mapping);
+			if (dma_addr >= ring_va &&
+			    dma_addr < ring_va + gpu->buffer.size) {
+				u32 dma_off = dma_addr - ring_va;
+				u32 *words = gpu->buffer.vaddr;
+				int center = dma_off / 4;
+				int start = center - 16;
+				int end = center + 16;
+				int w;
+				if (start < 0) start = 0;
+				if (end > (int)(gpu->buffer.size / 4))
+					end = gpu->buffer.size / 4;
+				dev_err(gpu->dev, "ring hang dump (ring_va=0x%08x dma_off=0x%x word=%d):\n",
+					ring_va, dma_off, center);
+				for (w = start; w < end; w++) {
+					dev_err(gpu->dev, "  %s ring[%4d]=0x%08x\n",
+						w == center ? "**" : "  ",
+						w, words[w]);
+				}
+			}
+		}
+	}
 
 	task = get_pid_task(submit->pid, PIDTYPE_PID);
 	if (task) {
@@ -1567,6 +2699,9 @@ static irqreturn_t irq_handler(int irq, void *data)
 
 	u32 intr = gpu_read(gpu, VIVS_HI_INTR_ACKNOWLEDGE);
 
+	if (gpu->identity.nn_core_count > 0)
+		dev_info_ratelimited(gpu->dev, "NPU irq: intr=0x%08x\n", intr);
+
 	if (intr != 0) {
 		ktime_t now = ktime_get();
 		int event;
@@ -1601,11 +2736,67 @@ static irqreturn_t irq_handler(int irq, void *data)
 				queue_work(gpu->wq, &gpu->sync_point_work);
 			}
 
+			/*
+			 * VIPPico v3 deferred completion: GL_EVENT fires
+			 * from FE before NN/TP finish (FE doesn't stall).
+			 * Defer fence signaling to npu_poll_work which
+			 * waits for NN/TP idle then signals.
+			 */
+			if (gpu->npu_poll_completion &&
+			    event == gpu->npu_poll_event) {
+				schedule_work(&gpu->npu_poll_work.work);
+				continue;
+			}
+
 			fence = gpu->event[event].fence;
 			if (!fence)
 				continue;
 
 			gpu->event[event].fence = NULL;
+
+			/*
+			 * A311D (VIPNano-QI v8, customer_id 0x88) hardware
+			 * drain wait. Without this ~1 ms delay before
+			 * signaling the submit fence, mesa's
+			 * pipe_buffer_read of the output BO returns stale
+			 * data from the prior inference (MobileNet v1
+			 * reused-interpreter off-by-one bug). The
+			 * mechanism is a hardware drain (AXI write
+			 * buffer or NN engine output FIFO) that completes
+			 * 400-600 us after NN/TP go idle -- the NN/TP idle
+			 * bits in VIVS_HI_IDLE_STATE are already set at
+			 * fence-signal time, so polling them is useless.
+			 *
+			 * Matrix-driven sweep on 2026-04-13 showed:
+			 *   < 400 us: deterministic 0/7 broken
+			 *   400-500 us: stochastic, partial passes
+			 *   >= 600 us: deterministic 7/7 fixed
+			 * udelay(1000) is a conservative value above the
+			 * stochastic boundary. Validated on A311D with
+			 * 21/21 inferences correct across 3 runs at
+			 * 266 ms/inference (vs 265 ms broken baseline,
+			 * ~0.3 percent overhead).
+			 *
+			 * 1 ms hardirq block is within safe limits at the
+			 * few-per-inference rate the NPU produces. An
+			 * alternative defer-to-workqueue approach
+			 * (schedule_work + npu_poll_work, as customer 0x99
+			 * already uses) also fixes correctness but is ~2x
+			 * slower due to workqueue wakeup latency. udelay
+			 * is simpler and faster.
+			 *
+			 * Investigation log:
+			 * amlogic/software/npu/ANALYSIS.md "A311D
+			 * MobileNet v1 Off-By-One Bug -- BREAKTHROUGH"
+			 * and subsequent matrix v1/v2/v3 sections.
+			 *
+			 * S905D3 (customer 0x99) does NOT need this --
+			 * that path uses npu_poll_completion deferral
+			 * which polls VIVS_HI_IDLE_STATE_NN/_TP before
+			 * signaling, providing the same effective wait.
+			 */
+			if (gpu->identity.customer_id == 0x88)
+				udelay(npu_drain_udelay); /* r79: parameterized */
 
 			/*
 			 * Events can be processed out of order.  Eg,
@@ -1633,22 +2824,27 @@ static int etnaviv_gpu_clk_enable(struct etnaviv_gpu *gpu)
 {
 	int ret;
 
+	dev_info(gpu->dev, "clk_enable: reg\n");
 	ret = clk_prepare_enable(gpu->clk_reg);
 	if (ret)
 		return ret;
 
+	dev_info(gpu->dev, "clk_enable: bus\n");
 	ret = clk_prepare_enable(gpu->clk_bus);
 	if (ret)
 		goto disable_clk_reg;
 
+	dev_info(gpu->dev, "clk_enable: core\n");
 	ret = clk_prepare_enable(gpu->clk_core);
 	if (ret)
 		goto disable_clk_bus;
 
+	dev_info(gpu->dev, "clk_enable: shader\n");
 	ret = clk_prepare_enable(gpu->clk_shader);
 	if (ret)
 		goto disable_clk_core;
 
+	dev_info(gpu->dev, "clk_enable: all done\n");
 	return 0;
 
 disable_clk_core:
@@ -1849,6 +3045,9 @@ static void etnaviv_gpu_unbind(struct device *dev, struct device *master,
 		etnaviv_iommu_context_put(gpu->mmu_context);
 
 	etnaviv_cmdbuf_free(&gpu->buffer);
+	if (gpu->nn_data_vaddr)
+		dma_free_wc(gpu->drm->dev, ETNAVIV_FLOP_DATA_SIZE,
+			    gpu->nn_data_vaddr, gpu->nn_data_paddr);
 	etnaviv_iommu_global_fini(gpu);
 
 	gpu->drm = NULL;

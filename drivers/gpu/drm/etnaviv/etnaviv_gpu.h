@@ -131,6 +131,19 @@ struct etnaviv_gpu {
 
 	/* 'ring'-buffer: */
 	struct etnaviv_cmdbuf buffer;
+	/* NN/TP flop reset data (instruction/kernel/input/output) */
+	void *nn_data_vaddr;
+	dma_addr_t nn_data_paddr;
+#define ETNAVIV_FLOP_DATA_SIZE	(2 * PAGE_SIZE)
+	/*
+	 * Persistent drm_mm nodes for the NN/TP flop reset VA reservations.
+	 * These MUST live in the gpu struct (not on the stack): the IOMMU
+	 * mappings are kept alive for the driver's lifetime because the
+	 * NN/TP engines retain register state referencing these VAs, so
+	 * the drm_mm_node that owns the VA range cannot be released.
+	 */
+	struct drm_mm_node nn_flop_node;
+	struct drm_mm_node tp_flop_node;
 	int exec_state;
 
 	/* event management: */
@@ -174,6 +187,15 @@ struct etnaviv_gpu {
 	unsigned int fe_waitcycles;
 	unsigned long base_rate_core;
 	unsigned long base_rate_shader;
+
+	/* NPU polling completion for chips without SMALL_BATCH support.
+	 * FE cannot write GL registers (like GL_EVENT) when SH is busy
+	 * from NN/TP operations. Instead, FE stops via END command and
+	 * a CPU-side work item polls for NN/TP idle then fires the event.
+	 */
+	bool npu_poll_completion;
+	struct delayed_work npu_poll_work;
+	int npu_poll_event;
 };
 
 static inline void gpu_write(struct etnaviv_gpu *gpu, u32 reg, u32 data)

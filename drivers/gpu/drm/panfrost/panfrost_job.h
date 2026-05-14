@@ -37,6 +37,13 @@ struct panfrost_job {
 	bool is_profiled;
 	ktime_t start_time;
 	u64 start_cycles;
+
+	/* SUBMIT_BATCH: if true, bos/mappings are shared with another job.
+	 * This job must NOT free bos/mappings in panfrost_job_cleanup. */
+	bool shared_bos;
+	/* If true, this job struct was heap-allocated (kzalloc).
+	 * If false, it's stack-allocated and must not be kfreed. */
+	bool heap_alloc;
 };
 
 int panfrost_job_init(struct panfrost_device *pfdev);

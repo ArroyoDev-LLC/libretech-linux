@@ -14,6 +14,7 @@
 #include "lima_bcast.h"
 #include "lima_vm.h"
 #include "lima_regs.h"
+#include "lima_perfcnt.h"
 
 #define pp_write(reg, data) writel(data, ip->iomem + reg)
 #define pp_read(reg) readl(ip->iomem + reg)
@@ -382,6 +383,7 @@ static void lima_pp_task_run(struct lima_sched_pipe *pipe,
 			pp_write(LIMA_PP_STACK, frame->fragment_stack_address[i]);
 			if (!frame->use_dlbu)
 				pp_write(LIMA_PP_FRAME, frame->plbu_array_address[i]);
+			lima_perfcnt_pp_job_start(ip);
 		}
 
 		pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_START_RENDERING);
@@ -403,6 +405,7 @@ static void lima_pp_task_run(struct lima_sched_pipe *pipe,
 
 			lima_pp_write_frame(ip, frame->frame, frame->wb);
 
+			lima_perfcnt_pp_job_start(ip);
 			pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_START_RENDERING);
 		}
 	}
@@ -410,11 +413,15 @@ static void lima_pp_task_run(struct lima_sched_pipe *pipe,
 
 static void lima_pp_task_fini(struct lima_sched_pipe *pipe)
 {
+	int i;
+
+	/* Read perf counters before soft reset clears them */
+	for (i = 0; i < pipe->num_processor; i++)
+		lima_perfcnt_pp_job_done(pipe->processor[i]);
+
 	if (pipe->bcast_processor)
 		lima_pp_soft_reset_async(pipe->bcast_processor);
 	else {
-		int i;
-
 		for (i = 0; i < pipe->num_processor; i++)
 			lima_pp_soft_reset_async(pipe->processor[i]);
 	}

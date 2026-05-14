@@ -22,6 +22,7 @@
 #include <linux/input.h>
 #include <linux/input/touchscreen.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/slab.h>
 #include <linux/pm.h>
 #include <linux/property.h>
@@ -221,7 +222,16 @@ static int get_pendown_state(struct ads7846 *ts)
 	if (ts->get_pendown_state)
 		return ts->get_pendown_state();
 
-	return gpiod_get_value(ts->gpio_pendown);
+	if (ts->gpio_pendown)
+		return gpiod_get_value_cansleep(ts->gpio_pendown);
+
+	/*
+	 * No pendown GPIO — use software pen state. The threaded IRQ
+	 * handler sets ts->pendown based on pressure readings. When pen
+	 * lifts (pressure drops to 0), pendown becomes false and the
+	 * polling loop exits. The next hardware IRQ edge restarts it.
+	 */
+	return ts->pendown;
 }
 
 static void ads7846_report_pen_up(struct ads7846 *ts)
@@ -901,14 +911,27 @@ static void ads7846_report_state(struct ads7846 *ts)
 	 *
 	 * The only safe way to check for the pen up condition is in the
 	 * timer by reading the pen signal state (it's a GPIO _and_ IRQ).
+	 *
+	 * However, when no pendown GPIO is available (IRQ-only mode),
+	 * pressure is our only signal. Mark pen as up when Rt == 0 so
+	 * the polling loop in ads7846_irq() can exit.
 	 */
+	if (!Rt && !ts->gpio_pendown && !ts->get_pendown_state) {
+		trace_printk("Rt=0, pendown=%d -> pen up\n", ts->pendown);
+		ts->pendown = false;
+		return;
+	}
+
+	trace_printk("Rt=%u ignore=%d pendown=%d x=%u y=%u z1=%u z2=%u\n",
+		     Rt, packet->ignore, ts->pendown, x, y, z1, z2);
+
 	if (Rt) {
 		struct input_dev *input = ts->input;
 
 		if (!ts->pendown) {
 			input_report_key(input, BTN_TOUCH, 1);
 			ts->pendown = true;
-			dev_vdbg(&ts->spi->dev, "DOWN\n");
+			trace_printk("BTN_TOUCH DOWN\n");
 		}
 
 		touchscreen_report_pos(input, &ts->core_prop, x, y, false);
@@ -923,7 +946,11 @@ static irqreturn_t ads7846_hard_irq(int irq, void *handle)
 {
 	struct ads7846 *ts = handle;
 
-	return get_pendown_state(ts) ? IRQ_WAKE_THREAD : IRQ_HANDLED;
+	if (!ts->gpio_pendown)
+		return IRQ_WAKE_THREAD;
+
+	return gpiod_get_value(ts->gpio_pendown) ? IRQ_WAKE_THREAD
+						  : IRQ_HANDLED;
 }
 
 
@@ -934,8 +961,14 @@ static irqreturn_t ads7846_irq(int irq, void *handle)
 	/* Start with a small delay before checking pendown state */
 	msleep(TS_POLL_DELAY);
 
-	while (!ts->stopped && get_pendown_state(ts)) {
-
+	/*
+	 * Use do-while: the IRQ fired, so pen is definitely down for the
+	 * first iteration. ads7846_report_state() will set ts->pendown
+	 * true (and send BTN_TOUCH) when it sees pressure, and set it
+	 * false when pressure drops to 0. get_pendown_state() returns
+	 * ts->pendown in IRQ-only mode, so the loop exits on pen lift.
+	 */
+	do {
 		/* pen is down, continue with the measurement */
 		ads7846_read_state(ts);
 
@@ -944,9 +977,9 @@ static irqreturn_t ads7846_irq(int irq, void *handle)
 
 		wait_event_timeout(ts->wait, ts->stopped,
 				   msecs_to_jiffies(TS_POLL_PERIOD));
-	}
+	} while (!ts->stopped && get_pendown_state(ts));
 
-	if (ts->pendown && !ts->stopped)
+	if (!ts->stopped)
 		ads7846_report_pen_up(ts);
 
 	return IRQ_HANDLED;
@@ -1003,15 +1036,27 @@ static int ads7846_setup_pendown(struct spi_device *spi,
 				 const struct ads7846_platform_data *pdata)
 {
 	/*
-	 * REVISIT when the irq can be triggered active-low, or if for some
-	 * reason the touchscreen isn't hooked up, we don't need to access
-	 * the pendown state.
+	 * When an interrupt is defined in the device tree, prefer using it
+	 * directly over a separate pendown-gpio. The PENIRQ output from
+	 * the ADS7846 is typically wired to the same pin used for both the
+	 * interrupt and pendown detection. Reading the pin state via the
+	 * GPIO subsystem is redundant when the IRQ already signals pen
+	 * contact, and on some platforms (e.g. Amlogic meson) the GPIO
+	 * controller is marked can_sleep which causes a WARN_ON when read
+	 * from the hard_irq handler.
+	 *
+	 * Without a pendown GPIO, the hard_irq handler always wakes the
+	 * threaded handler, which determines pen state via SPI reads.
 	 */
-
 	if (pdata->get_pendown_state) {
 		ts->get_pendown_state = pdata->get_pendown_state;
+	} else if (spi->irq) {
+		/* Interrupt defined — use IRQ-only mode, ignore pendown GPIO */
+		dev_info(&spi->dev, "using IRQ-only mode for pen detection\n");
 	} else {
-		ts->gpio_pendown = devm_gpiod_get(&spi->dev, "pendown", GPIOD_IN);
+		/* No interrupt defined, pendown GPIO is required */
+		ts->gpio_pendown = devm_gpiod_get(&spi->dev, "pendown",
+						  GPIOD_IN);
 		if (IS_ERR(ts->gpio_pendown)) {
 			dev_err(&spi->dev, "failed to request pendown GPIO\n");
 			return PTR_ERR(ts->gpio_pendown);
@@ -1351,7 +1396,16 @@ static int ads7846_probe(struct spi_device *spi)
 	if (err)
 		return err;
 
-	irq_flags = pdata->irq_flags ? : IRQF_TRIGGER_FALLING;
+	/*
+	 * Use platform data irq_flags if provided, otherwise read the
+	 * trigger type from the device tree / IRQ descriptor. Fall back
+	 * to IRQF_TRIGGER_FALLING if neither specifies a type.
+	 */
+	irq_flags = pdata->irq_flags;
+	if (!irq_flags)
+		irq_flags = irq_get_trigger_type(spi->irq);
+	if (!irq_flags)
+		irq_flags = IRQF_TRIGGER_FALLING;
 	irq_flags |= IRQF_ONESHOT;
 
 	err = devm_request_threaded_irq(dev, spi->irq,

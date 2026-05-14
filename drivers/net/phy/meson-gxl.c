@@ -53,6 +53,10 @@
 #define FR_PLL_DIV0	0x1c
 #define FR_PLL_DIV1	0x1d
 
+struct meson_gxl_priv {
+	bool wol_enabled;
+};
+
 static int meson_gxl_open_banks(struct phy_device *phydev)
 {
 	int ret;
@@ -129,6 +133,14 @@ static int meson_gxl_config_init(struct phy_device *phydev)
 {
 	int ret;
 
+	if (!phydev->priv) {
+		phydev->priv = devm_kzalloc(&phydev->mdio.dev,
+					    sizeof(struct meson_gxl_priv),
+					    GFP_KERNEL);
+		if (!phydev->priv)
+			return -ENOMEM;
+	}
+
 	/* Enable fractional PLL */
 	ret = meson_gxl_write_reg(phydev, BANK_BIST, FR_PLL_CONTROL, 0x5);
 	if (ret)
@@ -153,10 +165,12 @@ static int meson_gxl_wol_status(struct phy_device *phydev){
 
 static void meson_gxl_get_wol(struct phy_device *phydev, struct ethtool_wolinfo *wol)
 {
+	int int_mask;
+
 	wol->supported = WAKE_MAGIC;
 	wol->wolopts = 0;
 
-	int int_mask = phy_read(phydev, PHY_INT_MASK) & PHY_INT_WOL;
+	int_mask = phy_read(phydev, PHY_INT_MASK);
 	if (int_mask < 0) {
 		wol->supported = 0;
 		return;
@@ -168,30 +182,57 @@ static void meson_gxl_get_wol(struct phy_device *phydev, struct ethtool_wolinfo 
 	memset(wol->sopass, 0, sizeof(wol->sopass));
 }
 
+static int meson_gxl_program_wol_mac(struct phy_device *phydev,
+				      const unsigned char *mac_addr)
+{
+	int ret;
+
+	ret = meson_gxl_write_reg(phydev, BANK_WOL, 0,
+				   mac_addr[5] | mac_addr[4] << 8);
+	if (ret)
+		return ret;
+	ret = meson_gxl_write_reg(phydev, BANK_WOL, 1,
+				   mac_addr[3] | mac_addr[2] << 8);
+	if (ret)
+		return ret;
+	ret = meson_gxl_write_reg(phydev, BANK_WOL, 2,
+				   mac_addr[1] | mac_addr[0] << 8);
+	if (ret)
+		return ret;
+	return meson_gxl_write_reg(phydev, BANK_WOL, 3, 0x9);
+}
+
 static int meson_gxl_set_wol(struct phy_device *phydev, struct ethtool_wolinfo *wol)
 {
+	struct meson_gxl_priv *priv = phydev->priv;
 	struct net_device *ndev = phydev->attached_dev;
-	const unsigned char *mac_addr;
+	int ret;
 
-	if (!ndev) return -ENODEV;
+	if (!ndev)
+		return -ENODEV;
 
-	mac_addr = ndev->dev_addr;
-	pr_debug("meson_gxl_set_wol: mac %pM\n", mac_addr);
+	if (wol->wolopts & ~WAKE_MAGIC)
+		return -EOPNOTSUPP;
 
-	if (wol->wolopts & ~WAKE_MAGIC) return -EOPNOTSUPP;
-
-	if (wol->wolopts & WAKE_MAGIC){
-		/* MAC address */
-		meson_gxl_write_reg(phydev, BANK_WOL, 0, mac_addr[5] | mac_addr[4] << 8);
-		meson_gxl_write_reg(phydev, BANK_WOL, 1, mac_addr[3] | mac_addr[2] << 8);
-		meson_gxl_write_reg(phydev, BANK_WOL, 2, mac_addr[1] | mac_addr[0] << 8);
-		meson_gxl_write_reg(phydev, BANK_WOL, 3, 0x9);
-
-		/* Enable interrupt */
-		phy_write(phydev, PHY_INT_MASK, phy_read(phydev, PHY_INT_MASK) | PHY_INT_WOL);
+	if (wol->wolopts & WAKE_MAGIC) {
+		pr_debug("meson_gxl_set_wol: mac %pM\n", ndev->dev_addr);
+		ret = meson_gxl_program_wol_mac(phydev, ndev->dev_addr);
+		if (ret)
+			return ret;
+		ret = phy_write(phydev, PHY_INT_MASK,
+				phy_read(phydev, PHY_INT_MASK) | PHY_INT_WOL);
+		if (ret)
+			return ret;
+		if (priv)
+			priv->wol_enabled = true;
 		pr_debug("meson_gxl_set_wol: enabled\n");
 	} else {
-		phy_write(phydev, PHY_INT_MASK, phy_read(phydev, PHY_INT_MASK) & ~PHY_INT_WOL);
+		ret = phy_write(phydev, PHY_INT_MASK,
+				phy_read(phydev, PHY_INT_MASK) & ~PHY_INT_WOL);
+		if (ret)
+			return ret;
+		if (priv)
+			priv->wol_enabled = false;
 		pr_debug("meson_gxl_set_wol: disabled\n");
 	}
 
@@ -218,24 +259,42 @@ static int meson_gxl_phy_suspend(struct phy_device *phydev)
 
 static int meson_gxl_phy_resume(struct phy_device *phydev)
 {
+	struct meson_gxl_priv *priv = phydev->priv;
+	/*
+	 * The PHY is reset during stmmac_pltfr_init() before phy_resume is
+	 * called, clearing PHY_INT_MASK.  Read WOL state from software priv
+	 * rather than the (now-reset) hardware register.
+	 */
+	bool wol = priv ? priv->wol_enabled : meson_gxl_wol_status(phydev);
+	struct net_device *ndev;
 	int ret;
-	int wol = meson_gxl_wol_status(phydev);
+
 	pr_debug("%s: wol %d\n", __func__, wol);
 
-	if (wol){
-		// disable aneg comp and link down interrupts
-		pr_debug("%s: int mask %x\n", __func__, phy_read(phydev, PHY_INT_MASK));
-		phy_write(phydev, PHY_INT_MASK, phy_read(phydev, PHY_INT_MASK) | PHY_INT_DEFAULT);
-		pr_debug("%s: int mask %x\n", __func__, phy_read(phydev, PHY_INT_MASK));
-	} else {
-		ret = genphy_resume(phydev); // is this ok for wol case where only the interrupt mask is modified?
-		pr_debug("%s: generic\n", __func__);
+	if (!wol) {
+		ret = genphy_resume(phydev);
 		if (ret)
 			return ret;
 	}
 
 	ret = meson_gxl_config_init(phydev);
-	if (ret) return ret;
+	if (ret)
+		return ret;
+
+	if (wol) {
+		/* Re-program WOL hardware state lost when PHY was reset */
+		ndev = phydev->attached_dev;
+		if (ndev) {
+			ret = meson_gxl_program_wol_mac(phydev, ndev->dev_addr);
+			if (ret)
+				return ret;
+		}
+		phy_write(phydev, PHY_INT_MASK, PHY_INT_DEFAULT | PHY_INT_WOL);
+		pr_debug("%s: wol restored, int mask %x\n", __func__,
+			 phy_read(phydev, PHY_INT_MASK));
+	} else {
+		phy_write(phydev, PHY_INT_MASK, PHY_INT_DEFAULT);
+	}
 
 	return 0;
 }

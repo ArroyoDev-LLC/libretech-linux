@@ -110,8 +110,8 @@ void meson_vpp_init(struct meson_drm *priv)
 		writel_relaxed(VPP_OFIFO_SIZE_DEFAULT,
 			       priv->io_base + _REG(VPP_OFIFO_SIZE));
 	else
-		writel_bits_relaxed(VPP_OFIFO_SIZE_MASK, 0x77f,
-				    priv->io_base + _REG(VPP_OFIFO_SIZE));
+		writel_relaxed(VPP_OFIFO_SIZE_DEFAULT,
+			       priv->io_base + _REG(VPP_OFIFO_SIZE));
 	writel_relaxed(VPP_POSTBLEND_HOLD_LINES(4) | VPP_PREBLEND_HOLD_LINES(4),
 		       priv->io_base + _REG(VPP_HOLD_LINES));
 

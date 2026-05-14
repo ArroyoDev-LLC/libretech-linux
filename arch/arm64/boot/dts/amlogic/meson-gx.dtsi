@@ -21,9 +21,10 @@
 	#size-cells = <2>;
 
 	aliases {
-		mmc0 = &sd_emmc_b; /* SD card */
-		mmc1 = &sd_emmc_c; /* eMMC */
+		mmc0 = &sd_emmc_c; /* SD card */
+		mmc1 = &sd_emmc_b; /* eMMC */
 		mmc2 = &sd_emmc_a; /* SDIO */
+		rtc1 = &vrtc;
 	};
 
 	reserved-memory {
@@ -50,16 +51,19 @@
 		};
 
 		/* 32 MiB reserved for ARM Trusted Firmware (BL32) */
+		/*
 		secmon_reserved_bl32: secmon@5300000 {
 			reg = <0x0 0x05300000 0x0 0x2000000>;
 			no-map;
 		};
+		*/
 
 		linux,cma {
 			compatible = "shared-dma-pool";
 			reusable;
 			size = <0x0 0x10000000>;
 			alignment = <0x0 0x400000>;
+			alloc-ranges = <0x0 0x00000000 0x0 0x40000000>;
 			linux,cma-default;
 		};
 	};
@@ -95,6 +99,7 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x0>;
 			enable-method = "psci";
+			cpu-idle-states = <&CPU_SLEEP_0>;
 			next-level-cache = <&l2>;
 			clocks = <&scpi_dvfs 0>;
 			#cooling-cells = <2>;
@@ -105,6 +110,7 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x1>;
 			enable-method = "psci";
+			cpu-idle-states = <&CPU_SLEEP_0>;
 			next-level-cache = <&l2>;
 			clocks = <&scpi_dvfs 0>;
 			#cooling-cells = <2>;
@@ -115,6 +121,7 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x2>;
 			enable-method = "psci";
+			cpu-idle-states = <&CPU_SLEEP_0>;
 			next-level-cache = <&l2>;
 			clocks = <&scpi_dvfs 0>;
 			#cooling-cells = <2>;
@@ -125,6 +132,7 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x3>;
 			enable-method = "psci";
+			cpu-idle-states = <&CPU_SLEEP_0>;
 			next-level-cache = <&l2>;
 			clocks = <&scpi_dvfs 0>;
 			#cooling-cells = <2>;
@@ -134,6 +142,18 @@
 			compatible = "cache";
 			cache-level = <2>;
 			cache-unified;
+		};
+	};
+
+	idle-states {
+		entry-method = "arm,psci";
+		CPU_SLEEP_0: cpu-sleep-0 {
+			compatible = "arm,idle-state";
+			arm,psci-suspend-param = <0x0010000>;
+			local-timer-stop;
+			entry-latency-us = <8000>;
+			exit-latency-us = <8000>;
+			min-residency-us = <20000>;
 		};
 	};
 
@@ -180,6 +200,11 @@
 							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
+
+				map_vdec {
+					trip = <&cpu_hot>;
+					cooling-device = <&vdec THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
 			};
 		};
 	};
@@ -194,7 +219,7 @@
 	};
 
 	psci {
-		compatible = "arm,psci-0.2";
+		compatible = "arm,psci-1.0";
 		method = "smc";
 	};
 
@@ -333,14 +358,20 @@
 			};
 
 			pwm_ab: pwm@8550 {
-				compatible = "amlogic,meson-gx-pwm", "amlogic,meson-gxbb-pwm";
+				compatible = "amlogic,meson-gxbb-pwm-v2",
+					     "amlogic,meson8-pwm-v2",
+					     "amlogic,meson-gx-pwm",
+					     "amlogic,meson-gxbb-pwm";
 				reg = <0x0 0x08550 0x0 0x10>;
 				#pwm-cells = <3>;
 				status = "disabled";
 			};
 
 			pwm_cd: pwm@8650 {
-				compatible = "amlogic,meson-gx-pwm", "amlogic,meson-gxbb-pwm";
+				compatible = "amlogic,meson-gxbb-pwm-v2",
+					     "amlogic,meson8-pwm-v2",
+					     "amlogic,meson-gx-pwm",
+					     "amlogic,meson-gxbb-pwm";
 				reg = <0x0 0x08650 0x0 0x10>;
 				#pwm-cells = <3>;
 				status = "disabled";
@@ -355,7 +386,10 @@
 			};
 
 			pwm_ef: pwm@86c0 {
-				compatible = "amlogic,meson-gx-pwm", "amlogic,meson-gxbb-pwm";
+				compatible = "amlogic,meson-gxbb-pwm-v2",
+					     "amlogic,meson8-pwm-v2",
+					     "amlogic,meson-gx-pwm",
+					     "amlogic,meson-gxbb-pwm";
 				reg = <0x0 0x086c0 0x0 0x10>;
 				#pwm-cells = <3>;
 				status = "disabled";
@@ -445,6 +479,17 @@
 				compatible = "amlogic,meson-gxbb-scp-shmem";
 				reg = <0x13400 0x400>;
 			};
+
+			/*
+			 * pstore region: 20KB at offset 0x1000.
+			 * Avoids first 4KB (early-boot guard) and stays below
+			 * BL30 mailbox at 0x13000. Survives warm reset.
+			 * Zone split: ~12KB console ring, ~8KB dmesg slot.
+			 */
+			sram_pstore: pstore@1000 {
+				compatible = "amlogic,meson-sram-pstore";
+				reg = <0x1000 0x5000>;
+			};
 		};
 
 		aobus: bus@c8100000 {
@@ -507,7 +552,10 @@
 			};
 
 			pwm_AO_ab: pwm@550 {
-				compatible = "amlogic,meson-gx-ao-pwm", "amlogic,meson-gxbb-ao-pwm";
+				compatible = "amlogic,meson-gxbb-pwm-v2",
+					     "amlogic,meson8-pwm-v2",
+					     "amlogic,meson-gx-ao-pwm",
+					     "amlogic,meson-gxbb-ao-pwm";
 				reg = <0x0 0x00550 0x0 0x10>;
 				#pwm-cells = <3>;
 				status = "disabled";
@@ -533,6 +581,7 @@
 
 			amlogic,ao-sysctrl = <&sysctrl_AO>;
 			amlogic,canvas = <&canvas>;
+			#cooling-cells = <2>;
 		};
 
 		periphs: bus@c8834000 {
@@ -545,6 +594,7 @@
 			hwrng: rng@0 {
 				compatible = "amlogic,meson-rng";
 				reg = <0x0 0x0 0x0 0x4>;
+				quality = <1000>;
 			};
 		};
 
@@ -634,13 +684,14 @@
 
 		vpu: vpu@d0100000 {
 			compatible = "amlogic,meson-gx-vpu";
-			reg = <0x0 0xd0100000 0x0 0x100000>,
+			reg = <0x0 0xd0100000 0x0 0x40000>,
 			      <0x0 0xc883c000 0x0 0x1000>;
 			reg-names = "vpu", "hhi";
 			interrupts = <GIC_SPI 3 IRQ_TYPE_EDGE_RISING>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			amlogic,canvas = <&canvas>;
+			amlogic,hhi = <&sysctrl>;
 
 			/* CVBS VDAC output port */
 			cvbs_vdac_port: port@0 {

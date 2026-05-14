@@ -9,9 +9,12 @@
  */
 
 #include <linux/component.h>
+#include <linux/debugfs.h>
 #include <linux/module.h>
 #include <linux/of_graph.h>
+#include <linux/seq_file.h>
 #include <linux/sys_soc.h>
+#include <linux/mfd/syscon.h>
 #include <linux/platform_device.h>
 #include <linux/soc/amlogic/meson-canvas.h>
 
@@ -29,7 +32,9 @@
 #include "meson_crtc.h"
 #include "meson_drv.h"
 #include "meson_overlay.h"
+#include "meson_writeback.h"
 #include "meson_plane.h"
+#include "meson_plane2.h"
 #include "meson_osd_afbcd.h"
 #include "meson_registers.h"
 #include "meson_encoder_cvbs.h"
@@ -91,6 +96,48 @@ static int meson_dumb_create(struct drm_file *file, struct drm_device *dev,
 	return drm_gem_dma_dumb_create_internal(file, dev, args);
 }
 
+/* VENC Test Pattern Generator (debugfs) */
+
+static int meson_venc_tpg_show(struct seq_file *m, void *data)
+{
+	struct drm_device *dev = m->private;
+	struct meson_drm *priv = dev->dev_private;
+
+	seq_printf(m, "%d\n",
+		   readl_relaxed(priv->io_base + _REG(VENC_VIDEO_TST_EN)) & 1);
+	return 0;
+}
+
+static ssize_t meson_venc_tpg_write(struct file *file,
+				    const char __user *ubuf,
+				    size_t len, loff_t *offp)
+{
+	struct seq_file *m = file->private_data;
+	struct drm_device *dev = m->private;
+	struct meson_drm *priv = dev->dev_private;
+	int val;
+
+	if (kstrtoint_from_user(ubuf, len, 0, &val))
+		return -EFAULT;
+
+	if (val) {
+		writel_relaxed(1, priv->io_base + _REG(VENC_VIDEO_TST_MDSEL));
+		writel_relaxed(1, priv->io_base + _REG(VENC_VIDEO_TST_EN));
+	} else {
+		writel_relaxed(0, priv->io_base + _REG(VENC_VIDEO_TST_EN));
+	}
+
+	return len;
+}
+
+DEFINE_SHOW_STORE_ATTRIBUTE(meson_venc_tpg);
+
+static void meson_debugfs_init(struct drm_minor *minor)
+{
+	debugfs_create_file("venc_tpg", 0600, minor->debugfs_root,
+			    minor->dev, &meson_venc_tpg_fops);
+}
+
 DEFINE_DRM_GEM_DMA_FOPS(fops);
 
 static const struct drm_driver meson_driver = {
@@ -101,6 +148,7 @@ static const struct drm_driver meson_driver = {
 
 	/* Misc */
 	.fops			= &fops,
+	.debugfs_init		= meson_debugfs_init,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.date			= "20161109",
@@ -138,12 +186,11 @@ static void meson_vpu_init(struct meson_drm *priv)
 	u32 value;
 
 	/*
-	 * Slave dc0 and dc5 connected to master port 1.
-	 * By default other slaves are connected to master port 0.
+	 * L1C1 read arbiter: keep all slaves on master port 0.
+	 * BSP uses 0 here; splitting dc0/dc5 to port 1 can cause
+	 * bandwidth starvation at high resolutions.
 	 */
-	value = VPU_RDARB_SLAVE_TO_MASTER_PORT(0, 1) |
-		VPU_RDARB_SLAVE_TO_MASTER_PORT(5, 1);
-	writel_relaxed(value, priv->io_base + _REG(VPU_RDARB_MODE_L1C1));
+	writel_relaxed(0, priv->io_base + _REG(VPU_RDARB_MODE_L1C1));
 
 	/* Slave dc0 connected to master port 1 */
 	value = VPU_RDARB_SLAVE_TO_MASTER_PORT(0, 1);
@@ -220,24 +267,31 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 
 	priv->io_base = regs;
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "hhi");
-	if (!res) {
-		ret = -EINVAL;
-		goto free_drm;
-	}
-	/* Simply ioremap since it may be a shared register zone */
-	regs = devm_ioremap(dev, res->start, resource_size(res));
-	if (!regs) {
-		ret = -EADDRNOTAVAIL;
-		goto free_drm;
-	}
-
-	priv->hhi = devm_regmap_init_mmio(dev, regs,
-					  &meson_regmap_config);
+	/*
+	 * Use the HHI syscon regmap if available (shares lock with clock
+	 * driver, preventing PLL register races). Fall back to independent
+	 * ioremap for old DTBs without the amlogic,hhi phandle.
+	 */
+	priv->hhi = syscon_regmap_lookup_by_phandle(dev->of_node,
+						    "amlogic,hhi");
 	if (IS_ERR(priv->hhi)) {
-		dev_err(&pdev->dev, "Couldn't create the HHI regmap\n");
-		ret = PTR_ERR(priv->hhi);
-		goto free_drm;
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "hhi");
+		if (!res) {
+			ret = -EINVAL;
+			goto free_drm;
+		}
+		regs = devm_ioremap(dev, res->start, resource_size(res));
+		if (!regs) {
+			ret = -EADDRNOTAVAIL;
+			goto free_drm;
+		}
+		priv->hhi = devm_regmap_init_mmio(dev, regs,
+						  &meson_regmap_config);
+		if (IS_ERR(priv->hhi)) {
+			dev_err(&pdev->dev, "Couldn't create the HHI regmap\n");
+			ret = PTR_ERR(priv->hhi);
+			goto free_drm;
+		}
 	}
 
 	priv->canvas = meson_canvas_get(dev);
@@ -249,9 +303,12 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_osd1);
 	if (ret)
 		goto free_drm;
-	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_0);
+	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_osd2);
 	if (ret)
 		goto free_canvas_osd1;
+	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_0);
+	if (ret)
+		goto free_canvas_osd2;
 	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_1);
 	if (ret)
 		goto free_canvas_vd1_0;
@@ -284,13 +341,8 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		goto free_canvas_vd1_2;
-	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
-		drm->mode_config.max_width = 3840;
-		drm->mode_config.max_height = 3840;
-	} else {
-		drm->mode_config.max_width = 1920;
-		drm->mode_config.max_height = 1920;
-	}
+	drm->mode_config.max_width = 4096;
+	drm->mode_config.max_height = 4096;
 	drm->mode_config.funcs = &meson_mode_config_funcs;
 	drm->mode_config.helper_private	= &meson_mode_config_helpers;
 
@@ -336,6 +388,10 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 	if (ret)
 		goto exit_afbcd;
 
+	ret = meson_plane2_create(priv);
+	if (ret)
+		goto exit_afbcd;
+
 	ret = meson_overlay_create(priv);
 	if (ret)
 		goto exit_afbcd;
@@ -343,6 +399,21 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 	ret = meson_crtc_create(priv);
 	if (ret)
 		goto exit_afbcd;
+
+	ret = meson_writeback_create(priv);
+	if (ret)
+		goto exit_afbcd;
+
+	/* Allow writeback encoder to clone with any display encoder */
+	{
+		struct drm_encoder *enc;
+		u32 all_mask = 0;
+
+		drm_for_each_encoder(enc, drm)
+			all_mask |= drm_encoder_mask(enc);
+		drm_for_each_encoder(enc, drm)
+			enc->possible_clones = all_mask;
+	}
 
 	ret = request_irq(priv->vsync_irq, meson_irq, 0, drm->driver->name, drm);
 	if (ret)
@@ -373,6 +444,8 @@ free_canvas_vd1_1:
 	meson_canvas_free(priv->canvas, priv->canvas_id_vd1_1);
 free_canvas_vd1_0:
 	meson_canvas_free(priv->canvas, priv->canvas_id_vd1_0);
+free_canvas_osd2:
+	meson_canvas_free(priv->canvas, priv->canvas_id_osd2);
 free_canvas_osd1:
 	meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
 free_drm:
@@ -400,6 +473,7 @@ static void meson_drv_unbind(struct device *dev)
 
 	if (priv->canvas) {
 		meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
+		meson_canvas_free(priv->canvas, priv->canvas_id_osd2);
 		meson_canvas_free(priv->canvas, priv->canvas_id_vd1_0);
 		meson_canvas_free(priv->canvas, priv->canvas_id_vd1_1);
 		meson_canvas_free(priv->canvas, priv->canvas_id_vd1_2);

@@ -199,8 +199,8 @@ static struct meson_ee_pwrc_mem_domain sm1_pwrc_mem_vpu[] = {
 };
 
 static struct meson_ee_pwrc_mem_domain sm1_pwrc_mem_nna[] = {
-	{ HHI_NANOQ_MEM_PD_REG0, 0xff },
-	{ HHI_NANOQ_MEM_PD_REG1, 0xff },
+	{ HHI_NANOQ_MEM_PD_REG0, GENMASK(31, 0) },
+	{ HHI_NANOQ_MEM_PD_REG1, GENMASK(31, 0) },
 };
 
 static struct meson_ee_pwrc_mem_domain sm1_pwrc_mem_usb[] = {
@@ -398,19 +398,27 @@ static int meson_ee_pwrc_on(struct generic_pm_domain *domain)
 		container_of(domain, struct meson_ee_pwrc_domain, base);
 	int i, ret;
 
+	pr_info("meson-ee-pwrc: powering on %s\n", domain->name);
+
 	if (pwrc_domain->desc.top_pd)
 		regmap_update_bits(pwrc_domain->pwrc->regmap_ao,
 				   pwrc_domain->desc.top_pd->sleep_reg,
 				   pwrc_domain->desc.top_pd->sleep_mask, 0);
 	udelay(20);
 
-	for (i = 0 ; i < pwrc_domain->desc.mem_pd_count ; ++i)
+	for (i = 0 ; i < pwrc_domain->desc.mem_pd_count ; ++i) {
+		pr_info("meson-ee-pwrc: %s mem_pd[%d] reg=0x%x mask=0x%x\n",
+			domain->name, i,
+			pwrc_domain->desc.mem_pd[i].reg,
+			pwrc_domain->desc.mem_pd[i].mask);
 		regmap_update_bits(pwrc_domain->pwrc->regmap_hhi,
 				   pwrc_domain->desc.mem_pd[i].reg,
 				   pwrc_domain->desc.mem_pd[i].mask, 0);
+	}
 
 	udelay(20);
 
+	pr_info("meson-ee-pwrc: %s reset assert\n", domain->name);
 	ret = reset_control_assert(pwrc_domain->rstc);
 	if (ret)
 		return ret;
@@ -420,12 +428,18 @@ static int meson_ee_pwrc_on(struct generic_pm_domain *domain)
 				   pwrc_domain->desc.top_pd->iso_reg,
 				   pwrc_domain->desc.top_pd->iso_mask, 0);
 
+	pr_info("meson-ee-pwrc: %s reset deassert\n", domain->name);
 	ret = reset_control_deassert(pwrc_domain->rstc);
 	if (ret)
 		return ret;
 
-	return clk_bulk_prepare_enable(pwrc_domain->num_clks,
+	pr_info("meson-ee-pwrc: %s clk_bulk_prepare_enable (%d clks)\n",
+		domain->name, pwrc_domain->num_clks);
+	ret = clk_bulk_prepare_enable(pwrc_domain->num_clks,
 				       pwrc_domain->clks);
+	pr_info("meson-ee-pwrc: %s power on complete ret=%d\n",
+		domain->name, ret);
+	return ret;
 }
 
 static int meson_ee_pwrc_init_domain(struct platform_device *pdev,

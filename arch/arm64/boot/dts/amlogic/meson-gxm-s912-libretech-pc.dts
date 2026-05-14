@@ -64,3 +64,16 @@
 &usb2_phy2 {
 	phy-supply = <&typec2_vbus>;
 };
+
+/ {
+	reserved-memory {
+		linux,cma {
+			/*
+			 * AML-S912-PC comes in up to 3 GiB RAM variants. Set CMA
+			 * to 672 MiB (max formula for 3 GiB). U-boot caps to
+			 * min(DT, calculated) based on detected RAM.
+			 */
+			size = <0x0 0x2A000000>;
+		};
+	};
+};

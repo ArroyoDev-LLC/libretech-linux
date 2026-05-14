@@ -14,6 +14,18 @@
 	compatible = "amlogic,meson-gxl";
 
 	soc {
+		ge2d: ge2d@d0160000 {
+			compatible = "amlogic,gxl-ge2d";
+			reg = <0x0 0xd0160000 0x0 0x10000>;
+			interrupts = <GIC_SPI 150 IRQ_TYPE_EDGE_RISING>;
+			clocks = <&clkc CLKID_VAPB>, <&clkc CLKID_G2D>;
+			clock-names = "vapb", "g2d";
+			resets = <&reset RESET_GE2D>;
+			amlogic,canvas = <&canvas>;
+			power-domains = <&pwrc PWRC_GXBB_VPU_ID>;
+			#cooling-cells = <2>;
+		};
+
 		usb: usb@d0078080 {
 			compatible = "amlogic,meson-gxl-usb-ctrl";
 			reg = <0x0 0xd0078080 0x0 0x20>;
@@ -163,7 +175,7 @@
 			mux {
 				groups = "uart_tx_ao_a", "uart_rx_ao_a";
 				function = "uart_ao";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -180,7 +192,7 @@
 			mux {
 				groups = "uart_tx_ao_b", "uart_rx_ao_b";
 				function = "uart_ao_b";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -188,7 +200,7 @@
 			mux {
 				groups = "uart_tx_ao_b_0", "uart_rx_ao_b_1";
 				function = "uart_ao_b";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -214,7 +226,7 @@
 				groups = "i2c_sck_ao",
 				       "i2c_sda_ao";
 				function = "i2c_ao";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -286,7 +298,7 @@
 			mux {
 				groups = "ao_cec";
 				function = "cec_ao";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -522,7 +534,7 @@
 				groups = "uart_tx_a",
 				       "uart_rx_a";
 				function = "uart_a";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -540,7 +552,7 @@
 				groups = "uart_tx_b",
 				       "uart_rx_b";
 				function = "uart_b";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -558,7 +570,7 @@
 				groups = "uart_tx_c",
 				       "uart_rx_c";
 				function = "uart_c";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -576,7 +588,7 @@
 				groups = "i2c_sck_a",
 				     "i2c_sda_a";
 				function = "i2c_a";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -585,7 +597,7 @@
 				groups = "i2c_sck_b",
 				      "i2c_sda_b";
 				function = "i2c_b";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -594,7 +606,7 @@
 				groups = "i2c_sck_c",
 				      "i2c_sda_c";
 				function = "i2c_c";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -603,7 +615,7 @@
 				groups = "i2c_sck_c_dv19",
 				      "i2c_sda_c_dv18";
 				function = "i2c_c";
-				bias-disable;
+				bias-pull-up;
 			};
 		};
 
@@ -809,6 +821,31 @@
 	};
 };
 
+&pwm_ab {
+	clocks = <&xtal>,
+		 <0>, /* unknown/untested, the datasheet calls it "vid_pll" */
+		 <&clkc CLKID_FCLK_DIV4>,
+		 <&clkc CLKID_FCLK_DIV3>;
+};
+
+&pwm_AO_ab {
+	clocks = <&xtal>, <&clkc CLKID_CLK81>;
+};
+
+&pwm_cd {
+	clocks = <&xtal>,
+		 <0>, /* unknown/untested, the datasheet calls it "vid_pll" */
+		 <&clkc CLKID_FCLK_DIV4>,
+		 <&clkc CLKID_FCLK_DIV3>;
+};
+
+&pwm_ef {
+	clocks = <&xtal>,
+		 <0>, /* unknown/untested, the datasheet calls it "vid_pll" */
+		 <&clkc CLKID_FCLK_DIV4>,
+		 <&clkc CLKID_FCLK_DIV3>;
+};
+
 &pwrc {
 	resets = <&reset RESET_VIU>,
 		 <&reset RESET_VENC>,
@@ -869,6 +906,9 @@
 		 <&clkc CLKID_FCLK_DIV2>;
 	clock-names = "core", "clkin0", "clkin1";
 	resets = <&reset RESET_SD_EMMC_A>;
+
+	assigned-clocks = <&clkc CLKID_SD_EMMC_A_CLK0>;
+	assigned-clock-rates = <24000000>;
 };
 
 &sd_emmc_b {
@@ -877,6 +917,9 @@
 		 <&clkc CLKID_FCLK_DIV2>;
 	clock-names = "core", "clkin0", "clkin1";
 	resets = <&reset RESET_SD_EMMC_B>;
+
+	assigned-clocks = <&clkc CLKID_SD_EMMC_B_CLK0>;
+	assigned-clock-rates = <24000000>;
 };
 
 &sd_emmc_c {
@@ -885,6 +928,9 @@
 		 <&clkc CLKID_FCLK_DIV2>;
 	clock-names = "core", "clkin0", "clkin1";
 	resets = <&reset RESET_SD_EMMC_C>;
+
+	assigned-clocks = <&clkc CLKID_SD_EMMC_C_CLK0>;
+	assigned-clock-rates = <24000000>;
 };
 
 &simplefb_hdmi {
@@ -932,15 +978,29 @@
 &vpu {
 	compatible = "amlogic,meson-gxl-vpu", "amlogic,meson-gx-vpu";
 	power-domains = <&pwrc PWRC_GXBB_VPU_ID>;
+	amlogic,ge2d = <&ge2d>;
+};
+
+&cpu_cooling_maps {
+	map_ge2d {
+		trip = <&cpu_hot>;
+		cooling-device = <&ge2d THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+	};
 };
 
 &vdec {
 	compatible = "amlogic,gxl-vdec", "amlogic,gx-vdec";
+	interrupts = <GIC_SPI 44 IRQ_TYPE_EDGE_RISING>,
+		     <GIC_SPI 32 IRQ_TYPE_EDGE_RISING>,
+		     <GIC_SPI 45 IRQ_TYPE_EDGE_RISING>;
+	interrupt-names = "vdec", "esparser", "hcodec";
 	clocks = <&clkc CLKID_DOS_PARSER>,
 		 <&clkc CLKID_DOS>,
 		 <&clkc CLKID_VDEC_1>,
-		 <&clkc CLKID_VDEC_HEVC>;
-	clock-names = "dos_parser", "dos", "vdec_1", "vdec_hevc";
+		 <&clkc CLKID_VDEC_HEVC>,
+		 <&clkc CLKID_VDEC_HCODEC>;
+	clock-names = "dos_parser", "dos", "vdec_1", "vdec_hevc",
+		      "hcodec";
 	resets = <&reset RESET_PARSER>;
 	reset-names = "esparser";
 };

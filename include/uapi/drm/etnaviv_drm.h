@@ -83,6 +83,15 @@ struct drm_etnaviv_timespec {
 #define ETNAVIV_PARAM_GPU_ON_CHIP_SRAM_SIZE         0x22
 #define ETNAVIV_PARAM_GPU_AXI_SRAM_SIZE             0x23
 
+/*
+ * GPU virtual address where the kernel flat-mapped the AXI SRAM
+ * coherent DDR allocation for this NPU. 0 if the chip has no AXI SRAM
+ * or the kernel alloc failed; userspace MUST skip OCB_REMAP
+ * programming in that case. Non-zero VA is stable across contexts
+ * (kernel flat-maps every MMUv2 context at the same VA).
+ */
+#define ETNAVIV_PARAM_GPU_AXI_SRAM_START            0x24
+
 #define ETNA_MAX_PIPES 4
 
 struct drm_etnaviv_param {

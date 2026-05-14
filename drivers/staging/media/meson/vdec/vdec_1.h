@@ -10,5 +10,10 @@
 #include "vdec.h"
 
 extern struct amvdec_ops vdec_1_ops;
+void vdec_1_thermal_update(struct amvdec_core *core, unsigned long rate);
+void vdec_1_power_init(struct amvdec_core *core);
+int vdec_1_power_get(struct amvdec_core *core);
+void vdec_1_power_put(struct amvdec_core *core);
+void vdec_1_poweroff(struct amvdec_core *core);
 
 #endif

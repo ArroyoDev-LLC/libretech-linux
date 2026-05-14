@@ -36,4 +36,12 @@ config MESON_MX_SOCINFO
 	  Meson8b and Meson8m2 SoC family information about the type
 	  and version.
 
+config MESON_GE2D_API
+	bool "Amlogic GE2D kernel API"
+	depends on ARCH_MESON || COMPILE_TEST
+	help
+	  Built-in API shim for the GE2D 2D engine, allowing built-in
+	  drivers (e.g. DRM writeback) to use GE2D when the V4L2 GE2D
+	  driver is loaded as a module.
+
 endmenu

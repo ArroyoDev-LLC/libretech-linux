@@ -14,6 +14,7 @@
 #include <linux/property.h>
 
 #include "lima_device.h"
+#include "lima_sched.h"
 #include "lima_devfreq.h"
 
 static void lima_devfreq_update_utilization(struct lima_devfreq *devfreq)
@@ -34,14 +35,43 @@ static void lima_devfreq_update_utilization(struct lima_devfreq *devfreq)
 static int lima_devfreq_target(struct device *dev, unsigned long *freq,
 			       u32 flags)
 {
+	struct lima_device *ldev = dev_get_drvdata(dev);
 	struct dev_pm_opp *opp;
+	int i, ret;
 
 	opp = devfreq_recommended_opp(dev, freq, flags);
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 	dev_pm_opp_put(opp);
 
-	return dev_pm_opp_set_rate(dev, *freq);
+	/*
+	 * The Mali-450 hardware requires all GP/PP groups to be idle
+	 * before changing the clock frequency. The ARM BSP enforces
+	 * this via mali_dev_pause()/mali_dev_resume(). Without this,
+	 * frequency changes under GPU load cause hard lockups.
+	 *
+	 * Stop the scheduler work queues to prevent new job submission,
+	 * then wait for in-flight jobs to drain before changing the
+	 * clock. This is the lima equivalent of mali_dev_pause().
+	 */
+	for (i = 0; i < lima_pipe_num; i++)
+		drm_sched_wqueue_stop(&ldev->pipe[i].base);
+
+	/* Wait for in-flight jobs to complete */
+	for (i = 0; i < lima_pipe_num; i++) {
+		int timeout = 100; /* 100ms max wait */
+
+		while (atomic_read(&ldev->pipe[i].base.credit_count) &&
+		       timeout-- > 0)
+			usleep_range(1000, 2000);
+	}
+
+	ret = dev_pm_opp_set_rate(dev, *freq);
+
+	for (i = 0; i < lima_pipe_num; i++)
+		drm_sched_wqueue_start(&ldev->pipe[i].base);
+
+	return ret;
 }
 
 static void lima_devfreq_reset(struct lima_devfreq *devfreq)
@@ -146,6 +176,42 @@ int lima_devfreq_init(struct lima_device *ldev)
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 
+	/*
+	 * If the actual GPU clock is far below the minimum OPP frequency,
+	 * the clock parent chain is not configured for DVFS.  This happens
+	 * with old DTBs that have operating-points-v2 but lack
+	 * assigned-clocks for the GPU (leaving the clock on the 24 MHz
+	 * crystal oscillator).  Repeated devfreq clock changes in this
+	 * state reparent the Mali clock to FCLK_DIV4 without the full
+	 * clock-tree setup that assigned-clocks provides; on Amlogic GXL
+	 * this leaves the GPU APB bus inaccessible at suspend time,
+	 * causing a synchronous external abort in lima_pmu_hw_fini.
+	 *
+	 * Set the GPU to the maximum OPP frequency once so the hardware
+	 * runs at full speed, but skip devfreq entirely.
+	 */
+	if (clk_get_rate(ldev->clk_gpu) * 2 < cur_freq) {
+		unsigned long max_freq = ULONG_MAX;
+		struct dev_pm_opp *max_opp;
+		unsigned long safe_freq;
+
+		dev_pm_opp_put(opp);
+		max_opp = dev_pm_opp_find_freq_floor(dev, &max_freq);
+		if (IS_ERR(max_opp))
+			max_freq = cur_freq;
+		else
+			dev_pm_opp_put(max_opp);
+
+		safe_freq = clk_round_rate(ldev->clk_gpu, max_freq);
+		if (safe_freq > 0 && !clk_set_rate(ldev->clk_gpu, safe_freq))
+			dev_info(dev, "GPU clock set to %lu Hz (no devfreq, old DTB)\n",
+				 safe_freq);
+		else
+			dev_info(dev, "GPU clock at %lu Hz (no devfreq, old DTB)\n",
+				 clk_get_rate(ldev->clk_gpu));
+		return 0;
+	}
+
 	lima_devfreq_profile.initial_freq = cur_freq;
 	dev_pm_opp_put(opp);
 
@@ -153,8 +219,8 @@ int lima_devfreq_init(struct lima_device *ldev)
 	 * Setup default thresholds for the simple_ondemand governor.
 	 * The values are chosen based on experiments.
 	 */
-	ldevfreq->gov_data.upthreshold = 30;
-	ldevfreq->gov_data.downdifferential = 5;
+	ldevfreq->gov_data.upthreshold = 50;
+	ldevfreq->gov_data.downdifferential = 10;
 
 	devfreq = devm_devfreq_add_device(dev, &lima_devfreq_profile,
 					  DEVFREQ_GOV_SIMPLE_ONDEMAND,
@@ -171,6 +237,32 @@ int lima_devfreq_init(struct lima_device *ldev)
 		dev_info(dev, "Failed to register cooling device\n");
 	else
 		ldevfreq->cooling = cooling;
+
+	/*
+	 * Amlogic GXL default cap: max_freq = 666 MHz. With the
+	 * OC OPPs (1008/1200/1392/1584) present in the table, the
+	 * simple_ondemand governor would otherwise pick the highest
+	 * OPP (1584 MHz) under busy workloads -- which forces
+	 * gp0_pll reprogramming (PLL relock cost) and runs the GPU at
+	 * peak power on every default boot. Default-cap at 666 MHz
+	 * keeps mali on a fixed fclk_div3 parent (no PLL reprogramming,
+	 * lowest static power) unless userspace explicitly opts into OC.
+	 *
+	 * Userspace opt-in to OC:
+	 *     echo 1584000000 > /sys/class/devfreq/d00c0000.gpu/max_freq
+	 *
+	 * Restore the 666 MHz cap (or any value):
+	 *     echo 666000000  > /sys/class/devfreq/d00c0000.gpu/max_freq
+	 *
+	 * Mechanism: update devfreq's `user_max_freq_req` -- this is the
+	 * SAME dev_pm_qos request that the sysfs max_freq_store handler
+	 * updates. A userspace write to max_freq sysfs REPLACES this
+	 * value (not aggregates), so the cap is genuinely a default
+	 * that the user can lift. PM QoS frequencies are in kHz;
+	 * 666666666 Hz rounded-up to kHz == 666667 kHz.
+	 */
+	if (of_machine_is_compatible("amlogic,meson-gxl"))
+		dev_pm_qos_update_request(&devfreq->user_max_freq_req, 666667);
 
 	return 0;
 }

@@ -271,3 +271,4 @@ image.
     pixfmt-y12i
     pixfmt-uv8
     pixfmt-m420
+    pixfmt-meson-deep-color

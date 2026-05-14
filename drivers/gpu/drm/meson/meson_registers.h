@@ -562,7 +562,9 @@
 #define VPP_PEAKING_SAT_THD4 0x1db0
 #define VPP_PEAKING_SAT_THD5 0x1db1
 #define VPP_PEAKING_SAT_THD6 0x1db2
+#define VPP_RO_CRCSUM        0x1db2  /* VPP post-blend CRC result (read-only) */
 #define VPP_PEAKING_SAT_THD7 0x1db3
+#define VPP_CRC_CHK          0x1db3  /* VPP CRC trigger (write 1 to start) */
 #define VPP_PEAKING_SAT_THD8 0x1db4
 #define VPP_PEAKING_SAT_THD9 0x1db5
 #define VPP_PEAKING_GAIN_ADD1 0x1db6

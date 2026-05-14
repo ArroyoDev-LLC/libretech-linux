@@ -9,6 +9,7 @@
 #include <linux/export.h>
 #include <linux/bitfield.h>
 
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_fourcc.h>
 
 #include "meson_drv.h"
@@ -411,6 +412,84 @@ void meson_viu_gxm_disable_osd1_afbc(struct meson_drm *priv)
 			    priv->io_base + _REG(VIU_MISC_CTRL1));
 }
 
+static int meson_ctm_s31_32_to_13bit(u64 val)
+{
+	bool negative = !!(val & BIT_ULL(63));
+	u64 mag = val & ~BIT_ULL(63);
+	int coeff;
+
+	/*
+	 * Convert S31.32 sign-magnitude to 13-bit signed (Q1.11).
+	 * Right-shift by 21 (32 fractional - 11 fractional) with rounding.
+	 */
+	coeff = (int)((mag + BIT_ULL(20)) >> 21);
+
+	/* Clamp to 12-bit magnitude (13-bit signed max) */
+	if (coeff > 0xfff)
+		coeff = 0xfff;
+
+	return negative ? -coeff : coeff;
+}
+
+void meson_viu_set_ctm(struct meson_drm *priv, struct drm_color_ctm *ctm)
+{
+	int coeffs[EOTF_COEFF_SIZE];
+	int i;
+
+	if (!ctm) {
+		meson_viu_set_osd_matrix(priv, VIU_MATRIX_OSD_EOTF,
+					 eotf_bypass_coeff, false);
+		return;
+	}
+
+	for (i = 0; i < 9; i++)
+		coeffs[i] = meson_ctm_s31_32_to_13bit(ctm->matrix[i]);
+
+	coeffs[9] = EOTF_COEFF_RIGHTSHIFT;
+
+	meson_viu_set_osd_matrix(priv, VIU_MATRIX_OSD_EOTF, coeffs, true);
+}
+
+void meson_viu_set_gamma_lut(struct meson_drm *priv,
+			     struct drm_color_lut *lut, unsigned int size)
+{
+	unsigned int i;
+
+	if (!lut || !size) {
+		writel_bits_relaxed(L_GAMMA_CNTL_PORT_EN, 0,
+				    priv->io_base + _REG(GAMMA_CNTL_PORT));
+		return;
+	}
+
+	if (size > 256)
+		size = 256;
+
+	/* Write R channel */
+	writel(L_GAMMA_ADDR_PORT_AUTO_INC | L_GAMMA_ADDR_PORT_SEL_R,
+	       priv->io_base + _REG(GAMMA_ADDR_PORT));
+	for (i = 0; i < size; i++)
+		writel(drm_color_lut_extract(lut[i].red, 10),
+		       priv->io_base + _REG(GAMMA_DATA_PORT));
+
+	/* Write G channel */
+	writel(L_GAMMA_ADDR_PORT_AUTO_INC | L_GAMMA_ADDR_PORT_SEL_G,
+	       priv->io_base + _REG(GAMMA_ADDR_PORT));
+	for (i = 0; i < size; i++)
+		writel(drm_color_lut_extract(lut[i].green, 10),
+		       priv->io_base + _REG(GAMMA_DATA_PORT));
+
+	/* Write B channel */
+	writel(L_GAMMA_ADDR_PORT_AUTO_INC | L_GAMMA_ADDR_PORT_SEL_B,
+	       priv->io_base + _REG(GAMMA_ADDR_PORT));
+	for (i = 0; i < size; i++)
+		writel(drm_color_lut_extract(lut[i].blue, 10),
+		       priv->io_base + _REG(GAMMA_DATA_PORT));
+
+	/* Enable gamma correction */
+	writel_bits_relaxed(L_GAMMA_CNTL_PORT_EN, L_GAMMA_CNTL_PORT_EN,
+			    priv->io_base + _REG(GAMMA_CNTL_PORT));
+}
+
 void meson_viu_init(struct meson_drm *priv)
 {
 	uint32_t reg;
@@ -443,7 +522,7 @@ void meson_viu_init(struct meson_drm *priv)
 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
 		reg |= (VIU_OSD_BURST_LENGTH_32 | VIU_OSD_HOLD_FIFO_LINES(31));
 	else
-		reg |= (VIU_OSD_BURST_LENGTH_64 | VIU_OSD_HOLD_FIFO_LINES(4));
+		reg |= (VIU_OSD_BURST_LENGTH_96 | VIU_OSD_HOLD_FIFO_LINES(31));
 
 	writel_relaxed(reg, priv->io_base + _REG(VIU_OSD1_FIFO_CTRL_STAT));
 	writel_relaxed(reg, priv->io_base + _REG(VIU_OSD2_FIFO_CTRL_STAT));
@@ -503,4 +582,7 @@ void meson_viu_init(struct meson_drm *priv)
 	priv->viu.osd1_enabled = false;
 	priv->viu.osd1_commit = false;
 	priv->viu.osd1_interlace = false;
+
+	priv->viu.osd2_enabled = false;
+	priv->viu.osd2_commit = false;
 }

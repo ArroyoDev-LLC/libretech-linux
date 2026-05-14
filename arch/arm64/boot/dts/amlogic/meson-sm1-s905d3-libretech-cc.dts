@@ -87,3 +87,51 @@
 	clocks = <&clkc CLKID_CPU3_CLK>;
 	clock-latency = <50000>;
 };
+
+&csi_analog_dphy {
+	status = "okay";
+};
+
+&csi_dphy {
+	status = "okay";
+	/*
+	 * Physical lane mapping for this board's J21 CSI connector.
+	 * Lanes 3,4 (1-indexed) connect to the GPIOAO_10 connector.
+	 */
+	data-lanes = <3 4>;
+};
+
+&csi {
+	status = "okay";
+};
+
+&csi_capture {
+	status = "okay";
+};
+
+&i2c3 {
+	status = "okay";
+	pinctrl-0 = <&i2c3_sda_a_pins>, <&i2c3_sck_a_pins>;
+	pinctrl-names = "default";
+};
+
+&npu {
+	status = "okay";
+};
+
+&wave420l {
+	status = "okay";
+};
+
+/ {
+	reserved-memory {
+		linux,cma {
+			/*
+			 * AML-S905D3-CC comes in up to 4 GiB RAM variants. Set CMA
+			 * to 896 MiB (max formula for 4 GiB). U-boot caps to
+			 * min(DT, calculated) based on detected RAM.
+			 */
+			size = <0x0 0x38000000>;
+		};
+	};
+};

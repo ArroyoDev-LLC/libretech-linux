@@ -2858,7 +2858,12 @@ static struct clk_regmap g12a_vdec_1_sel = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_hws = g12a_vdec_parent_hws,
 		.num_parents = ARRAY_SIZE(g12a_vdec_parent_hws),
-		.flags = CLK_SET_RATE_PARENT,
+		/* No CLK_SET_RATE_PARENT: mux includes hifi_pll/gp0_pll
+		 * (shared with VPU/VCLK/GPU/NNA).  Rate propagation would
+		 * reprogram the shared PLL.  Parent set via DT or
+		 * clk_set_parent(); rate set on divider only.
+		 */
+		.flags = 0,
 	},
 };
 
@@ -2896,6 +2901,56 @@ static struct clk_regmap g12a_vdec_1 = {
 	},
 };
 
+static struct clk_regmap g12a_vdec_hcodec_sel = {
+	.data = &(struct clk_regmap_mux_data){
+		.offset = HHI_VDEC_CLK_CNTL,
+		.mask = 0x7,
+		.shift = 25,
+		.flags = CLK_MUX_ROUND_CLOSEST,
+	},
+	.hw.init = &(struct clk_init_data){
+		.name = "vdec_hcodec_sel",
+		.ops = &clk_regmap_mux_ops,
+		.parent_hws = g12a_vdec_parent_hws,
+		.num_parents = ARRAY_SIZE(g12a_vdec_parent_hws),
+		.flags = 0,
+	},
+};
+
+static struct clk_regmap g12a_vdec_hcodec_div = {
+	.data = &(struct clk_regmap_div_data){
+		.offset = HHI_VDEC_CLK_CNTL,
+		.shift = 16,
+		.width = 7,
+		.flags = CLK_DIVIDER_ROUND_CLOSEST,
+	},
+	.hw.init = &(struct clk_init_data){
+		.name = "vdec_hcodec_div",
+		.ops = &clk_regmap_divider_ops,
+		.parent_hws = (const struct clk_hw *[]) {
+			&g12a_vdec_hcodec_sel.hw
+		},
+		.num_parents = 1,
+		.flags = CLK_SET_RATE_PARENT,
+	},
+};
+
+static struct clk_regmap g12a_vdec_hcodec = {
+	.data = &(struct clk_regmap_gate_data){
+		.offset = HHI_VDEC_CLK_CNTL,
+		.bit_idx = 24,
+	},
+	.hw.init = &(struct clk_init_data) {
+		.name = "vdec_hcodec",
+		.ops = &clk_regmap_gate_ops,
+		.parent_hws = (const struct clk_hw *[]) {
+			&g12a_vdec_hcodec_div.hw
+		},
+		.num_parents = 1,
+		.flags = CLK_SET_RATE_PARENT,
+	},
+};
+
 static struct clk_regmap g12a_vdec_hevcf_sel = {
 	.data = &(struct clk_regmap_mux_data){
 		.offset = HHI_VDEC2_CLK_CNTL,
@@ -2908,7 +2963,7 @@ static struct clk_regmap g12a_vdec_hevcf_sel = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_hws = g12a_vdec_parent_hws,
 		.num_parents = ARRAY_SIZE(g12a_vdec_parent_hws),
-		.flags = CLK_SET_RATE_PARENT,
+		.flags = 0,
 	},
 };
 
@@ -2958,7 +3013,7 @@ static struct clk_regmap g12a_vdec_hevc_sel = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_hws = g12a_vdec_parent_hws,
 		.num_parents = ARRAY_SIZE(g12a_vdec_parent_hws),
-		.flags = CLK_SET_RATE_PARENT,
+		.flags = 0,
 	},
 };
 
@@ -3020,7 +3075,7 @@ static struct clk_regmap g12a_vapb_0_sel = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_hws = g12a_vapb_parent_hws,
 		.num_parents = ARRAY_SIZE(g12a_vapb_parent_hws),
-		.flags = CLK_SET_RATE_NO_REPARENT,
+		.flags = 0,
 	},
 };
 
@@ -3068,7 +3123,7 @@ static struct clk_regmap g12a_vapb_1_sel = {
 		.ops = &clk_regmap_mux_ops,
 		.parent_hws = g12a_vapb_parent_hws,
 		.num_parents = ARRAY_SIZE(g12a_vapb_parent_hws),
-		.flags = CLK_SET_RATE_NO_REPARENT,
+		.flags = 0,
 	},
 };
 
@@ -3123,7 +3178,7 @@ static struct clk_regmap g12a_vapb_sel = {
 			&g12a_vapb_1.hw,
 		},
 		.num_parents = 2,
-		.flags = CLK_SET_RATE_NO_REPARENT,
+		.flags = CLK_SET_RATE_PARENT,
 	},
 };
 
@@ -4363,6 +4418,60 @@ static MESON_GATE(g12b_csi_phy1,		HHI_GCLK_MPEG2,	28);
 static MESON_GATE(g12b_csi_phy0,		HHI_GCLK_MPEG2,	29);
 static MESON_GATE(g12a_gic,			HHI_GCLK_MPEG2,	30);
 
+static MESON_GATE(sm1_csi2_adapt,		HHI_CSI2_ADAPT_CLK_CNTL, 8);
+
+/*
+ * CSI PHY functional clock (HHI_MIPI_CSI_PHY_CLK_CNTL)
+ * Feeds the D-PHY block at 0xFF650000. Without this clock enabled,
+ * MMIO to the D-PHY registers causes a bus error.
+ */
+static struct clk_regmap g12b_mipi_csi_phy_clk0_sel = {
+	.data = &(struct clk_regmap_mux_data){
+		.offset = HHI_MIPI_CSI_PHY_CLK_CNTL,
+		.mask = 7,
+		.shift = 12,
+	},
+	.hw.init = &(struct clk_init_data){
+		.name = "mipi_csi_phy_clk0_sel",
+		.ops = &clk_regmap_mux_ops,
+		.parent_data = g12b_mipi_isp_parent_data,
+		.num_parents = ARRAY_SIZE(g12b_mipi_isp_parent_data),
+	},
+};
+
+static struct clk_regmap g12b_mipi_csi_phy_clk0_div = {
+	.data = &(struct clk_regmap_div_data){
+		.offset = HHI_MIPI_CSI_PHY_CLK_CNTL,
+		.shift = 0,
+		.width = 7,
+	},
+	.hw.init = &(struct clk_init_data){
+		.name = "mipi_csi_phy_clk0_div",
+		.ops = &clk_regmap_divider_ops,
+		.parent_hws = (const struct clk_hw *[]) {
+			&g12b_mipi_csi_phy_clk0_sel.hw
+		},
+		.num_parents = 1,
+		.flags = CLK_SET_RATE_PARENT,
+	},
+};
+
+static struct clk_regmap g12b_mipi_csi_phy_clk0 = {
+	.data = &(struct clk_regmap_gate_data){
+		.offset = HHI_MIPI_CSI_PHY_CLK_CNTL,
+		.bit_idx = 8,
+	},
+	.hw.init = &(struct clk_init_data) {
+		.name = "mipi_csi_phy_clk0",
+		.ops = &clk_regmap_gate_ops,
+		.parent_hws = (const struct clk_hw *[]) {
+			&g12b_mipi_csi_phy_clk0_div.hw
+		},
+		.num_parents = 1,
+		.flags = CLK_SET_RATE_PARENT,
+	},
+};
+
 static MESON_GATE(g12a_vclk2_venci0,		HHI_GCLK_OTHER,	1);
 static MESON_GATE(g12a_vclk2_venci1,		HHI_GCLK_OTHER,	2);
 static MESON_GATE(g12a_vclk2_vencp0,		HHI_GCLK_OTHER,	3);
@@ -4604,6 +4713,9 @@ static struct clk_hw *g12a_hw_clks[] = {
 	[CLKID_VDEC_HEVCF_SEL]		= &g12a_vdec_hevcf_sel.hw,
 	[CLKID_VDEC_HEVCF_DIV]		= &g12a_vdec_hevcf_div.hw,
 	[CLKID_VDEC_HEVCF]		= &g12a_vdec_hevcf.hw,
+	[CLKID_VDEC_HCODEC_SEL]	= &g12a_vdec_hcodec_sel.hw,
+	[CLKID_VDEC_HCODEC_DIV]	= &g12a_vdec_hcodec_div.hw,
+	[CLKID_VDEC_HCODEC]		= &g12a_vdec_hcodec.hw,
 	[CLKID_TS_DIV]			= &g12a_ts_div.hw,
 	[CLKID_TS]			= &g12a_ts.hw,
 	[CLKID_SPICC0_SCLK_SEL]		= &g12a_spicc0_sclk_sel.hw,
@@ -4831,6 +4943,9 @@ static struct clk_hw *g12b_hw_clks[] = {
 	[CLKID_VDEC_HEVCF_SEL]		= &g12a_vdec_hevcf_sel.hw,
 	[CLKID_VDEC_HEVCF_DIV]		= &g12a_vdec_hevcf_div.hw,
 	[CLKID_VDEC_HEVCF]		= &g12a_vdec_hevcf.hw,
+	[CLKID_VDEC_HCODEC_SEL]	= &g12a_vdec_hcodec_sel.hw,
+	[CLKID_VDEC_HCODEC_DIV]	= &g12a_vdec_hcodec_div.hw,
+	[CLKID_VDEC_HCODEC]		= &g12a_vdec_hcodec.hw,
 	[CLKID_TS_DIV]			= &g12a_ts_div.hw,
 	[CLKID_TS]			= &g12a_ts.hw,
 	[CLKID_SYS1_PLL_DCO]		= &g12b_sys1_pll_dco.hw,
@@ -4883,6 +4998,9 @@ static struct clk_hw *g12b_hw_clks[] = {
 	[CLKID_MIPI_ISP_GATE]		= &g12b_mipi_isp_gate.hw,
 	[CLKID_MIPI_ISP_CSI_PHY0]	= &g12b_csi_phy0.hw,
 	[CLKID_MIPI_ISP_CSI_PHY1]	= &g12b_csi_phy1.hw,
+	[CLKID_MIPI_CSI_PHY_CLK0_SEL]	= &g12b_mipi_csi_phy_clk0_sel.hw,
+	[CLKID_MIPI_CSI_PHY_CLK0_DIV]	= &g12b_mipi_csi_phy_clk0_div.hw,
+	[CLKID_MIPI_CSI_PHY_CLK0]	= &g12b_mipi_csi_phy_clk0.hw,
 };
 
 static struct clk_hw *sm1_hw_clks[] = {
@@ -5099,6 +5217,9 @@ static struct clk_hw *sm1_hw_clks[] = {
 	[CLKID_VDEC_HEVCF_SEL]		= &g12a_vdec_hevcf_sel.hw,
 	[CLKID_VDEC_HEVCF_DIV]		= &g12a_vdec_hevcf_div.hw,
 	[CLKID_VDEC_HEVCF]		= &g12a_vdec_hevcf.hw,
+	[CLKID_VDEC_HCODEC_SEL]	= &g12a_vdec_hcodec_sel.hw,
+	[CLKID_VDEC_HCODEC_DIV]	= &g12a_vdec_hcodec_div.hw,
+	[CLKID_VDEC_HCODEC]		= &g12a_vdec_hcodec.hw,
 	[CLKID_TS_DIV]			= &g12a_ts_div.hw,
 	[CLKID_TS]			= &g12a_ts.hw,
 	[CLKID_GP1_PLL_DCO]		= &sm1_gp1_pll_dco.hw,
@@ -5130,6 +5251,15 @@ static struct clk_hw *sm1_hw_clks[] = {
 	[CLKID_MIPI_DSI_PXCLK_SEL]	= &g12a_mipi_dsi_pxclk_sel.hw,
 	[CLKID_MIPI_DSI_PXCLK_DIV]	= &g12a_mipi_dsi_pxclk_div.hw,
 	[CLKID_MIPI_DSI_PXCLK]		= &g12a_mipi_dsi_pxclk.hw,
+	[CLKID_MIPI_ISP_CSI_PHY0]	= &g12b_csi_phy0.hw,
+	[CLKID_MIPI_ISP_SEL]		= &g12b_mipi_isp_sel.hw,
+	[CLKID_MIPI_ISP_DIV]		= &g12b_mipi_isp_div.hw,
+	[CLKID_MIPI_ISP]		= &g12b_mipi_isp.hw,
+	[CLKID_MIPI_ISP_GATE]		= &g12b_mipi_isp_gate.hw,
+	[CLKID_CSI2_ADAPT]		= &sm1_csi2_adapt.hw,
+	[CLKID_MIPI_CSI_PHY_CLK0_SEL]	= &g12b_mipi_csi_phy_clk0_sel.hw,
+	[CLKID_MIPI_CSI_PHY_CLK0_DIV]	= &g12b_mipi_csi_phy_clk0_div.hw,
+	[CLKID_MIPI_CSI_PHY_CLK0]	= &g12b_mipi_csi_phy_clk0.hw,
 };
 
 /* Convenience table to populate regmap in .probe */
@@ -5327,6 +5457,9 @@ static struct clk_regmap *const g12a_clk_regmaps[] = {
 	&g12a_vdec_hevcf_sel,
 	&g12a_vdec_hevcf_div,
 	&g12a_vdec_hevcf,
+	&g12a_vdec_hcodec_sel,
+	&g12a_vdec_hcodec_div,
+	&g12a_vdec_hcodec,
 	&g12a_ts_div,
 	&g12a_ts,
 	&g12b_cpu_clk,
@@ -5385,6 +5518,10 @@ static struct clk_regmap *const g12a_clk_regmaps[] = {
 	&g12b_mipi_isp_gate,
 	&g12b_csi_phy1,
 	&g12b_csi_phy0,
+	&sm1_csi2_adapt,
+	&g12b_mipi_csi_phy_clk0_sel,
+	&g12b_mipi_csi_phy_clk0_div,
+	&g12b_mipi_csi_phy_clk0,
 };
 
 static const struct reg_sequence g12a_init_regs[] = {

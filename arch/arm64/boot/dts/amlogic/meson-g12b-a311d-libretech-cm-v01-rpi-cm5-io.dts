@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/dts-v1/;
+
+#include "meson-g12b-a311d.dtsi"
+#include "meson-libretech-cottonwood-cm.dtsi"
+#include "meson-g12b-libretech-cottonwood-cm.dtsi"
+#include "meson-libretech-cottonwood-cm-rpi-cm-io.dtsi"
+
+/ {
+	compatible = "libretech,aml-a311d-cm-v01", "amlogic,a311d", "amlogic,g12b";
+	model = "Libre Computer AML-A311D-CM-V01 on RPi CM5-IO";
+};
+
+/ {
+	reserved-memory {
+		linux,cma {
+			/*
+			 * AML-A311D-CM-V01 comes in up to 4 GiB RAM variants. Set
+			 * CMA to 896 MiB (max formula for 4 GiB). U-boot caps to
+			 * min(DT, calculated) based on detected RAM.
+			 */
+			size = <0x0 0x38000000>;
+		};
+	};
+};

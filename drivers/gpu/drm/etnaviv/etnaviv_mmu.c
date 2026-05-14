@@ -4,6 +4,7 @@
  */
 
 #include <linux/dma-mapping.h>
+#include <linux/genalloc.h>
 #include <linux/scatterlist.h>
 
 #include "common.xml.h"
@@ -366,6 +367,52 @@ void etnaviv_iommu_context_put(struct etnaviv_iommu_context *context)
 	kref_put(&context->refcount, etnaviv_iommu_context_free);
 }
 
+/*
+ * Reserve and flat-map the AXI SRAM flat-map region at
+ * ETNAVIV_AXI_SRAM_VA in a freshly-created MMUv2 context. Call after
+ * context_alloc (drm_mm is initialised) and before the context is
+ * handed back to the caller.
+ *
+ * Returns 0 on success, -errno on failure. Callers that don't care
+ * about AXI SRAM (MMUv1 contexts, or global->axi_sram_cpu == NULL)
+ * skip this call entirely.
+ */
+int etnaviv_iommu_install_axi_sram(struct etnaviv_iommu_context *ctx)
+{
+	struct etnaviv_iommu_global *global = ctx->global;
+	int ret;
+
+	if (!global->axi_sram_cpu)
+		return 0;
+
+	ctx->axi_sram_node.start = ETNAVIV_AXI_SRAM_VA;
+	ctx->axi_sram_node.size  = global->axi_sram_size;
+	ctx->axi_sram_node.color = 0;
+
+	ret = drm_mm_reserve_node(&ctx->mm, &ctx->axi_sram_node);
+	if (ret) {
+		dev_warn(global->dev,
+			 "AXI SRAM flat-map: drm_mm reserve failed at VA 0x%08x: %d\n",
+			 (u32)ETNAVIV_AXI_SRAM_VA, ret);
+		return ret;
+	}
+
+	ret = etnaviv_context_map(ctx, ETNAVIV_AXI_SRAM_VA,
+				  global->axi_sram_dma,
+				  global->axi_sram_size,
+				  ETNAVIV_PROT_READ | ETNAVIV_PROT_WRITE);
+	if (ret) {
+		drm_mm_remove_node(&ctx->axi_sram_node);
+		dev_warn(global->dev,
+			 "AXI SRAM flat-map: iommu map failed at VA 0x%08x: %d\n",
+			 (u32)ETNAVIV_AXI_SRAM_VA, ret);
+		return ret;
+	}
+
+	ctx->flush_seq++;
+	return 0;
+}
+
 struct etnaviv_iommu_context *
 etnaviv_iommu_context_init(struct etnaviv_iommu_global *global,
 			   struct etnaviv_cmdbuf_suballoc *suballoc)
@@ -392,6 +439,15 @@ etnaviv_iommu_context_init(struct etnaviv_iommu_global *global,
 		        "command buffer outside valid memory window\n");
 		goto out_unmap;
 	}
+
+	/*
+	 * AXI SRAM flat-map -- best effort. Failure is non-fatal: the
+	 * context still works for normal GEM submits; only OCB_REMAP-
+	 * dependent NPU paths (V8 SRAM caching, A311D NN flop reset)
+	 * will see AXI_SRAM_START = 0 and skip their programming.
+	 */
+	if (global->version == ETNAVIV_IOMMU_V2)
+		etnaviv_iommu_install_axi_sram(ctx);
 
 	return ctx;
 
@@ -441,7 +497,7 @@ int etnaviv_iommu_get_suballoc_va(struct etnaviv_iommu_context *context,
 
 		mapping->iova = node->start;
 		ret = etnaviv_context_map(context, node->start, paddr, size,
-					  ETNAVIV_PROT_READ);
+					  ETNAVIV_PROT_READ | ETNAVIV_PROT_WRITE);
 		if (ret < 0) {
 			drm_mm_remove_node(node);
 			mutex_unlock(&context->lock);
@@ -526,6 +582,72 @@ int etnaviv_iommu_global_init(struct etnaviv_gpu *gpu)
 			goto free_bad_page;
 	}
 
+	/*
+	 * AXI SRAM flat-map backing: mapped into each MMUv2 context at
+	 * ETNAVIV_AXI_SRAM_VA by etnaviv_iommu_install_axi_sram.
+	 *
+	 * Two sources, in preference order:
+	 *   1. On-chip AXI SRAM advertised by an mmio-sram gen_pool reached
+	 *      via the GPU node's "sram" phandle. A311D has 1 MB at phys
+	 *      0xFF000000; putting the flat-map there lets hot NN BOs live
+	 *      in on-die SRAM instead of DDR, attacking the DDR-bandwidth
+	 *      bottleneck on the FC layer.
+	 *   2. Coherent DDR via dma_alloc_coherent -- the historical
+	 *      fallback. Functional but carries DDR latency. Kept so
+	 *      pre-SRAM-DT kernels, or platforms where the SRAM is reserved
+	 *      for other masters, still benefit from the flat-map window.
+	 *
+	 * Skipped entirely on chips with axi_sram_size == 0 (e.g. S905D3).
+	 * On soft failure the size is left at zero and OCB_REMAP programming
+	 * is disabled userspace-side.
+	 */
+	if (version == ETNAVIV_IOMMU_V2 && gpu->identity.axi_sram_size) {
+		size_t sz = gpu->identity.axi_sram_size;
+
+		/*
+		 * Use gpu->dev->of_node, not dev->of_node: dev here is the
+		 * DRM aggregate device (has no DT node with the SRAM
+		 * phandle), while gpu->dev is the per-GPU platform device
+		 * whose of_node is npu@ff100000 carrying "sram = <...>".
+		 */
+		global->axi_sram_pool = of_gen_pool_get(gpu->dev->of_node,
+							"sram", 0);
+		if (global->axi_sram_pool) {
+			unsigned long va = gen_pool_alloc(global->axi_sram_pool,
+							  sz);
+			if (va) {
+				global->axi_sram_cpu = (void *)va;
+				global->axi_sram_dma =
+					gen_pool_virt_to_phys(
+						global->axi_sram_pool, va);
+				global->axi_sram_size = sz;
+				dev_info(dev,
+					 "AXI SRAM flat-map: %zu bytes @ phys 0x%llx (on-chip mmio-sram pool)\n",
+					 sz, (unsigned long long)global->axi_sram_dma);
+			} else {
+				dev_warn(dev,
+					 "AXI SRAM flat-map: on-chip gen_pool_alloc(%zu) failed; falling back to DDR\n",
+					 sz);
+				global->axi_sram_pool = NULL;
+			}
+		}
+
+		if (!global->axi_sram_cpu) {
+			global->axi_sram_cpu = dma_alloc_coherent(dev, sz,
+				&global->axi_sram_dma, GFP_KERNEL);
+			if (global->axi_sram_cpu) {
+				global->axi_sram_size = sz;
+				dev_info(dev,
+					 "AXI SRAM flat-map: %zu bytes DDR-backed (no on-chip SRAM pool)\n",
+					 sz);
+			} else {
+				dev_warn(dev,
+					 "AXI SRAM flat-map: %zu-byte alloc failed; OCB_REMAP disabled\n",
+					 sz);
+			}
+		}
+	}
+
 	global->dev = dev;
 	global->version = version;
 	global->use = 1;
@@ -566,6 +688,17 @@ void etnaviv_iommu_global_fini(struct etnaviv_gpu *gpu)
 	if (global->bad_page_cpu)
 		dma_free_wc(global->dev, SZ_4K,
 			    global->bad_page_cpu, global->bad_page_dma);
+
+	if (global->axi_sram_cpu) {
+		if (global->axi_sram_pool)
+			gen_pool_free(global->axi_sram_pool,
+				      (unsigned long)global->axi_sram_cpu,
+				      global->axi_sram_size);
+		else
+			dma_free_coherent(global->dev, global->axi_sram_size,
+					  global->axi_sram_cpu,
+					  global->axi_sram_dma);
+	}
 
 	mutex_destroy(&global->lock);
 	kfree(global);

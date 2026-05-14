@@ -3598,10 +3598,6 @@ static void stmmac_free_irq(struct net_device *dev,
 			free_irq(priv->sfty_ce_irq, dev);
 		fallthrough;
 	case REQ_IRQ_ERR_SFTY_CE:
-		if (priv->lpi_irq > 0 && priv->lpi_irq != dev->irq)
-			free_irq(priv->lpi_irq, dev);
-		fallthrough;
-	case REQ_IRQ_ERR_LPI:
 		if (priv->wol_irq > 0 && priv->wol_irq != dev->irq)
 			free_irq(priv->wol_irq, dev);
 		fallthrough;
@@ -3656,24 +3652,6 @@ static int stmmac_request_irq_multi_msi(struct net_device *dev)
 				   "%s: alloc wol MSI %d (error: %d)\n",
 				   __func__, priv->wol_irq, ret);
 			irq_err = REQ_IRQ_ERR_WOL;
-			goto irq_error;
-		}
-	}
-
-	/* Request the LPI IRQ in case of another line
-	 * is used for LPI
-	 */
-	if (priv->lpi_irq > 0 && priv->lpi_irq != dev->irq) {
-		int_name = priv->int_name_lpi;
-		sprintf(int_name, "%s:%s", dev->name, "lpi");
-		ret = request_irq(priv->lpi_irq,
-				  stmmac_mac_interrupt,
-				  0, int_name, dev);
-		if (unlikely(ret < 0)) {
-			netdev_err(priv->dev,
-				   "%s: alloc lpi MSI %d (error: %d)\n",
-				   __func__, priv->lpi_irq, ret);
-			irq_err = REQ_IRQ_ERR_LPI;
 			goto irq_error;
 		}
 	}
@@ -3814,19 +3792,6 @@ static int stmmac_request_irq_single(struct net_device *dev)
 				   "%s: ERROR: allocating the WoL IRQ %d (%d)\n",
 				   __func__, priv->wol_irq, ret);
 			irq_err = REQ_IRQ_ERR_WOL;
-			goto irq_error;
-		}
-	}
-
-	/* Request the IRQ lines */
-	if (priv->lpi_irq > 0 && priv->lpi_irq != dev->irq) {
-		ret = request_irq(priv->lpi_irq, stmmac_interrupt,
-				  IRQF_SHARED, dev->name, dev);
-		if (unlikely(ret < 0)) {
-			netdev_err(priv->dev,
-				   "%s: ERROR: allocating the LPI IRQ %d (%d)\n",
-				   __func__, priv->lpi_irq, ret);
-			irq_err = REQ_IRQ_ERR_LPI;
 			goto irq_error;
 		}
 	}
@@ -5843,6 +5808,70 @@ static int stmmac_napi_poll_rxtx(struct napi_struct *napi, int budget)
 }
 
 /**
+ *  stmmac_dump_tx_timeout_state - dump registers on TX timeout for debugging
+ *  @priv: driver private structure
+ *
+ *  Called before reset to capture the failing DMA/MAC/PHY state.
+ *  Rate-limited to first 3 occurrences to avoid log spam on reset loops.
+ */
+static void stmmac_dump_tx_timeout_state(struct stmmac_priv *priv)
+{
+	void __iomem *ioaddr = priv->ioaddr;
+	struct phy_device *phydev = priv->dev->phydev;
+	static int dump_count;
+
+	if (dump_count >= 3)
+		return;
+	dump_count++;
+
+	netdev_err(priv->dev, "TX timeout register dump (%d/3):\n", dump_count);
+
+	/* DMA registers (dwmac1000 core, base + 0x1000) */
+	netdev_err(priv->dev, "  DMA_BUS_MODE:    0x%08x\n",
+		   readl(ioaddr + 0x1000));
+	netdev_err(priv->dev, "  DMA_STATUS:      0x%08x\n",
+		   readl(ioaddr + 0x1014));
+	netdev_err(priv->dev, "  DMA_CONTROL:     0x%08x\n",
+		   readl(ioaddr + 0x1018));
+	netdev_err(priv->dev, "  DMA_INTR_ENA:    0x%08x\n",
+		   readl(ioaddr + 0x101c));
+	netdev_err(priv->dev, "  DMA_TX_BASE:     0x%08x\n",
+		   readl(ioaddr + 0x1010));
+	netdev_err(priv->dev, "  DMA_CUR_TX_DESC: 0x%08x\n",
+		   readl(ioaddr + 0x1048));
+	netdev_err(priv->dev, "  DMA_CUR_TX_BUF:  0x%08x\n",
+		   readl(ioaddr + 0x1050));
+
+	/* MAC registers */
+	netdev_err(priv->dev, "  MAC_CONTROL:     0x%08x\n",
+		   readl(ioaddr + 0x0000));
+	netdev_err(priv->dev, "  MAC_FRAME_FILT:  0x%08x\n",
+		   readl(ioaddr + 0x0004));
+	netdev_err(priv->dev, "  MAC_STATUS:      0x%08x\n",
+		   readl(ioaddr + 0x0038));
+
+	/* TX descriptor ring state */
+	if (priv->dma_conf.tx_queue) {
+		struct stmmac_tx_queue *tx_q = &priv->dma_conf.tx_queue[0];
+
+		netdev_err(priv->dev, "  TX ring: cur=%d dirty=%d\n",
+			   tx_q->cur_tx, tx_q->dirty_tx);
+	}
+
+	/* PHY registers via MDIO */
+	if (phydev) {
+		netdev_err(priv->dev, "  PHY BMCR:        0x%04x\n",
+			   phy_read(phydev, MII_BMCR));
+		netdev_err(priv->dev, "  PHY BMSR:        0x%04x\n",
+			   phy_read(phydev, MII_BMSR));
+		netdev_err(priv->dev, "  PHY ANAR:        0x%04x\n",
+			   phy_read(phydev, MII_ADVERTISE));
+		netdev_err(priv->dev, "  PHY ANLPAR:      0x%04x\n",
+			   phy_read(phydev, MII_LPA));
+	}
+}
+
+/**
  *  stmmac_tx_timeout
  *  @dev : Pointer to net device structure
  *  @txqueue: the index of the hanging transmit queue
@@ -5855,6 +5884,7 @@ static void stmmac_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
 
+	stmmac_dump_tx_timeout_state(priv);
 	stmmac_global_err(priv);
 }
 
@@ -6697,9 +6727,13 @@ static int stmmac_vlan_rx_add_vid(struct net_device *ndev, __be16 proto, u16 vid
 
 	if (priv->hw->num_vlan) {
 		ret = stmmac_add_hw_vlan_rx_fltr(priv, ndev, priv->hw, proto, vid);
-		if (ret)
+		if (ret) {
+			clear_bit(vid, priv->active_vlans);
+			stmmac_vlan_update(priv, is_double);
 			goto err_pm_put;
+		}
 	}
+
 err_pm_put:
 	pm_runtime_put(priv->device);
 
@@ -6720,14 +6754,20 @@ static int stmmac_vlan_rx_kill_vid(struct net_device *ndev, __be16 proto, u16 vi
 		is_double = true;
 
 	clear_bit(vid, priv->active_vlans);
+	ret = stmmac_vlan_update(priv, is_double);
+	if (ret) {
+		set_bit(vid, priv->active_vlans);
+		goto del_vlan_error;
+	}
 
 	if (priv->hw->num_vlan) {
 		ret = stmmac_del_hw_vlan_rx_fltr(priv, ndev, priv->hw, proto, vid);
-		if (ret)
+		if (ret) {
+			set_bit(vid, priv->active_vlans);
+			stmmac_vlan_update(priv, is_double);
 			goto del_vlan_error;
+		}
 	}
-
-	ret = stmmac_vlan_update(priv, is_double);
 
 del_vlan_error:
 	pm_runtime_put(priv->device);
@@ -7584,7 +7624,6 @@ int stmmac_dvr_probe(struct device *device,
 
 	priv->dev->irq = res->irq;
 	priv->wol_irq = res->wol_irq;
-	priv->lpi_irq = res->lpi_irq;
 	priv->sfty_irq = res->sfty_irq;
 	priv->sfty_ce_irq = res->sfty_ce_irq;
 	priv->sfty_ue_irq = res->sfty_ue_irq;

@@ -13,6 +13,7 @@
 #include "lima_regs.h"
 #include "lima_gem.h"
 #include "lima_vm.h"
+#include "lima_perfcnt.h"
 
 #define gp_write(reg, data) writel(data, ip->iomem + reg)
 #define gp_read(reg) readl(ip->iomem + reg)
@@ -163,6 +164,8 @@ static void lima_gp_task_run(struct lima_sched_pipe *pipe,
 	for (i = 0; i < LIMA_GP_FRAME_REG_NUM; i++)
 		writel(f[i], ip->iomem + LIMA_GP_VSCL_START_ADDR + i * 4);
 
+	lima_perfcnt_gp_job_start(ip);
+
 	gp_write(LIMA_GP_CMD, LIMA_GP_CMD_UPDATE_PLBU_ALLOC);
 	gp_write(LIMA_GP_CMD, cmd);
 }
@@ -214,6 +217,7 @@ static int lima_gp_hard_reset(struct lima_ip *ip)
 
 static void lima_gp_task_fini(struct lima_sched_pipe *pipe)
 {
+	lima_perfcnt_gp_job_done(pipe->processor[0]);
 	lima_gp_soft_reset_async(pipe->processor[0]);
 }
 

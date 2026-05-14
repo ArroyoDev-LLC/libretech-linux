@@ -562,7 +562,15 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
 
 	/* None will match for AFBC Only formats */
 	switch (fb->format->format) {
-	/* TOFIX DRM_FORMAT_RGB888 should be supported */
+	case DRM_FORMAT_RGB888:
+		priv->viu.vd1_if0_gen_reg |= VD_DEMUX_MODE_RGB |
+					     VD_BYTES_PER_PIXEL(2) |
+					     VD_LITTLE_ENDIAN;
+		priv->viu.vd1_if0_canvas0 =
+					CANVAS_ADDR2(priv->canvas_id_vd1_0) |
+					CANVAS_ADDR1(priv->canvas_id_vd1_0) |
+					CANVAS_ADDR0(priv->canvas_id_vd1_0);
+		break;
 	case DRM_FORMAT_YUYV:
 		priv->viu.vd1_if0_gen_reg |= VD_BYTES_PER_PIXEL(1);
 		priv->viu.vd1_if0_canvas0 =
@@ -816,6 +824,7 @@ static const uint32_t supported_drm_formats[] = {
 	DRM_FORMAT_YUV420,
 	DRM_FORMAT_YUV411,
 	DRM_FORMAT_YUV410,
+	DRM_FORMAT_RGB888,
 	DRM_FORMAT_YUV420_8BIT, /* Amlogic FBC Only */
 	DRM_FORMAT_YUV420_10BIT, /* Amlogic FBC Only */
 };

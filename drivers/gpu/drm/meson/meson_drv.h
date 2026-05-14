@@ -14,8 +14,10 @@
 struct drm_crtc;
 struct drm_device;
 struct drm_plane;
+struct drm_writeback_connector;
 struct meson_drm;
 struct meson_afbcd_ops;
+struct meson_ge2d_dev;
 
 enum vpu_compatible {
 	VPU_COMPATIBLE_GXBB = 0,
@@ -49,6 +51,7 @@ struct meson_drm {
 
 	struct meson_canvas *canvas;
 	u8 canvas_id_osd1;
+	u8 canvas_id_osd2;
 	u8 canvas_id_vd1_0;
 	u8 canvas_id_vd1_1;
 	u8 canvas_id_vd1_2;
@@ -58,6 +61,8 @@ struct meson_drm {
 	struct drm_plane *primary_plane;
 	struct drm_plane *overlay_plane;
 	void *encoders[MESON_ENC_LAST];
+	struct drm_writeback_connector *writeback;
+	struct meson_ge2d_dev *ge2d;
 
 	const struct meson_drm_soc_limits *limits;
 
@@ -90,6 +95,28 @@ struct meson_drm {
 		uint32_t osd_blend_din0_scope_v;
 		uint32_t osb_blend0_size;
 		uint32_t osb_blend1_size;
+
+		bool osd2_enabled;
+		bool osd2_commit;
+		uint32_t osd2_ctrl_stat;
+		uint32_t osd2_ctrl_stat2;
+		uint32_t osd2_blk0_cfg[5];
+		uint32_t osd2_addr;
+		uint32_t osd2_stride;
+		uint32_t osd2_height;
+		uint32_t osd2_width;
+		uint32_t osd_blend_din1_scope_h;
+		uint32_t osd_blend_din1_scope_v;
+		uint32_t osd2_sc_ctrl0;
+		uint32_t osd2_sc_i_wh_m1;
+		uint32_t osd2_sc_o_h_start_end;
+		uint32_t osd2_sc_o_v_start_end;
+		uint32_t osd2_sc_v_ctrl0;
+		uint32_t osd2_sc_v_phase_step;
+		uint32_t osd2_sc_v_ini_phase;
+		uint32_t osd2_sc_h_ctrl0;
+		uint32_t osd2_sc_h_phase_step;
+		uint32_t osd2_sc_h_ini_phase;
 
 		bool vd1_enabled;
 		bool vd1_commit;

@@ -26,41 +26,7 @@
 #include "meson_viu.h"
 #include "meson_osd_afbcd.h"
 
-/* OSD_SCI_WH_M1 */
-#define SCI_WH_M1_W(w)			FIELD_PREP(GENMASK(28, 16), w)
-#define SCI_WH_M1_H(h)			FIELD_PREP(GENMASK(12, 0), h)
-
-/* OSD_SCO_H_START_END */
-/* OSD_SCO_V_START_END */
-#define SCO_HV_START(start)		FIELD_PREP(GENMASK(27, 16), start)
-#define SCO_HV_END(end)			FIELD_PREP(GENMASK(11, 0), end)
-
-/* OSD_SC_CTRL0 */
-#define SC_CTRL0_PATH_EN		BIT(3)
-#define SC_CTRL0_SEL_OSD1		BIT(2)
-
-/* OSD_VSC_CTRL0 */
-#define VSC_BANK_LEN(value)		FIELD_PREP(GENMASK(2, 0), value)
-#define VSC_TOP_INI_RCV_NUM(value)	FIELD_PREP(GENMASK(6, 3), value)
-#define VSC_TOP_RPT_L0_NUM(value)	FIELD_PREP(GENMASK(9, 8), value)
-#define VSC_BOT_INI_RCV_NUM(value)	FIELD_PREP(GENMASK(14, 11), value)
-#define VSC_BOT_RPT_L0_NUM(value)	FIELD_PREP(GENMASK(17, 16), value)
-#define VSC_PROG_INTERLACE		BIT(23)
-#define VSC_VERTICAL_SCALER_EN		BIT(24)
-
-/* OSD_VSC_INI_PHASE */
-#define VSC_INI_PHASE_BOT(bottom)	FIELD_PREP(GENMASK(31, 16), bottom)
-#define VSC_INI_PHASE_TOP(top)		FIELD_PREP(GENMASK(15, 0), top)
-
-/* OSD_HSC_CTRL0 */
-#define HSC_BANK_LENGTH(value)		FIELD_PREP(GENMASK(2, 0), value)
-#define HSC_INI_RCV_NUM0(value)		FIELD_PREP(GENMASK(6, 3), value)
-#define HSC_RPT_P0_NUM0(value)		FIELD_PREP(GENMASK(9, 8), value)
-#define HSC_HORIZ_SCALER_EN		BIT(22)
-
-/* VPP_OSD_VSC_PHASE_STEP */
-/* VPP_OSD_HSC_PHASE_STEP */
-#define SC_PHASE_STEP(value)		FIELD_PREP(GENMASK(27, 0), value)
+/* OSD scaler macros are in meson_viu.h */
 
 struct meson_plane {
 	struct drm_plane base;
@@ -87,14 +53,15 @@ static int meson_plane_atomic_check(struct drm_plane *plane,
 		return PTR_ERR(crtc_state);
 
 	/*
-	 * Only allow :
+	 * Allow :
 	 * - Upscaling up to 5x, vertical and horizontal
+	 * - Downscaling up to 5x, vertical and horizontal
 	 * - Final coordinates must match crtc size
 	 */
 	return drm_atomic_helper_check_plane_state(new_plane_state,
 						   crtc_state,
 						   FRAC_16_16(1, 5),
-						   DRM_PLANE_NO_SCALING,
+						   FRAC_16_16(5, 1),
 						   false, true);
 }
 
@@ -123,6 +90,10 @@ static u32 meson_g12a_afbcd_line_stride(struct meson_drm *priv)
 	case DRM_FORMAT_ARGB8888:
 	case DRM_FORMAT_XBGR8888:
 	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_RGBA8888:
+	case DRM_FORMAT_BGRX8888:
+	case DRM_FORMAT_BGRA8888:
 		line_stride = ((priv->viu.osd1_width << 5) + 127) >> 7;
 		break;
 	}
@@ -160,16 +131,15 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
 	spin_lock_irqsave(&priv->drm->event_lock, flags);
 
 	/* Check if AFBC decoder is required for this buffer */
-	if ((meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM) ||
-	     meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) &&
+	if (priv->afbcd.ops &&
 	    fb->modifier & DRM_FORMAT_MOD_ARM_AFBC(MESON_MOD_AFBC_VALID_BITS))
 		priv->viu.osd1_afbcd = true;
 	else
 		priv->viu.osd1_afbcd = false;
 
-	/* Enable OSD and BLK0, set max global alpha */
+	/* Enable OSD and BLK0, set global alpha from plane state */
 	priv->viu.osd1_ctrl_stat = OSD_ENABLE |
-				   (0x100 << OSD_GLOBAL_ALPHA_SHIFT) |
+				   (((new_state->alpha + 1) >> 8) << OSD_GLOBAL_ALPHA_SHIFT) |
 				   OSD_BLK0_ENABLE;
 
 	priv->viu.osd1_ctrl_stat2 = readl(priv->io_base +
@@ -221,6 +191,16 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
 			priv->viu.osd1_blk0_cfg[0] |= OSD_BLK_MODE_32 |
 						OSD_COLOR_MATRIX_32_ABGR;
 			break;
+		case DRM_FORMAT_RGBA8888:
+		case DRM_FORMAT_RGBX8888:
+			priv->viu.osd1_blk0_cfg[0] |= OSD_BLK_MODE_32 |
+						OSD_COLOR_MATRIX_32_RGBA;
+			break;
+		case DRM_FORMAT_BGRA8888:
+		case DRM_FORMAT_BGRX8888:
+			priv->viu.osd1_blk0_cfg[0] |= OSD_BLK_MODE_32 |
+						OSD_COLOR_MATRIX_32_BGRA;
+			break;
 		case DRM_FORMAT_RGB888:
 			priv->viu.osd1_blk0_cfg[0] |= OSD_BLK_MODE_24 |
 						OSD_COLOR_MATRIX_24_RGB;
@@ -235,12 +215,16 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
 	switch (fb->format->format) {
 	case DRM_FORMAT_XRGB8888:
 	case DRM_FORMAT_XBGR8888:
-		/* For XRGB, replace the pixel's alpha by 0xFF */
+	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_BGRX8888:
+		/* For xRGB variants, replace the pixel's alpha by 0xFF */
 		priv->viu.osd1_ctrl_stat2 |= OSD_REPLACE_EN;
 		break;
 	case DRM_FORMAT_ARGB8888:
 	case DRM_FORMAT_ABGR8888:
-		/* For ARGB, use the pixel's alpha */
+	case DRM_FORMAT_RGBA8888:
+	case DRM_FORMAT_BGRA8888:
+		/* For ARGB variants, use the pixel's alpha */
 		priv->viu.osd1_ctrl_stat2 &= ~OSD_REPLACE_EN;
 		break;
 	}
@@ -438,8 +422,7 @@ static bool meson_plane_format_mod_supported(struct drm_plane *plane,
 	if (modifier == DRM_FORMAT_MOD_LINEAR)
 		return true;
 
-	if (!meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM) &&
-	    !meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
+	if (!priv->afbcd.ops)
 		return false;
 
 	if (modifier & ~DRM_FORMAT_MOD_ARM_AFBC(MESON_MOD_AFBC_VALID_BITS))
@@ -474,8 +457,12 @@ static const struct drm_plane_funcs meson_plane_funcs = {
 static const uint32_t supported_drm_formats[] = {
 	DRM_FORMAT_ARGB8888,
 	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_RGBA8888,
+	DRM_FORMAT_BGRA8888,
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_RGBX8888,
+	DRM_FORMAT_BGRX8888,
 	DRM_FORMAT_RGB888,
 	DRM_FORMAT_RGB565,
 };
@@ -561,6 +548,8 @@ int meson_plane_create(struct meson_drm *priv)
 	}
 
 	drm_plane_helper_add(plane, &meson_plane_helper_funcs);
+
+	drm_plane_create_alpha_property(plane);
 
 	/* For now, OSD Primary plane is always on the front */
 	drm_plane_create_zpos_immutable_property(plane, 1);

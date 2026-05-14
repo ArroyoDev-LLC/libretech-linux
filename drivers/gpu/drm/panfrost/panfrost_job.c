@@ -248,6 +248,9 @@ static void panfrost_job_hw_submit(struct panfrost_job *job, int js)
 			job->is_profiled = true;
 			job->start_time = ktime_get();
 			job->start_cycles = panfrost_cycle_counter_read(pfdev);
+		} else if (job->requirements & PANFROST_JD_REQ_CYCLE_COUNT) {
+			panfrost_cycle_counter_get(pfdev);
+			job->is_profiled = true;
 		}
 
 		job_write(pfdev, JS_COMMAND_NEXT(js), JS_COMMAND_START);
@@ -336,25 +339,29 @@ static void panfrost_job_cleanup(struct kref *ref)
 	dma_fence_put(job->done_fence);
 	dma_fence_put(job->render_done_fence);
 
-	if (job->mappings) {
-		for (i = 0; i < job->bo_count; i++) {
-			if (!job->mappings[i])
-				break;
+	/* shared_bos: another job in the batch owns bos/mappings */
+	if (!job->shared_bos) {
+		if (job->mappings) {
+			for (i = 0; i < job->bo_count; i++) {
+				if (!job->mappings[i])
+					break;
 
-			atomic_dec(&job->mappings[i]->obj->gpu_usecount);
-			panfrost_gem_mapping_put(job->mappings[i]);
+				atomic_dec(&job->mappings[i]->obj->gpu_usecount);
+				panfrost_gem_mapping_put(job->mappings[i]);
+			}
+			kvfree(job->mappings);
 		}
-		kvfree(job->mappings);
+
+		if (job->bos) {
+			for (i = 0; i < job->bo_count; i++)
+				drm_gem_object_put(job->bos[i]);
+
+			kvfree(job->bos);
+		}
 	}
 
-	if (job->bos) {
-		for (i = 0; i < job->bo_count; i++)
-			drm_gem_object_put(job->bos[i]);
-
-		kvfree(job->bos);
-	}
-
-	kfree(job);
+	if (job->heap_alloc)
+		kfree(job);
 }
 
 void panfrost_job_put(struct panfrost_job *job)

@@ -50,6 +50,33 @@ struct etnaviv_iommu_global {
 	u32 memory_base;
 
 	/*
+	 * AXI SRAM flat-map.
+	 *
+	 * NPU chips with `axi_sram_size > 0` (VIPNano-QI on A311D today)
+	 * get a coherent DDR chunk allocated at global init and
+	 * flat-mapped into every MMUv2 context at GPU VA
+	 * `ETNAVIV_AXI_SRAM_VA`. Mesa's etnaviv ML driver reads the VA
+	 * via DRM_ETNAVIV_PARAM_GPU_AXI_SRAM_START and emits
+	 * `VIVS_GL_OCB_REMAP_START/END` accordingly.
+	 *
+	 * Null when the GPU has no AXI SRAM (S905D3 VIPPico v3) or when
+	 * the DDR allocation failed at init. Userspace then sees
+	 * AXI_SRAM_SIZE = 0 / AXI_SRAM_START = 0 and skips OCB_REMAP
+	 * programming.
+	 */
+	void *axi_sram_cpu;
+	dma_addr_t axi_sram_dma;
+	size_t axi_sram_size;
+	/*
+	 * If non-NULL, the AXI SRAM backing came from an mmio-sram gen_pool
+	 * reachable via the "sram" DT phandle on the GPU node -- that is,
+	 * from real on-chip SRAM. NULL means the backing was DDR via
+	 * dma_alloc_coherent (CI / silicon with axi_sram_size > 0 but no
+	 * DT-provided SRAM pool). fini uses this to pick the right free.
+	 */
+	struct gen_pool *axi_sram_pool;
+
+	/*
 	 * This union holds members needed by either MMUv1 or MMUv2, which
 	 * can not exist at the same time.
 	 */
@@ -79,6 +106,13 @@ struct etnaviv_iommu_context {
 
 	/* Not part of the context, but needs to have the same lifetime */
 	struct etnaviv_vram_mapping cmdbuf_mapping;
+
+	/*
+	 * AXI SRAM flat-map reservation at ETNAVIV_AXI_SRAM_VA. Reserved
+	 * in context_init (iff global->axi_sram_cpu is non-NULL) so
+	 * softpinned GEM allocs can't collide with the flat-map.
+	 */
+	struct drm_mm_node axi_sram_node;
 };
 
 int etnaviv_iommu_global_init(struct etnaviv_gpu *gpu);
@@ -97,6 +131,18 @@ int etnaviv_iommu_get_suballoc_va(struct etnaviv_iommu_context *ctx,
 				  struct etnaviv_vram_mapping *mapping,
 				  u32 memory_base, dma_addr_t paddr,
 				  size_t size);
+
+/*
+ * AXI SRAM flat-map GPU VA. See `struct etnaviv_iommu_global`
+ * axi_sram_* comment for the rationale. Value chosen to stay clear of
+ * `ETNAVIV_SOFTPIN_START_ADDRESS + ETNAVIV_SOFTPIN_CAP` for typical
+ * workloads (MobileNet v1 sums to a few MB of softpinned coefficients;
+ * 64 MB of softpin headroom before AXI SRAM is ample). NOT the BSP
+ * value (0x01000000) -- see ANALYSIS.md "VA layout collision".
+ */
+#define ETNAVIV_AXI_SRAM_VA	0x04000000
+
+int etnaviv_iommu_install_axi_sram(struct etnaviv_iommu_context *ctx);
 void etnaviv_iommu_put_suballoc_va(struct etnaviv_iommu_context *ctx,
 				   struct etnaviv_vram_mapping *mapping);
 
