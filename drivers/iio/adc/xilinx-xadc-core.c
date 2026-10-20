@@ -24,6 +24,7 @@
 #include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
+#include <linux/thermal.h>
 
 #include <linux/iio/buffer.h>
 #include <linux/iio/events.h>
@@ -985,6 +986,45 @@ static int xadc_read_raw(struct iio_dev *indio_dev,
 	}
 }
 
+/*
+ * LOCAL PATCH (not upstream): expose the on-die temperature as a
+ * thermal-sensor provider so a DT thermal-zone can hang a critical trip off
+ * it. Mainline publishes the sensor only through IIO, which nothing in the
+ * thermal core can consume, so a Zynq-7000 board has no over-temperature
+ * shutdown at all.
+ */
+static int xadc_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	struct iio_dev *indio_dev = thermal_zone_device_priv(tz);
+	struct xadc *xadc = iio_priv(indio_dev);
+	const struct iio_chan_spec *chan = &indio_dev->channels[0];
+	int raw, val2 = 0, ret;
+
+	/* The on-die temperature is channel 0 on both the 7 series and US. */
+	if (chan->type != IIO_TEMP)
+		return -ENODEV;
+
+	ret = xadc_read_raw(indio_dev, chan, &raw, &val2, IIO_CHAN_INFO_RAW);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * Exactly the conversion the IIO _scale/_offset attributes describe,
+	 * using the same per-variant constants, so the thermal zone and
+	 * in_temp0_input can never disagree:
+	 *
+	 *	T[m degC] = raw * temp_scale / 2^realbits - temp_offset
+	 */
+	*temp = (int)(((s64)raw * xadc->ops->temp_scale) >>
+		      chan->scan_type.realbits) - xadc->ops->temp_offset;
+
+	return 0;
+}
+
+static const struct thermal_zone_device_ops xadc_thermal_ops = {
+	.get_temp = xadc_thermal_get_temp,
+};
+
 static int xadc_write_samplerate(struct xadc *xadc, int val)
 {
 	unsigned long clk_rate = xadc_get_dclk_rate(xadc);
@@ -1320,6 +1360,7 @@ static void xadc_cancel_delayed_work(void *data)
 static int xadc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct thermal_zone_device *tz;
 	const struct xadc_ops *ops;
 	struct iio_dev *indio_dev;
 	unsigned int bipolar_mask;
@@ -1444,7 +1485,24 @@ static int xadc_probe(struct platform_device *pdev)
 	/* Go to non-buffered mode */
 	xadc_postdisable(indio_dev);
 
-	return devm_iio_device_register(dev, indio_dev);
+	ret = devm_iio_device_register(dev, indio_dev);
+	if (ret)
+		return ret;
+
+	/*
+	 * Registered AFTER the IIO device so devres tears the zone down FIRST.
+	 * Only boards whose DT declares a thermal-zone pointing at this sensor
+	 * get one; its absence is not an error.
+	 */
+	tz = devm_thermal_of_zone_register(dev, 0, indio_dev, &xadc_thermal_ops);
+	if (IS_ERR(tz)) {
+		ret = PTR_ERR(tz);
+		if (ret != -ENODEV && ret != -ENOTSUPP && ret != -EOPNOTSUPP)
+			return dev_err_probe(dev, ret,
+					     "failed to register thermal zone\n");
+	}
+
+	return 0;
 }
 
 static struct platform_driver xadc_driver = {

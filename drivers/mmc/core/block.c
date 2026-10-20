@@ -209,6 +209,58 @@ static inline int mmc_get_devidx(struct gendisk *disk)
 	return devidx;
 }
 
+/*
+ * mmc_blk_card_in_use - is the card's user-area block device (or any of its
+ * partitions) currently open?  Used by the DESTRUCTIVE write eye
+ * (drivers/mmc/core/eye.c) to refuse to clobber a live device.
+ *
+ * A mount holds the (partition) block device open, as does any raw opener (dd,
+ * fsck, blkid, a udev probe). We snapshot bd_openers (atomic) across the
+ * whole-disk device and every partition, so any of those shows up as busy.
+ * Best-effort: it cannot see an opener that races in AFTER the check -- but the
+ * write eye runs with the host claimed, so no NEW block I/O can start meanwhile.
+ * Returns false for a card with no user-area gendisk (e.g. SDIO): nothing to
+ * protect.
+ */
+bool mmc_blk_card_in_use(struct mmc_card *card)
+{
+	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
+	struct block_device *part;
+	unsigned long idx;
+	bool in_use = false;
+
+	if (!md || !md->disk)
+		return false;
+
+	rcu_read_lock();
+	xa_for_each(&md->disk->part_tbl, idx, part) {
+		if (atomic_read(&part->bd_openers)) {
+			in_use = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return in_use;
+}
+EXPORT_SYMBOL_GPL(mmc_blk_card_in_use);
+
+/*
+ * mmc_blk_card_user_sectors - capacity of the card's user-area block device in
+ * 512-byte sectors, or 0 if it has no user-area gendisk. Used by the write eye
+ * to bounds-check its scratch region against the real device size.
+ */
+sector_t mmc_blk_card_user_sectors(struct mmc_card *card)
+{
+	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
+
+	if (!md || !md->disk)
+		return 0;
+
+	return get_capacity(md->disk);
+}
+EXPORT_SYMBOL_GPL(mmc_blk_card_user_sectors);
+
 static void mmc_blk_kref_release(struct kref *ref)
 {
 	struct mmc_blk_data *md = container_of(ref, struct mmc_blk_data, kref);

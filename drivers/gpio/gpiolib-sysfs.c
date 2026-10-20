@@ -397,6 +397,15 @@ static ssize_t active_low_store(struct device *dev,
 }
 #endif /* CONFIG_GPIO_SYSFS_LEGACY */
 
+#if IS_ENABLED(CONFIG_GPIO_SYSFS_LEGACY)
+static bool gpiod_chip_has_to_irq(struct gpio_desc *desc)
+{
+	CLASS(gpio_chip_guard, guard)(desc);
+
+	return guard.gc && guard.gc->to_irq;
+}
+#endif /* CONFIG_GPIO_SYSFS_LEGACY */
+
 static umode_t gpio_is_visible(struct kobject *kobj, struct attribute *attr,
 			       int n)
 {
@@ -414,7 +423,13 @@ static umode_t gpio_is_visible(struct kobject *kobj, struct attribute *attr,
 	} else if (strcmp(attr->name, "edge") == 0) {
 		data = container_of(dev_attr, struct gpiod_data, edge_attr);
 
-		if (gpiod_to_irq(data->desc) < 0)
+		/*
+		 * Whether the chip has interrupts at all: gpiod_to_irq() may
+		 * create a mapping, which on some controllers holds one of a
+		 * few interrupt lines for as long as the line stays exported.
+		 * A line that cannot have one fails when "edge" is written.
+		 */
+		if (!gpiod_chip_has_to_irq(data->desc))
 			mode = 0;
 
 		if (!data->direction_can_change &&

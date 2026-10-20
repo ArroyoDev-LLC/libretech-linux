@@ -30,6 +30,19 @@ static const struct v4l2_frmsize_stepwise enc_frmsize[FMT_TYPES] = {
 	},
 };
 
+/* Custom control IDs for Wave5 encoder features not in standard V4L2 */
+#define V4L2_CID_WAVE5_ENC_BASE		(V4L2_CID_USER_BASE + 0x2000)
+#define V4L2_CID_WAVE5_ENC_HEVC_SAO		(V4L2_CID_WAVE5_ENC_BASE + 0)
+#define V4L2_CID_WAVE5_ENC_NR_Y_ENABLE		(V4L2_CID_WAVE5_ENC_BASE + 1)
+#define V4L2_CID_WAVE5_ENC_NR_CB_ENABLE	(V4L2_CID_WAVE5_ENC_BASE + 2)
+#define V4L2_CID_WAVE5_ENC_NR_CR_ENABLE	(V4L2_CID_WAVE5_ENC_BASE + 3)
+#define V4L2_CID_WAVE5_ENC_NR_NOISE_EST_ENABLE	(V4L2_CID_WAVE5_ENC_BASE + 4)
+#define V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_Y	(V4L2_CID_WAVE5_ENC_BASE + 5)
+#define V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_CB	(V4L2_CID_WAVE5_ENC_BASE + 6)
+#define V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_CR	(V4L2_CID_WAVE5_ENC_BASE + 7)
+#define V4L2_CID_WAVE5_ENC_HEVC_CB_QP_OFFSET	(V4L2_CID_WAVE5_ENC_BASE + 8)
+#define V4L2_CID_WAVE5_ENC_HEVC_CR_QP_OFFSET	(V4L2_CID_WAVE5_ENC_BASE + 9)
+
 static const struct vpu_format enc_fmt_list[FMT_TYPES][MAX_FMTS] = {
 	[VPU_FMT_TYPE_CODEC] = {
 		{
@@ -198,6 +211,12 @@ static int start_encode(struct vpu_instance *inst, u32 *fail_res)
 	pic_param.source_frame = &frame_buf;
 	pic_param.code_option.implicit_header_encode = 1;
 	pic_param.code_option.encode_aud = inst->encode_aud;
+	if (inst->enc_param.force_pic_qp_enable) {
+		pic_param.force_pic_qp_enable = 1;
+		pic_param.force_pic_qp_i = inst->enc_param.intra_qp;
+		pic_param.force_pic_qp_p = inst->enc_param.force_pic_qp_p;
+		pic_param.force_pic_qp_b = inst->enc_param.force_pic_qp_b;
+	}
 	ret = wave5_vpu_enc_start_one_frame(inst, &pic_param, fail_res);
 	if (ret) {
 		if (*fail_res == WAVE5_SYSERR_QUEUEING_FAIL)
@@ -846,21 +865,28 @@ static int wave5_vpu_enc_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP:
 		inst->enc_param.intra_qp = ctrl->val;
 		break;
+	case V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP:
+		inst->enc_param.force_pic_qp_p = ctrl->val;
+		if (ctrl->val)
+			inst->enc_param.force_pic_qp_enable = 1;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEVC_B_FRAME_QP:
+		inst->enc_param.force_pic_qp_b = ctrl->val;
+		if (ctrl->val)
+			inst->enc_param.force_pic_qp_enable = 1;
+		break;
 	case V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE:
 		switch (ctrl->val) {
 		case V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED:
 			inst->enc_param.disable_deblk = 1;
-			inst->enc_param.sao_enable = 0;
 			inst->enc_param.lf_cross_slice_boundary_enable = 0;
 			break;
 		case V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_ENABLED:
 			inst->enc_param.disable_deblk = 0;
-			inst->enc_param.sao_enable = 1;
 			inst->enc_param.lf_cross_slice_boundary_enable = 1;
 			break;
 		case V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY:
 			inst->enc_param.disable_deblk = 0;
-			inst->enc_param.sao_enable = 1;
 			inst->enc_param.lf_cross_slice_boundary_enable = 0;
 			break;
 		default:
@@ -872,6 +898,30 @@ static int wave5_vpu_enc_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEVC_LF_TC_OFFSET_DIV2:
 		inst->enc_param.tc_offset_div2 = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_HEVC_SAO:
+		inst->enc_param.sao_enable = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_NR_Y_ENABLE:
+		inst->enc_param.nr_y_enable = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_NR_CB_ENABLE:
+		inst->enc_param.nr_cb_enable = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_NR_CR_ENABLE:
+		inst->enc_param.nr_cr_enable = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_NR_NOISE_EST_ENABLE:
+		inst->enc_param.nr_noise_est_enable = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_Y:
+		inst->enc_param.nr_noise_sigma_y = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_CB:
+		inst->enc_param.nr_noise_sigma_cb = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_CR:
+		inst->enc_param.nr_noise_sigma_cr = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEVC_REFRESH_TYPE:
 		switch (ctrl->val) {
@@ -899,6 +949,29 @@ static int wave5_vpu_enc_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEVC_WAVEFRONT:
 		inst->enc_param.wpp_enable = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEVC_GENERAL_PB:
+		inst->enc_param.use_general_pb = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_PARTITION_DEPTH:
+		/*
+		 * V4L2 partition depth maps to CU size mode bitmask:
+		 * depth 0: only 32x32 -> cu_size_mode = 0x4
+		 * depth 1: 32x32 + 16x16 -> cu_size_mode = 0x6
+		 * depth 2: 32x32 + 16x16 + 8x8 -> cu_size_mode = 0x7
+		 */
+		switch (ctrl->val) {
+		case 0:
+			inst->enc_param.cu_size_mode = 0x4;
+			break;
+		case 1:
+			inst->enc_param.cu_size_mode = 0x6;
+			break;
+		case 2:
+		default:
+			inst->enc_param.cu_size_mode = 0x7;
+			break;
+		}
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEVC_STRONG_SMOOTHING:
 		inst->enc_param.strong_intra_smooth_enable = ctrl->val;
@@ -1047,6 +1120,12 @@ static int wave5_vpu_enc_s_ctrl(struct v4l2_ctrl *ctrl)
 		inst->enc_param.chroma_cb_qp_offset = ctrl->val;
 		inst->enc_param.chroma_cr_qp_offset = ctrl->val;
 		break;
+	case V4L2_CID_WAVE5_ENC_HEVC_CB_QP_OFFSET:
+		inst->enc_param.chroma_cb_qp_offset = ctrl->val;
+		break;
+	case V4L2_CID_WAVE5_ENC_HEVC_CR_QP_OFFSET:
+		inst->enc_param.chroma_cr_qp_offset = ctrl->val;
+		break;
 	case V4L2_CID_MPEG_VIDEO_H264_I_PERIOD:
 		inst->enc_param.intra_period = ctrl->val;
 		break;
@@ -1055,6 +1134,45 @@ static int wave5_vpu_enc_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR:
 		inst->enc_param.forced_idr_header_enable = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD:
+		/*
+		 * Period means how many frames to complete a full intra
+		 * refresh cycle. The hardware arg field is the number of
+		 * CTU rows (HEVC) or MB rows (AVC) refreshed per frame,
+		 * computed at sequence init from this period value.
+		 * Store the period directly; wave5_set_enc_openparam()
+		 * converts it to row count based on picture dimensions.
+		 */
+		inst->enc_param.intra_refresh_arg = ctrl->val;
+		inst->enc_param.intra_mb_refresh_arg = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE:
+		switch (ctrl->val) {
+		case V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_CYCLIC:
+			/*
+			 * Cyclic intra refresh: encode a band of intra
+			 * CTU rows (HEVC) or MB rows (AVC) each frame,
+			 * sweeping top-to-bottom across the picture.
+			 */
+			inst->enc_param.intra_refresh_mode =
+				REFRESH_MODE_CTU_ROWS;
+			inst->enc_param.intra_mb_refresh_mode =
+				REFRESH_MB_MODE_CTU_ROWS;
+			break;
+		case V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_RANDOM:
+			/*
+			 * Random / step-size mode: intra CTUs are spread
+			 * across the frame rather than in contiguous rows.
+			 */
+			inst->enc_param.intra_refresh_mode =
+				REFRESH_MODE_CTU_STEP_SIZE;
+			inst->enc_param.intra_mb_refresh_mode =
+				REFRESH_MB_MODE_CTU_STEP_SIZE;
+			break;
+		default:
+			return -EINVAL;
+		}
 		break;
 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
 		break;
@@ -1067,6 +1185,28 @@ static int wave5_vpu_enc_s_ctrl(struct v4l2_ctrl *ctrl)
 
 static const struct v4l2_ctrl_ops wave5_vpu_enc_ctrl_ops = {
 	.s_ctrl = wave5_vpu_enc_s_ctrl,
+};
+
+static const struct v4l2_ctrl_config wave5_hevc_cb_qp_offset = {
+	.ops = &wave5_vpu_enc_ctrl_ops,
+	.id = V4L2_CID_WAVE5_ENC_HEVC_CB_QP_OFFSET,
+	.name = "HEVC Chroma Cb QP Offset",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.min = -12,
+	.max = 12,
+	.step = 1,
+	.def = 0,
+};
+
+static const struct v4l2_ctrl_config wave5_hevc_cr_qp_offset = {
+	.ops = &wave5_vpu_enc_ctrl_ops,
+	.id = V4L2_CID_WAVE5_ENC_HEVC_CR_QP_OFFSET,
+	.name = "HEVC Chroma Cr QP Offset",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.min = -12,
+	.max = 12,
+	.step = 1,
+	.def = 0,
 };
 
 static int wave5_vpu_enc_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
@@ -1142,6 +1282,13 @@ static int wave5_set_enc_openparam(struct enc_open_param *open_param,
 	open_param->wave_param.hvs_max_delta_qp = 10;
 	open_param->wave_param.skip_intra_trans = 1;
 	open_param->wave_param.intra_nx_n_enable = 1;
+	open_param->wave_param.nr_y_enable = input.nr_y_enable;
+	open_param->wave_param.nr_cb_enable = input.nr_cb_enable;
+	open_param->wave_param.nr_cr_enable = input.nr_cr_enable;
+	open_param->wave_param.nr_noise_est_enable = input.nr_noise_est_enable;
+	open_param->wave_param.nr_noise_sigma_y = input.nr_noise_sigma_y;
+	open_param->wave_param.nr_noise_sigma_cb = input.nr_noise_sigma_cb;
+	open_param->wave_param.nr_noise_sigma_cr = input.nr_noise_sigma_cr;
 	open_param->wave_param.nr_intra_weight_y = 7;
 	open_param->wave_param.nr_intra_weight_cb = 7;
 	open_param->wave_param.nr_intra_weight_cr = 7;
@@ -1202,6 +1349,12 @@ static int wave5_set_enc_openparam(struct enc_open_param *open_param,
 	open_param->wave_param.strong_intra_smooth_enable = input.strong_intra_smooth_enable;
 	open_param->wave_param.max_num_merge = input.max_num_merge;
 	open_param->wave_param.tmvp_enable = input.tmvp_enable;
+	open_param->wave_param.force_pic_qp_enable = input.force_pic_qp_enable;
+	open_param->wave_param.force_pic_qp_p = input.force_pic_qp_p;
+	open_param->wave_param.force_pic_qp_b = input.force_pic_qp_b;
+	open_param->wave_param.use_general_pb = input.use_general_pb;
+	if (input.cu_size_mode)
+		open_param->wave_param.cu_size_mode = input.cu_size_mode;
 	open_param->wave_param.transform8x8_enable = input.transform8x8_enable;
 	open_param->wave_param.chroma_cb_qp_offset = input.chroma_cb_qp_offset;
 	open_param->wave_param.chroma_cr_qp_offset = input.chroma_cr_qp_offset;
@@ -1584,7 +1737,7 @@ static int wave5_vpu_open_enc(struct file *filp)
 	}
 	v4l2_m2m_set_src_buffered(inst->v4l2_fh.m2m_ctx, true);
 
-	v4l2_ctrl_handler_init(v4l2_ctrl_hdl, 50);
+	v4l2_ctrl_handler_init(v4l2_ctrl_hdl, 65);
 	v4l2_ctrl_new_std_menu(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
 			       V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
 			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10, 0,
@@ -1602,6 +1755,12 @@ static int wave5_vpu_open_enc(struct file *filp)
 	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
 			  V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP,
 			  0, 63, 1, 30);
+	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
+			  V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP,
+			  0, 63, 1, 0);
+	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
+			  V4L2_CID_MPEG_VIDEO_HEVC_B_FRAME_QP,
+			  0, 63, 1, 0);
 	v4l2_ctrl_new_std_menu(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
 			       V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE,
 			       V4L2_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE_DISABLED_AT_SLICE_BOUNDARY, 0,
@@ -1612,6 +1771,81 @@ static int wave5_vpu_open_enc(struct file *filp)
 	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
 			  V4L2_CID_MPEG_VIDEO_HEVC_LF_TC_OFFSET_DIV2,
 			  -6, 6, 1, 0);
+	{
+		static const struct v4l2_ctrl_config wave5_hevc_sao_ctrl = {
+			.ops = &wave5_vpu_enc_ctrl_ops,
+			.id = V4L2_CID_WAVE5_ENC_HEVC_SAO,
+			.name = "HEVC SAO Enable",
+			.type = V4L2_CTRL_TYPE_BOOLEAN,
+			.min = 0,
+			.max = 1,
+			.step = 1,
+			.def = 1,
+		};
+
+		v4l2_ctrl_new_custom(v4l2_ctrl_hdl, &wave5_hevc_sao_ctrl,
+				     NULL);
+	}
+	v4l2_ctrl_new_custom(v4l2_ctrl_hdl, &wave5_hevc_cb_qp_offset, NULL);
+	v4l2_ctrl_new_custom(v4l2_ctrl_hdl, &wave5_hevc_cr_qp_offset, NULL);
+	{
+		static const struct v4l2_ctrl_config wave5_nr_ctrls[] = {
+			{
+				.ops = &wave5_vpu_enc_ctrl_ops,
+				.id = V4L2_CID_WAVE5_ENC_NR_Y_ENABLE,
+				.name = "Noise Reduction Y Enable",
+				.type = V4L2_CTRL_TYPE_BOOLEAN,
+				.min = 0, .max = 1, .step = 1, .def = 0,
+			},
+			{
+				.ops = &wave5_vpu_enc_ctrl_ops,
+				.id = V4L2_CID_WAVE5_ENC_NR_CB_ENABLE,
+				.name = "Noise Reduction Cb Enable",
+				.type = V4L2_CTRL_TYPE_BOOLEAN,
+				.min = 0, .max = 1, .step = 1, .def = 0,
+			},
+			{
+				.ops = &wave5_vpu_enc_ctrl_ops,
+				.id = V4L2_CID_WAVE5_ENC_NR_CR_ENABLE,
+				.name = "Noise Reduction Cr Enable",
+				.type = V4L2_CTRL_TYPE_BOOLEAN,
+				.min = 0, .max = 1, .step = 1, .def = 0,
+			},
+			{
+				.ops = &wave5_vpu_enc_ctrl_ops,
+				.id = V4L2_CID_WAVE5_ENC_NR_NOISE_EST_ENABLE,
+				.name = "Noise Reduction Auto Estimate",
+				.type = V4L2_CTRL_TYPE_BOOLEAN,
+				.min = 0, .max = 1, .step = 1, .def = 1,
+			},
+			{
+				.ops = &wave5_vpu_enc_ctrl_ops,
+				.id = V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_Y,
+				.name = "Noise Reduction Sigma Y",
+				.type = V4L2_CTRL_TYPE_INTEGER,
+				.min = 0, .max = 255, .step = 1, .def = 0,
+			},
+			{
+				.ops = &wave5_vpu_enc_ctrl_ops,
+				.id = V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_CB,
+				.name = "Noise Reduction Sigma Cb",
+				.type = V4L2_CTRL_TYPE_INTEGER,
+				.min = 0, .max = 255, .step = 1, .def = 0,
+			},
+			{
+				.ops = &wave5_vpu_enc_ctrl_ops,
+				.id = V4L2_CID_WAVE5_ENC_NR_NOISE_SIGMA_CR,
+				.name = "Noise Reduction Sigma Cr",
+				.type = V4L2_CTRL_TYPE_INTEGER,
+				.min = 0, .max = 255, .step = 1, .def = 0,
+			},
+		};
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(wave5_nr_ctrls); i++)
+			v4l2_ctrl_new_custom(v4l2_ctrl_hdl,
+					     &wave5_nr_ctrls[i], NULL);
+	}
 	v4l2_ctrl_new_std_menu(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
 			       V4L2_CID_MPEG_VIDEO_HEVC_REFRESH_TYPE,
 			       V4L2_MPEG_VIDEO_HEVC_REFRESH_IDR, 0,
@@ -1628,6 +1862,12 @@ static int wave5_vpu_open_enc(struct file *filp)
 	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
 			  V4L2_CID_MPEG_VIDEO_HEVC_WAVEFRONT,
 			  0, 1, 1, 0);
+	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
+			  V4L2_CID_MPEG_VIDEO_HEVC_GENERAL_PB,
+			  0, 1, 1, 0);
+	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
+			  V4L2_CID_MPEG_VIDEO_HEVC_MAX_PARTITION_DEPTH,
+			  0, 2, 1, 2);
 	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
 			  V4L2_CID_MPEG_VIDEO_HEVC_STRONG_SMOOTHING,
 			  0, 1, 1, 1);
@@ -1725,6 +1965,13 @@ static int wave5_vpu_open_enc(struct file *filp)
 			  V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
 			  0, 1, 1, 0);
 
+	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
+			  V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD,
+			  0, 2047, 1, 0);
+	v4l2_ctrl_new_std_menu(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
+			       V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE,
+			       V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_CYCLIC, 0,
+			       V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_CYCLIC);
 	if (v4l2_ctrl_hdl->error) {
 		ret = -ENODEV;
 		goto cleanup_inst;

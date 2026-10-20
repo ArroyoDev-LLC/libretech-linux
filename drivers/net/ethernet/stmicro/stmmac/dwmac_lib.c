@@ -271,8 +271,10 @@ void stmmac_set_mac(void __iomem *ioaddr, bool enable)
 	else
 		value &= ~(MAC_ENABLE_TX | MAC_ENABLE_RX);
 
-	if (value != old_val)
+	if (value != old_val) {
+		pr_debug("%s: writing to MAC_CTRL_REG %x\n", __func__, value);
 		writel(value, ioaddr + MAC_CTRL_REG);
+	}
 }
 
 void stmmac_get_mac_addr(void __iomem *ioaddr, unsigned char *addr,

@@ -220,6 +220,20 @@ static const struct flash_info winbond_nor_parts[] = {
 		.name = "w25q256",
 		.size = SZ_32M,
 		.no_sfdp_flags = SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
+		/*
+		 * The part supports the 4-byte instruction set (13h/0Ch/…), but
+		 * that is advertised through SFDP 4BAIT, which a blank-SFDP unit
+		 * never exposes -- so the core falls back to entering 4-byte
+		 * ADDRESS MODE with EN4B and keeps using the 3-byte opcodes.
+		 * That is the mode a crash can strand the flash in, and on a
+		 * board whose RESET# is not wired it makes
+		 * spi_nor_set_4byte_addr_mode() emit its "enabling reset hack"
+		 * WARN and taint the kernel. Declaring the opcodes here is the
+		 * documented remedy for exactly this case (see
+		 * spi_nor_init_fixup_flags()): the core then issues 13h with a
+		 * 4-byte address and never touches the mode bit at all.
+		 */
+		.fixup_flags = SPI_NOR_4B_OPCODES,
 		.fixups = &w25q256_fixups,
 	}, {
 		.id = SNOR_ID(0xef, 0x40, 0x20),

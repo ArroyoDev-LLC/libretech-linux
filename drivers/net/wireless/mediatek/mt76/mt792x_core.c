@@ -693,6 +693,29 @@ int mt792x_init_wiphy(struct ieee80211_hw *hw)
 
 	if (is_mt7921(&dev->mt76)) {
 		ieee80211_hw_set(hw, CHANCTX_STA_CSA);
+
+		/*
+		 * Default mac80211 power-save OFF for MT7921 on our kernel.
+		 *
+		 * mac80211 advertises WIPHY_FLAG_PS_ON_BY_DEFAULT for every
+		 * driver, so cfg80211 boots wdev->ps = true and "iw dev wlanX
+		 * get power_save" reads "on" with no userspace config. On the
+		 * MT7921E (PCIe/M.2) the firmware then silently sleeps through
+		 * AP-buffered RX traffic under heavy display CPU/IRQ load
+		 * (HDMI scanout on the Genio 510 EVK): a 360 s ping soak showed
+		 * 27 fail-seconds / 10 s max drop with PS on vs 0 with PS off,
+		 * no deauth/beacon-loss in dmesg -- pure PS-induced RX stalls.
+		 *
+		 * Our targets (Genio EVKs / Chromebooks / x86 hosts) are
+		 * mains-powered dev/demo boxes where link reliability beats the
+		 * marginal idle-power saving, so flip the boot default to off.
+		 * SUPPORTS_PS stays advertised, so a user can still opt back in
+		 * with "iw dev wlanX set power_save on". Clearing the flag here
+		 * (after ieee80211_alloc_hw set it, before ieee80211_register_hw)
+		 * makes cfg80211 init wdev->ps = false. mt7921-scoped so the
+		 * shared mt76 core and other MT76 parts are untouched.
+		 */
+		wiphy->flags &= ~WIPHY_FLAG_PS_ON_BY_DEFAULT;
 	}
 
 	if (dev->pm.enable)

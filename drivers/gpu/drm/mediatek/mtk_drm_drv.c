@@ -373,7 +373,7 @@ static int mtk_drm_match(struct device *dev, const void *data)
 static bool mtk_drm_get_all_drm_priv(struct device *dev)
 {
 	struct mtk_drm_private *drm_priv = dev_get_drvdata(dev);
-	struct mtk_drm_private *all_drm_priv[MAX_CRTC];
+	struct mtk_drm_private *all_drm_priv[MAX_CRTC] = { NULL };
 	struct mtk_drm_private *temp_drm_priv;
 	struct device_node *phandle = dev->parent->of_node;
 	const struct of_device_id *of_id;
@@ -420,6 +420,21 @@ static bool mtk_drm_get_all_drm_priv(struct device *dev)
 	}
 
 	if (drm_priv->data->mmsys_dev_num == cnt) {
+		/*
+		 * all_drm_priv[] above is indexed by CRTC role (MAIN/EXT/THIRD),
+		 * but the consolidation below -- and kms_init's all_drm_private[]
+		 * loop -- consume it as a contiguous 0..cnt-1 list of mmsys
+		 * devices. A single-mmsys SoC whose only pipeline is the EXT path
+		 * (e.g. mt8365 HDMI-only, DSI main path disabled) lands at
+		 * CRTC_EXT with the CRTC_MAIN slot left NULL; dereferencing that
+		 * empty slot faults (NULL + offsetof(all_drm_private)). Compact
+		 * the populated slots to the front -- a no-op when a MAIN path is
+		 * present (the common case), so existing configs are unaffected.
+		 */
+		for (i = 0, j = 0; i < MAX_CRTC; i++)
+			if (all_drm_priv[i])
+				all_drm_priv[j++] = all_drm_priv[i];
+
 		for (i = 0; i < cnt; i++)
 			for (j = 0; j < cnt; j++)
 				all_drm_priv[j]->all_drm_private[i] = all_drm_priv[i];

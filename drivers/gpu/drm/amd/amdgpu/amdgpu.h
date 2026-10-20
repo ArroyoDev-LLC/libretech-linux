@@ -1176,6 +1176,12 @@ struct amdgpu_device {
 	 * queue fence.
 	 */
 	struct xarray			userq_xa;
+	/**
+	 * @userq_doorbell_xa: Global user queue map (doorbell_index → queue)
+	 * for IRQ-safe lookup (priv-fault / illegal-inst → hang_detect).
+	 * Coexists with per-mgr idr + userq_mgr_list on 6.18.y-lc.
+	 */
+	struct xarray			userq_doorbell_xa;
 
 	/* df */
 	struct amdgpu_df                df;

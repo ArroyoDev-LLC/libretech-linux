@@ -336,8 +336,16 @@ void ucsi_altmode_update_active(struct ucsi_connector *con)
 		cur = 0xff;
 	}
 
-	if (cur < UCSI_MAX_ALTMODES)
-		altmode = typec_altmode_get_partner(con->port_altmode[cur]);
+	if (cur < UCSI_MAX_ALTMODES) {
+		/*
+		 * Some firmware (e.g. Qualcomm X1E80100) returns a 1-based
+		 * altmode index in GET_CURRENT_CAM. Adjust to 0-based for the
+		 * con->port_altmode[] access when the quirk is set.
+		 */
+		u8 idx = (con->ucsi->quirks & UCSI_CAM_1INDEXED) && cur > 0 ?
+			 cur - 1 : cur;
+		altmode = typec_altmode_get_partner(con->port_altmode[idx]);
+	}
 
 	for (i = 0; con->partner_altmode[i]; i++)
 		typec_altmode_update_active(con->partner_altmode[i],
@@ -2021,6 +2029,19 @@ static int ucsi_init(struct ucsi *ucsi)
 		dev_warn(ucsi->dev, "UCSI: Invalid num_connectors %d. Likely buggy FW\n",
 			 ucsi->cap.num_connectors);
 		ucsi->cap.num_connectors &= 0x7f; // clear bit and carry on
+	}
+
+	/*
+	 * Platform quirk: PPM advertises too few connectors (GET_CAPABILITY)
+	 * while still notifying / serving higher connector numbers. Raise the
+	 * count so ports are registered and CCI connector-change events ACK.
+	 */
+	if ((ucsi->quirks & UCSI_MIN_CONNECTORS_2) &&
+	    ucsi->cap.num_connectors < 2) {
+		dev_info(ucsi->dev,
+			 "UCSI: firmware reported %u connector(s); quirk raises to 2\n",
+			 ucsi->cap.num_connectors);
+		ucsi->cap.num_connectors = 2;
 	}
 
 	/* Allocate the connectors. Released in ucsi_unregister() */

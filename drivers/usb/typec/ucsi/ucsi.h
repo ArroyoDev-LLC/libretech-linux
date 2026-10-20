@@ -485,6 +485,15 @@ struct ucsi {
 	unsigned long quirks;
 #define UCSI_NO_PARTNER_PDOS	BIT(0)	/* Don't read partner's PDOs */
 #define UCSI_DELAY_DEVICE_PDOS	BIT(1)	/* Reading PDOs fails until the parter is in PD mode */
+#define UCSI_CAM_1INDEXED	BIT(3)	/* GET_CURRENT_CAM returns 1-based index, not 0-based */
+	/*
+	 * Firmware under-reports bNumConnectors in GET_CAPABILITY (e.g. 1)
+	 * but still emits CCI / answers GET_CONNECTOR_* for connector 2+.
+	 * Force a minimum of 2 registered connectors so events are handled
+	 * and the PPM is ACKed (otherwise dmesg floods with
+	 * "bogus connector number in CCI").
+	 */
+#define UCSI_MIN_CONNECTORS_2	BIT(4)
 };
 
 #define UCSI_MAX_DATA_LENGTH(u) (((u)->version < UCSI_VERSION_2_0) ? 0x10 : 0xff)

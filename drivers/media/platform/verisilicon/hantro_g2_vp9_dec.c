@@ -895,7 +895,15 @@ int hantro_g2_vp9_dec_run(struct hantro_ctx *ctx)
 
 	ret = start_prepare_run(ctx, &decode_params);
 	if (ret) {
-		hantro_end_prepare_run(ctx);
+		/*
+		 * start_prepare_run() already called hantro_start_prepare_run()
+		 * before failing, so the request must still be completed -- but
+		 * the job is aborted here and the hardware is never kicked, so
+		 * complete it WITHOUT arming the watchdog. The previous
+		 * hantro_end_prepare_run() left a 2 s watchdog running that
+		 * nothing would cancel, firing later against an unrelated job.
+		 */
+		hantro_abort_prepare_run(ctx);
 		return ret;
 	}
 

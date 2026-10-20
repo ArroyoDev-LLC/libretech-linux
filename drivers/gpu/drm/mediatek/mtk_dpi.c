@@ -15,6 +15,7 @@
 #include <linux/of_graph.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
+#include <linux/reset.h>
 #include <linux/soc/mediatek/mtk-mmsys.h>
 #include <linux/types.h>
 
@@ -74,6 +75,7 @@ struct mtk_dpi {
 	struct clk *engine_clk;
 	struct clk *pixel_clk;
 	struct clk *tvd_clk;
+	struct reset_control *reset;
 	int irq;
 	struct drm_display_mode mode;
 	const struct mtk_dpi_conf *conf;
@@ -538,6 +540,15 @@ static int mtk_dpi_power_on(struct mtk_dpi *dpi)
 		dev_err(dpi->dev, "Failed to enable pixel clock: %d\n", ret);
 		goto err_pixel;
 	}
+
+	/*
+	 * The mt8188 DPI that feeds the internal HDMI encoder needs its
+	 * MM-clock-domain reset pulsed (with the clocks running) before it
+	 * will emit pixels -- the BSP does this and mainline's mtk_dpi never
+	 * did, so the pipeline configures + clocks but the output stays dark.
+	 * Optional: nodes without a "resets" property get a NULL rstc no-op.
+	 */
+	reset_control_reset(dpi->reset);
 
 	return 0;
 
@@ -1300,6 +1311,12 @@ static int mtk_dpi_probe(struct platform_device *pdev)
 	if (IS_ERR(dpi->tvd_clk))
 		return dev_err_probe(dev, PTR_ERR(dpi->tvd_clk),
 				     "Failed to get tvdpll clock\n");
+
+	/* Optional: the mt8188 internal-HDMI DPI declares an MM-clk reset. */
+	dpi->reset = devm_reset_control_get_optional_exclusive(dev, NULL);
+	if (IS_ERR(dpi->reset))
+		return dev_err_probe(dev, PTR_ERR(dpi->reset),
+				     "Failed to get reset control\n");
 
 	dpi->irq = platform_get_irq(pdev, 0);
 	if (dpi->irq < 0)

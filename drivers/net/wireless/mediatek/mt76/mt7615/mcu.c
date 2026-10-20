@@ -5,6 +5,7 @@
  *         Ryder Lee <ryder.lee@mediatek.com>
  */
 
+#include <linux/delay.h>
 #include <linux/firmware.h>
 #include "mt7615.h"
 #include "mcu.h"
@@ -1228,7 +1229,7 @@ static int mt7615_load_patch(struct mt7615_dev *dev, u32 addr, const char *name)
 {
 	const struct mt7615_patch_hdr *hdr;
 	const struct firmware *fw = NULL;
-	int len, ret, sem;
+	int len, ret, sem, i;
 
 	ret = firmware_request_nowarn(&fw, name, dev->mt76.dev);
 	if (ret)
@@ -1240,16 +1241,29 @@ static int mt7615_load_patch(struct mt7615_dev *dev, u32 addr, const char *name)
 		goto release_fw;
 	}
 
-	sem = mt76_connac_mcu_patch_sem_ctrl(&dev->mt76, true);
-	switch (sem) {
-	case PATCH_IS_DL:
-		goto release_fw;
-	case PATCH_NOT_DL_SEM_SUCCESS:
-		break;
-	default:
-		dev_err(dev->mt76.dev, "Failed to get patch semaphore\n");
-		ret = -EAGAIN;
-		goto release_fw;
+	/*
+	 * On the MT7663 combo chip the ROM patch and its download semaphore are
+	 * shared between the Wi-Fi (mt7663s) and BT (btmtksdio) SDIO functions.
+	 * At boot both probe near-simultaneously, and whichever loses the race
+	 * sees PATCH_NOT_DL_SEM_FAIL while the other function holds the semaphore
+	 * mid-download. Poll until that function finishes (-> PATCH_IS_DL) or we
+	 * acquire the semaphore ourselves, instead of bailing out: the bare
+	 * one-shot check wedged mt7663s at boot ("Failed to get patch
+	 * semaphore"), while a manual reload -- racing nothing -- always
+	 * succeeded.
+	 */
+	for (i = 0; ; i++) {
+		sem = mt76_connac_mcu_patch_sem_ctrl(&dev->mt76, true);
+		if (sem == PATCH_IS_DL)
+			goto release_fw;
+		if (sem == PATCH_NOT_DL_SEM_SUCCESS)
+			break;
+		if (sem != PATCH_NOT_DL_SEM_FAIL || i >= 50) {
+			dev_err(dev->mt76.dev, "Failed to get patch semaphore\n");
+			ret = -EAGAIN;
+			goto release_fw;
+		}
+		msleep(20);
 	}
 
 	hdr = (const struct mt7615_patch_hdr *)(fw->data);

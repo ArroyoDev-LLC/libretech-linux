@@ -1134,6 +1134,17 @@ struct drm_xe_vm_bind_op {
 #define DRM_XE_VM_BIND_FLAG_CHECK_PXP	(1 << 4)
 #define DRM_XE_VM_BIND_FLAG_CPU_ADDR_MIRROR	(1 << 5)
 #define DRM_XE_VM_BIND_FLAG_MADVISE_AUTORESET	(1 << 6)
+/**
+ * DRM_XE_VM_BIND_FLAG_NO_CPU_ACCESS - Caller asserts the BO will not be
+ * CPU-mmaped on this driver instance. Allows binding an imported dma-buf
+ * (bo->cpu_caching == 0) with a non-coherent (XE_COH_NONE) PAT for
+ * GPU<->GPU peer DMA where coherency with CPU caches is not required.
+ * No-op for BOs that already carry a cpu_caching mode (i.e., BOs created
+ * via DRM_IOCTL_XE_GEM_CREATE). Userspace must abide by the contract;
+ * violations (mmap + CPU write of an imported BO bound with this flag)
+ * yield undefined behaviour with no kernel-side detection.
+ */
+#define DRM_XE_VM_BIND_FLAG_NO_CPU_ACCESS	(1 << 8)
 	/** @flags: Bind flags */
 	__u32 flags;
 

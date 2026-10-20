@@ -931,6 +931,14 @@ bool xe_pt_zap_ptes(struct xe_tile *tile, struct xe_vma *vma)
 	if (!(pt_mask & BIT(tile->id)))
 		return false;
 
+	/*
+	 * The VM's page tables are freed by xe_vm_close_and_put() before the
+	 * VMAs of shared BOs are unlinked; an eviction racing that teardown
+	 * still reaches here. Nothing to zap in a VM with no page tables.
+	 */
+	if (!pt)
+		return false;
+
 	(void)xe_pt_walk_shared(&pt->base, pt->level, xe_vma_start(vma),
 				xe_vma_end(vma), &xe_walk.base);
 

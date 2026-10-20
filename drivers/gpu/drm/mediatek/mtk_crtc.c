@@ -826,9 +826,10 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
 		wait_event_timeout(mtk_crtc->cb_blocking_queue,
 				   mtk_crtc->cmdq_vblank_cnt == 0,
 				   msecs_to_jiffies(500));
+	else
 #endif
-	/* Wait for planes to be disabled */
-	drm_crtc_wait_one_vblank(crtc);
+		/* Wait for planes to be disabled */
+		drm_crtc_wait_one_vblank(crtc);
 
 	drm_crtc_vblank_off(crtc);
 	mtk_crtc_ddp_hw_fini(mtk_crtc);

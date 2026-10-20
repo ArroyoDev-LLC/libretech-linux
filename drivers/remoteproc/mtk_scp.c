@@ -5,6 +5,7 @@
 #include <asm/barrier.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
+#include <linux/elf.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
@@ -943,6 +944,75 @@ static int scp_unprepare(struct rproc *rproc)
 	return 0;
 }
 
+/*
+ * Copy a coredump segment. The SCP SRAM / L1TCM regions are ioremap()'d (Device
+ * memory), so the default rproc_coredump copy (plain memcpy) faults with an
+ * alignment abort on its unaligned wide loads (LDP). Use memcpy_fromio, which is
+ * also correct for the Normal-memory shared-DRAM region.
+ */
+static void scp_coredump_copy(struct rproc *rproc, struct rproc_dump_segment *segment,
+			      void *dest, size_t offset, size_t size)
+{
+	void *ptr = scp_da_to_va(rproc, segment->da + offset, size, NULL);
+
+	if (!ptr) {
+		dev_err(&rproc->dev, "coredump: no VA for da %#llx (+%#zx)\n",
+			segment->da, offset);
+		memset(dest, 0xff, size);
+		return;
+	}
+	memcpy_fromio(dest, ptr, size);
+}
+
+/*
+ * Register the SCP memory regions as coredump segments and emit a devcoredump
+ * on crash. Without this the rproc dump_segments list is empty, so a watchdog
+ * crash silently resets the SCP with no post-mortem (see the internal
+ * ChromeOS SCP status record). The segment list is rebuilt
+ * from scratch on every crash because parse_fw/load re-run on each recovery and
+ * would otherwise accumulate duplicate segments. Segments use a custom copy fn
+ * (scp_coredump_copy) because the SRAM is iomem.
+ */
+static void scp_coredump(struct rproc *rproc)
+{
+	struct mtk_scp *scp = rproc->priv;
+	const struct mtk_scp_sizes_data *scp_sizes = scp->data->scp_sizes;
+	u64 sram_da;
+
+	rproc_coredump_cleanup(rproc);
+
+	/*
+	 * The SCP ISA is per-SoC, not RV32 everywhere: MT8183/MT8186 ship an
+	 * ARM EABI5 blob, the MT8192 class an RV32 one. Take it from the
+	 * per-SoC data rather than hardcoding, or an MT8183 dump is labelled
+	 * RISC-V and no disassembler will read it.
+	 */
+	rproc_coredump_set_elf_info(rproc, ELFCLASS32, scp->data->elf_machine);
+
+	/*
+	 * SRAM (code + data) is the primary post-mortem region. Its device
+	 * address base differs by da_to_va variant: mt8183 maps SRAM from da 0,
+	 * the mt8192-class maps it from sram_phys.
+	 */
+	sram_da = (scp->data->scp_da_to_va == mt8183_scp_da_to_va) ? 0 : scp->sram_phys;
+	rproc_coredump_add_custom_segment(rproc, sram_da, scp->sram_size,
+					  scp_coredump_copy, NULL);
+
+	/* Optional L1TCM (mt8192-class). */
+	if (scp->cluster->l1tcm_size)
+		rproc_coredump_add_custom_segment(rproc, scp->cluster->l1tcm_phys,
+						  scp->cluster->l1tcm_size,
+						  scp_coredump_copy, NULL);
+
+	/* Optional shared DRAM (da_to_va maps da == dma_addr to cpu_addr). */
+	if (scp_sizes->max_dram_size)
+		rproc_coredump_add_custom_segment(rproc, scp->dma_addr,
+						  scp_sizes->max_dram_size,
+						  scp_coredump_copy, NULL);
+
+	rproc_coredump(rproc);
+}
+
 static const struct rproc_ops scp_ops = {
 	.prepare	= scp_prepare,
 	.unprepare	= scp_unprepare,
@@ -951,6 +1021,7 @@ static const struct rproc_ops scp_ops = {
 	.load		= scp_load,
 	.da_to_va	= scp_da_to_va,
 	.parse_fw	= scp_parse_fw,
+	.coredump	= scp_coredump,
 	.sanity_check	= rproc_elf_sanity_check,
 };
 
@@ -1446,6 +1517,9 @@ static const struct mtk_scp_of_data mt8183_of_data = {
 	.host_to_scp_int_bit = MT8183_HOST_IPC_INT_BIT,
 	.ipi_buf_offset = 0x7bdb0,
 	.scp_sizes = &default_scp_sizes,
+	/* linux-firmware mediatek/mt8183/scp.img: "ELF 32-bit LSB executable,
+	 * ARM, EABI5" -- a Cortex-M, not the RV32 core of the mt8192 class. */
+	.elf_machine = EM_ARM,
 };
 
 static const struct mtk_scp_of_data mt8186_of_data = {
@@ -1460,6 +1534,8 @@ static const struct mtk_scp_of_data mt8186_of_data = {
 	.host_to_scp_int_bit = MT8183_HOST_IPC_INT_BIT,
 	.ipi_buf_offset = 0x3bdb0,
 	.scp_sizes = &default_scp_sizes,
+	/* linux-firmware mediatek/mt8186/scp.img: "ARM, EABI5". */
+	.elf_machine = EM_ARM,
 };
 
 static const struct mtk_scp_of_data mt8188_of_data = {
@@ -1473,6 +1549,8 @@ static const struct mtk_scp_of_data mt8188_of_data = {
 	.host_to_scp_reg = MT8192_GIPC_IN_SET,
 	.host_to_scp_int_bit = MT8192_HOST_IPC_INT_BIT,
 	.scp_sizes = &mt8188_scp_sizes,
+	/* linux-firmware mediatek/mt8188/scp_c0.img: "UCB RISC-V, RVC". */
+	.elf_machine = EM_RISCV,
 };
 
 static const struct mtk_scp_of_data mt8188_of_data_c1 = {
@@ -1486,6 +1564,11 @@ static const struct mtk_scp_of_data mt8188_of_data_c1 = {
 	.host_to_scp_reg = MT8192_GIPC_IN_SET,
 	.host_to_scp_int_bit = MT8195_CORE1_HOST_IPC_INT_BIT,
 	.scp_sizes = &mt8188_scp_c1_sizes,
+	/* No _c1 blob ships in linux-firmware (mediatek/mt8188/ holds only
+	 * scp_c0.img), so this is INFERRED from c0 of the same dual-SCP
+	 * cluster rather than read off a binary. Confirm with `file` if an
+	 * mt8188 scp_c1 image ever lands. */
+	.elf_machine = EM_RISCV,
 };
 
 static const struct mtk_scp_of_data mt8192_of_data = {
@@ -1499,6 +1582,8 @@ static const struct mtk_scp_of_data mt8192_of_data = {
 	.host_to_scp_reg = MT8192_GIPC_IN_SET,
 	.host_to_scp_int_bit = MT8192_HOST_IPC_INT_BIT,
 	.scp_sizes = &default_scp_sizes,
+	/* linux-firmware mediatek/mt8192/scp.img: "UCB RISC-V, RVC". */
+	.elf_machine = EM_RISCV,
 };
 
 static const struct mtk_scp_of_data mt8195_of_data = {
@@ -1512,6 +1597,8 @@ static const struct mtk_scp_of_data mt8195_of_data = {
 	.host_to_scp_reg = MT8192_GIPC_IN_SET,
 	.host_to_scp_int_bit = MT8192_HOST_IPC_INT_BIT,
 	.scp_sizes = &mt8195_scp_sizes,
+	/* linux-firmware mediatek/mt8195/scp.img: "UCB RISC-V, RVC". */
+	.elf_machine = EM_RISCV,
 };
 
 static const struct mtk_scp_of_data mt8195_of_data_c1 = {
@@ -1525,6 +1612,9 @@ static const struct mtk_scp_of_data mt8195_of_data_c1 = {
 	.host_to_scp_reg = MT8192_GIPC_IN_SET,
 	.host_to_scp_int_bit = MT8195_CORE1_HOST_IPC_INT_BIT,
 	.scp_sizes = &default_scp_sizes,
+	/* No _c1 blob ships in linux-firmware (mediatek/mt8195/ holds only
+	 * scp.img), so INFERRED from c0 of the same dual-SCP cluster. */
+	.elf_machine = EM_RISCV,
 };
 
 static const struct mtk_scp_of_data *mt8188_of_data_cores[] = {

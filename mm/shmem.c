@@ -5255,10 +5255,31 @@ static const struct address_space_operations shmem_aops = {
 	.error_remove_folio = shmem_error_remove_folio,
 };
 
+/*
+ * ashmem-on-memfd compat for Android.  Mainline dropped the ashmem driver in
+ * 5.18, but Android 16's ApplicationSharedMemory (via libcutils
+ * ashmem_create_region) still probes memfd support with
+ * ioctl(memfd, ASHMEM_GET_SIZE) in __has_memfd_support() and requires the file
+ * size back before it will use the memfd path (sys.use_memfd=true); every
+ * other ashmem op is then done memfd-natively in userspace (fstat / seals /
+ * no-op pin).  Answer just that one ioctl on shmem/memfd files so system_server
+ * boots without a /dev/ashmem device.
+ * ASHMEM_GET_SIZE == _IO(0x77, 4) == 0x7704 (Android uapi linux/ashmem.h).
+ */
+static long shmem_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	if (cmd == 0x7704)
+		return i_size_read(file_inode(file));
+
+	return -ENOTTY;
+}
+
 static const struct file_operations shmem_file_operations = {
 	.mmap		= shmem_mmap,
 	.open		= shmem_file_open,
 	.get_unmapped_area = shmem_get_unmapped_area,
+	.unlocked_ioctl	= shmem_ioctl,
+	.compat_ioctl	= shmem_ioctl,
 #ifdef CONFIG_TMPFS
 	.llseek		= shmem_file_llseek,
 	.read_iter	= shmem_file_read_iter,

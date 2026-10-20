@@ -2372,6 +2372,8 @@ L:	linux-amlogic@lists.infradead.org
 S:	Maintained
 W:	http://linux-meson.com/
 F:	Documentation/devicetree/bindings/phy/amlogic*
+F:	Documentation/devicetree/bindings/soc/amlogic/amlogic,gxl-ddr-pub-mon.yaml
+F:	Documentation/devicetree/bindings/soc/amlogic/amlogic,gxl-pubmon-sc-shmem.yaml
 F:	arch/arm/boot/dts/amlogic/
 F:	arch/arm/mach-meson/
 F:	arch/arm64/boot/dts/amlogic/
@@ -12550,6 +12552,13 @@ S:	Supported
 F:	drivers/infiniband/hw/irdma/
 F:	include/uapi/rdma/irdma-abi.h
 
+INTEL GAUSSIAN & NEURAL ACCELERATOR (GNA)
+M:	Maciej Kwapulinski <maciej.kwapulinski@linux.intel.com>
+S:	Maintained
+F:	Documentation/gpu/gna.rst
+F:	drivers/gpu/drm/gna/
+F:	include/uapi/drm/gna_drm.h
+
 INTEL GPIO DRIVERS
 M:	Andy Shevchenko <andy@kernel.org>
 L:	linux-gpio@vger.kernel.org
@@ -22213,6 +22222,15 @@ T:	git https://github.com/spacemit-com/linux
 F:	arch/riscv/boot/dts/spacemit/
 N:	spacemit
 K:	spacemit
+
+RISC-V TENSTORRENT SoC SUPPORT
+M:	Drew Fustini <dfustini@oss.tenstorrent.com>
+M:	Joel Stanley <jms@oss.tenstorrent.com>
+L:	linux-riscv@lists.infradead.org
+S:	Maintained
+T:	git https://github.com/tenstorrent/linux.git
+F:	Documentation/devicetree/bindings/riscv/tenstorrent.yaml
+F:	arch/riscv/boot/dts/tenstorrent/
 
 RISC-V THEAD SoC SUPPORT
 M:	Drew Fustini <fustini@kernel.org>

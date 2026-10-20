@@ -1800,6 +1800,8 @@ static void rk_gmac_remove(struct platform_device *pdev)
 
 	if (priv->plat->phy_node && bsp_priv->integrated_phy)
 		clk_put(bsp_priv->clk_phy);
+
+	reset_control_put(bsp_priv->phy_reset);
 }
 
 static const struct of_device_id rk_gmac_dwmac_match[] = {

@@ -6,6 +6,7 @@
 */
 
 #include <linux/slab.h>
+#include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/module.h>
@@ -93,6 +94,21 @@ static irqreturn_t mtk_vcodec_enc_irq_handler(int irq, void *priv)
 	spin_unlock_irqrestore(&dev->irqlock, flags);
 
 	core_id = dev->venc_pdata->core_id;
+	if (!ctx) {
+		/*
+		 * No encode owns this interrupt -- the same latent NULL
+		 * dereference the decoder core handler took (a write through
+		 * ctx at offsetof(irq_status), fatal because it is in
+		 * interrupt context). Acknowledge it if we can and drop it.
+		 */
+		if (core_id >= 0 && core_id < NUM_MAX_VCODEC_REG_BASE) {
+			addr = dev->reg_base[core_id] + MTK_VENC_IRQ_ACK_OFFSET;
+			clean_irq_status(readl(dev->reg_base[core_id] +
+					       MTK_VENC_IRQ_STATUS_OFFSET), addr);
+		}
+		return IRQ_HANDLED;
+	}
+
 	if (core_id < 0 || core_id >= NUM_MAX_VCODEC_REG_BASE) {
 		mtk_v4l2_venc_err(ctx, "Invalid core id: %d, ctx id: %d", core_id, ctx->id);
 		return IRQ_HANDLED;
@@ -273,6 +289,27 @@ static int mtk_vcodec_probe(struct platform_device *pdev)
 		return PTR_ERR(dev->fw_handler);
 
 	dev->venc_pdata = of_device_get_match_data(&pdev->dev);
+
+	/*
+	 * On the MT8188 VENC the SMI larb (larb19, id 21) is masked to MM-IOMMU
+	 * region 1 (4G-8G) only (mt8188_larb_region_msk[1][21]=~0, IOVA_34_EN).
+	 * The default 32-bit DMA mask allocates the encoder work / frame /
+	 * bitstream buffers in region 0 (<4G), which the region-1 larb cannot
+	 * translate -- the venc engine DMA faults and the SCP stalls
+	 * (watchdog) while programming the encode. A 34-bit mask (matching the
+	 * uses_34bit pdata flag and the IOVA_34_EN iommu) places the buffers in
+	 * region 1 so the larb can translate them. Same root cause + fix as the
+	 * mt8188 mtk-jpeg encode (mtk_jpeg_core.c). Gate on uses_34bit so
+	 * MT8195 (uses_34bit=false, single 4G region) keeps the 32-bit mask.
+	 */
+	if (dev->venc_pdata->uses_34bit) {
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(34));
+		if (ret) {
+			dev_err(&pdev->dev, "[MTK VCODEC] Failed to set 34-bit DMA mask");
+			goto err_enc_pm;
+		}
+	}
+
 	ret = mtk_vcodec_init_enc_clk(dev);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "[MTK VCODEC] Failed to get mtk vcodec clock source!");

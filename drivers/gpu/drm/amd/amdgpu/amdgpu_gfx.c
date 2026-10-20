@@ -28,6 +28,9 @@
 
 #include "amdgpu.h"
 #include "amdgpu_gfx.h"
+#include "amdgpu_mes.h"
+#include "mes_userqueue.h"
+#include "amdgpu_amdkfd.h"
 #include "amdgpu_rlc.h"
 #include "amdgpu_ras.h"
 #include "amdgpu_reset.h"
@@ -372,6 +375,30 @@ int amdgpu_gfx_kiq_init(struct amdgpu_device *adev,
 	amdgpu_bo_unreserve(kiq->eop_obj);
 
 	return 0;
+}
+
+static void amdgpu_gfx_mqd_reset_restore(struct amdgpu_ring *ring)
+{
+	struct amdgpu_device *adev = ring->adev;
+	int mqd_idx, mqd_size;
+
+	/* restore mqd with the backup copy */
+	if (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE) {
+		mqd_idx = ring - &adev->gfx.compute_ring[0];
+		mqd_size = adev->mqds[AMDGPU_HW_IP_COMPUTE].mqd_size;
+		if (adev->gfx.mec.mqd_backup[mqd_idx])
+			memcpy_toio(ring->mqd_ptr, adev->gfx.mec.mqd_backup[mqd_idx], mqd_size);
+	} else if (ring->funcs->type == AMDGPU_RING_TYPE_GFX) {
+		mqd_size = adev->mqds[AMDGPU_HW_IP_GFX].mqd_size;
+		mqd_idx = ring - &adev->gfx.gfx_ring[0];
+
+		if (adev->gfx.me.mqd_backup[mqd_idx])
+			memcpy_toio(ring->mqd_ptr, adev->gfx.me.mqd_backup[mqd_idx], mqd_size);
+	}
+	/* reset the ring */
+	ring->wptr = 0;
+	atomic64_set((atomic64_t *)ring->wptr_cpu_addr, 0);
+	amdgpu_ring_clear_ring(ring);
 }
 
 /* create MQD for each compute/gfx queue */
@@ -1775,6 +1802,39 @@ static ssize_t amdgpu_gfx_get_compute_reset_mask(struct device *dev,
 	return amdgpu_show_reset_mask(buf, adev->gfx.compute_supported_reset);
 }
 
+
+int amdgpu_gfx_mes_reset_queue(struct amdgpu_ring *ring,
+			       unsigned int vmid,
+			       struct amdgpu_fence *timedout_fence,
+			       bool use_mmio)
+{
+	struct amdgpu_device *adev = ring->adev;
+	int r;
+
+	amdgpu_ring_reset_helper_begin(ring, timedout_fence);
+
+	/* This tree: 4-arg reset_legacy_queue, 2-arg map, 5-arg unmap */
+	r = amdgpu_mes_reset_legacy_queue(ring->adev, ring, vmid, use_mmio);
+	if (r)
+		return r;
+
+	if (use_mmio) {
+		r = amdgpu_mes_unmap_legacy_queue(adev, ring,
+						  RESET_QUEUES, 0, 0);
+		if (r)
+			return r;
+		amdgpu_gfx_mqd_reset_restore(ring);
+
+		r = amdgpu_mes_map_legacy_queue(adev, ring);
+		if (r) {
+			dev_err(adev->dev, "failed to remap queue\n");
+			return r;
+		}
+	}
+
+	return amdgpu_ring_reset_helper_end(ring, timedout_fence);
+}
+
 static DEVICE_ATTR(run_cleaner_shader, 0200,
 		   NULL, amdgpu_gfx_set_run_cleaner_shader);
 
@@ -1920,6 +1980,221 @@ void amdgpu_gfx_sysfs_fini(struct amdgpu_device *adev)
 		amdgpu_gfx_sysfs_isolation_shader_fini(adev);
 		amdgpu_gfx_sysfs_reset_mask_fini(adev);
 	}
+}
+
+
+static void amdgpu_gfx_reset_start_compute_scheds(struct amdgpu_device *adev,
+						 struct amdgpu_ring *guilty_ring)
+{
+	struct amdgpu_ring *ring;
+	int i;
+
+	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+		ring = &adev->gfx.compute_ring[i];
+		if (ring == guilty_ring)
+			continue;
+		drm_sched_wqueue_start(&ring->sched);
+	}
+}
+
+static void amdgpu_gfx_reset_stop_compute_scheds(struct amdgpu_device *adev,
+						struct amdgpu_ring *guilty_ring)
+{
+	struct amdgpu_ring *ring;
+	int i;
+
+	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+		ring = &adev->gfx.compute_ring[i];
+		if (ring == guilty_ring)
+			continue;
+		drm_sched_wqueue_stop(&ring->sched);
+	}
+}
+
+static int amdgpu_gfx_reset_mes_kcq(struct amdgpu_device *adev,
+				    struct amdgpu_ring *guilty_ring,
+				    unsigned int db)
+{
+	bool use_mmio = adev->gfx.mec.use_mmio_for_reset;
+	struct amdgpu_fence *fence;
+	struct amdgpu_ring *ring;
+	int i, r;
+
+	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+		ring = &adev->gfx.compute_ring[i];
+		if (ring == guilty_ring)
+			continue;
+		if (ring->doorbell_index == db) {
+			fence = amdgpu_ring_find_guilty_fence(ring);
+			r = amdgpu_gfx_mes_reset_queue(ring, 0, fence, use_mmio);
+			if (r)
+				return r;
+			break;
+		}
+	}
+	return 0;
+}
+
+/**
+ * amdgpu_gfx_hqd_owned_by_kernel - is an HQD slot one of the kernel's own rings?
+ * @adev: amdgpu device
+ * @queue_type: AMDGPU_RING_TYPE_GFX or AMDGPU_RING_TYPE_COMPUTE
+ * @me: micro engine (MEC1 = 1 for compute)
+ * @pipe: pipe index
+ * @queue: queue index
+ *
+ * A reset issued on behalf of a user/KFD queue must never land on a kernel
+ * gfx ring, KCQ or KIQ: those rings carry the kernel's own submissions, and an
+ * MMIO dequeue of one of them while the MES is hung leaves the kernel ring in
+ * an undefined state for the rest of the boot. Callers that derive HQD
+ * coordinates from a guess (firmware HQD info that came back zeroed, or KFD
+ * queue fields that MES never filled in) use this to refuse the reset.
+ */
+bool amdgpu_gfx_hqd_owned_by_kernel(struct amdgpu_device *adev, int queue_type,
+				    u32 me, u32 pipe, u32 queue)
+{
+	struct amdgpu_ring *ring;
+	int i;
+
+	if (queue_type == AMDGPU_RING_TYPE_GFX) {
+		for (i = 0; i < adev->gfx.num_gfx_rings; i++) {
+			ring = &adev->gfx.gfx_ring[i];
+			if (ring->me == me && ring->pipe == pipe && ring->queue == queue)
+				return true;
+		}
+		return false;
+	}
+
+	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+		ring = &adev->gfx.compute_ring[i];
+		if (ring->me == me && ring->pipe == pipe && ring->queue == queue)
+			return true;
+	}
+	ring = &adev->gfx.kiq[0].ring;
+	if (ring->sched.ready || ring->ring_obj) {
+		if (ring->me == me && ring->pipe == pipe && ring->queue == queue)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Common helper for MES compute queue resets when multiple queues may be
+ * affected. Used by both KGD (KCQ timeout) and KFD (MES hang / suspend fail).
+ * Adapted from Deucher series 0037/0038 for 6.18.y-lc APIs:
+ *  - amdgpu_mes_suspend/resume take adev only (no xcc_id)
+ *  - detect_and_reset_hung_queues has no xcc_id arg
+ *  - mes_hung_db_array lives on adev->gfx.mec
+ */
+int amdgpu_gfx_reset_mes_compute(struct amdgpu_device *adev,
+				 struct amdgpu_ring *ring,
+				 struct amdgpu_fence *guilty_fence,
+				 struct amdgpu_usermode_queue *uq,
+				 unsigned int *hung_queue_count)
+{
+	struct amdgpu_mes_hung_queue_hqd_info *hqd_info;
+	int i, r, pipe, queue, queue_type;
+	unsigned int num_hung = 0;
+	bool use_mmio = adev->gfx.mec.use_mmio_for_reset;
+	u32 *hung_array = adev->gfx.mec.mes_hung_db_array;
+	int hqd_off = adev->mes.hung_queue_hqd_info_offset;
+
+	if (!hung_array)
+		return -ENOMEM;
+
+	hqd_info = (struct amdgpu_mes_hung_queue_hqd_info *)
+		&hung_array[hqd_off];
+
+	mutex_lock(&adev->gfx.mec.reset_mutex);
+	/* stop the drm schedulers for all compute queues except guilty */
+	amdgpu_gfx_reset_stop_compute_scheds(adev, ring);
+
+	/*
+	 * suspend_all fails if a queue is hung; detect_only then returns
+	 * the array of bad queue doorbells + HQD info in the second half.
+	 */
+	r = amdgpu_mes_suspend(adev);
+	/* if suspend all succeeds, there should be no hang queue */
+	if (!r)
+		/* always reset the KCQ/userq: need to signal fence; may be
+		 * stuck in a preemptable loop.
+		 */
+		goto fence_reset;
+
+	r = amdgpu_mes_detect_and_reset_hung_queues(adev, AMDGPU_RING_TYPE_COMPUTE,
+						    true, &num_hung, hung_array);
+	if (r)
+		goto out;
+	if (hung_queue_count)
+		*hung_queue_count = num_hung;
+
+fence_reset:
+	/* reset the queue this came from if specified */
+	if (ring) {
+		r = amdgpu_gfx_mes_reset_queue(ring, 0, guilty_fence, use_mmio);
+		if (r)
+			goto out;
+	}
+	if (uq) {
+		r = mes_userq_reset(uq);
+		if (r)
+			goto out;
+	}
+	for (i = 0; i < (int)num_hung; i++) {
+		/*
+		 * The HQD word for hung doorbell i lives at hung_array[hqd_off + i]
+		 * (hqd_info aliases it). Past the end of the array there is no word
+		 * at all, and a word of zero means the firmware did not report
+		 * where the queue lives -- observed on gfx1201 (R9700), where it
+		 * decoded as gfx pipe 0 queue 0 and the MMIO path then dequeued the
+		 * kernel's own rings. Coordinates are only passed on when the
+		 * firmware gave them and they do not name a kernel ring; otherwise
+		 * consumers get AMDGPU_GFX_HQD_UNKNOWN and must not MMIO-reset.
+		 */
+		bool hqd_known = hqd_off + i <
+				 amdgpu_mes_get_hung_queue_db_array_size(adev);
+
+		if (hqd_known) {
+			pipe = hqd_info[i].pipe_index;
+			queue = hqd_info[i].queue_index;
+			queue_type = hqd_info[i].queue_type;
+			if (!hqd_info[i].bit0_31 ||
+			    amdgpu_gfx_hqd_owned_by_kernel(adev, queue_type, 1,
+							   pipe, queue))
+				hqd_known = false;
+		}
+		if (!hqd_known) {
+			pipe = AMDGPU_GFX_HQD_UNKNOWN;
+			queue = AMDGPU_GFX_HQD_UNKNOWN;
+			queue_type = AMDGPU_RING_TYPE_COMPUTE;
+			dev_warn_ratelimited(adev->dev,
+					     "MES hang: no usable HQD info for doorbell 0x%x; not resetting by HQD coordinates\n",
+					     hung_array[i]);
+		}
+
+		/* reset any KCQs matching this doorbell */
+		r = amdgpu_gfx_reset_mes_kcq(adev, ring, hung_array[i]);
+		if (r)
+			goto out;
+		/* reset any KFD queues */
+		r = amdgpu_amdkfd_reset_mes_queue(adev, 0, queue_type, pipe, queue,
+						  hung_array[i]);
+		if (r)
+			goto out;
+		/* reset KGD user queues */
+		r = mes_userq_reset_queue(adev, uq, queue_type, pipe, queue,
+					  hung_array[i]);
+		if (r)
+			goto out;
+	}
+out:
+	/* resume all will enable the non-hung queues */
+	amdgpu_mes_resume(adev);
+	if (!r)
+		amdgpu_gfx_reset_start_compute_scheds(adev, ring);
+	mutex_unlock(&adev->gfx.mec.reset_mutex);
+
+	return r;
 }
 
 int amdgpu_gfx_cleaner_shader_sw_init(struct amdgpu_device *adev,

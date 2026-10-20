@@ -29,6 +29,7 @@ struct rockchip_mbox_msg {
 
 struct rockchip_mbox_data {
 	int num_chans;
+	bool doorbell;
 };
 
 struct rockchip_mbox_chan {
@@ -41,6 +42,7 @@ struct rockchip_mbox_chan {
 struct rockchip_mbox {
 	struct mbox_controller mbox;
 	struct clk *pclk;
+	bool doorbell;
 	void __iomem *mbox_base;
 
 	/* The maximum size of buf for each channel */
@@ -49,11 +51,25 @@ struct rockchip_mbox {
 	struct rockchip_mbox_chan *chans;
 };
 
+static int chan_idx(struct mbox_chan *chan)
+{
+	struct rockchip_mbox *mb = dev_get_drvdata(chan->mbox->dev);
+
+	return chan - mb->mbox.chans;
+}
+
 static int rockchip_mbox_send_data(struct mbox_chan *chan, void *data)
 {
 	struct rockchip_mbox *mb = dev_get_drvdata(chan->mbox->dev);
 	struct rockchip_mbox_msg *msg = data;
 	struct rockchip_mbox_chan *chans = mb->chans;
+
+	if (mb->doorbell) {
+		/* Carries no data: ring A2B, the reply comes via shmem + B2A. */
+		writel_relaxed(0, mb->mbox_base + MAILBOX_A2B_CMD(chan_idx(chan)));
+		writel_relaxed(0, mb->mbox_base + MAILBOX_A2B_DAT(chan_idx(chan)));
+		return 0;
+	}
 
 	if (!msg)
 		return -EINVAL;
@@ -132,6 +148,11 @@ static irqreturn_t rockchip_mbox_isr(int irq, void *dev_id)
 		if (irq != mb->chans[idx].irq)
 			continue;
 
+		if (mb->doorbell) {
+			mbox_chan_received_data(&mb->mbox.chans[idx], NULL);
+			break;
+		}
+
 		msg = mb->chans[idx].msg;
 		if (!msg) {
 			dev_err(mb->mbox.dev,
@@ -155,8 +176,14 @@ static const struct rockchip_mbox_data rk3368_drv_data = {
 	.num_chans = 4,
 };
 
+static const struct rockchip_mbox_data rk3399_drv_data = {
+	.num_chans = 4,
+	.doorbell = true,
+};
+
 static const struct of_device_id rockchip_mbox_of_match[] = {
 	{ .compatible = "rockchip,rk3368-mailbox", .data = &rk3368_drv_data},
+	{ .compatible = "rockchip,rk3399-mailbox", .data = &rk3399_drv_data},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, rockchip_mbox_of_match);
@@ -192,7 +219,8 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
 	mb->mbox.dev = &pdev->dev;
 	mb->mbox.num_chans = drv_data->num_chans;
 	mb->mbox.ops = &rockchip_mbox_chan_ops;
-	mb->mbox.txdone_irq = true;
+	mb->doorbell = drv_data->doorbell;
+	mb->mbox.txdone_irq = !drv_data->doorbell;
 
 	mb->mbox_base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(mb->mbox_base))

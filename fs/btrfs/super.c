@@ -781,6 +781,18 @@ static void set_device_specific_options(struct btrfs_fs_info *fs_info)
 		btrfs_set_opt(fs_info->mount_opt, SSD);
 
 	/*
+	 * Warn about RAID5/6 being experimental at mount time
+	 */
+	if ((fs_info->avail_data_alloc_bits |
+	     fs_info->avail_metadata_alloc_bits |
+	     fs_info->avail_system_alloc_bits) &
+	    BTRFS_BLOCK_GROUP_RAID56_MASK) {
+		btrfs_err(fs_info,
+		"btrfs RAID5/6 is EXPERIMENTAL and has known data-loss bugs");
+		add_taint(TAINT_AUX, LOCKDEP_STILL_OK);
+	}
+
+	/*
 	 * For devices supporting discard turn on discard=async automatically,
 	 * unless it's already set or disabled. This could be turned off by
 	 * nodiscard for the same mount.
@@ -2640,7 +2652,7 @@ module_exit(exit_btrfs_fs)
 
 MODULE_DESCRIPTION("B-Tree File System (BTRFS)");
 MODULE_LICENSE("GPL");
-MODULE_SOFTDEP("pre: crc32c");
+MODULE_SOFTDEP("pre: crypto-crc32c");
 MODULE_SOFTDEP("pre: xxhash64");
 MODULE_SOFTDEP("pre: sha256");
 MODULE_SOFTDEP("pre: blake2b-256");

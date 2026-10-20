@@ -5610,8 +5610,15 @@ loop:
 		if ((status == -ENOTCONN) || (status == -ENOTSUPP))
 			break;
 
-		/* When halfway through our retry count, power-cycle the port */
-		if (i == (PORT_INIT_TRIES - 1) / 2) {
+		/*
+		 * When halfway through our retry count, power-cycle the port,
+		 * unless the port is marked as one whose VBUS is the attached
+		 * device's power rail (USB_PORT_QUIRK_NO_POWER_CYCLE), where
+		 * the bounce would reset the device instead of recovering it.
+		 * The retry loop itself is unaffected either way.
+		 */
+		if (i == (PORT_INIT_TRIES - 1) / 2 &&
+		    !(port_dev->quirks & USB_PORT_QUIRK_NO_POWER_CYCLE)) {
 			dev_info(&port_dev->dev, "attempt power cycle\n");
 			usb_hub_set_port_power(hdev, hub, port1, false);
 			msleep(2 * hub_power_on_good_delay(hub));

@@ -1762,6 +1762,11 @@ extern int sysctl_perf_event_sample_rate;
 
 extern void perf_sample_event_took(u64 sample_len_ns);
 
+static inline bool perf_paranoid_any(void)
+{
+	return sysctl_perf_event_paranoid > 2;
+}
+
 /* Access to perf_event_open(2) syscall. */
 #define PERF_SECURITY_OPEN		0
 

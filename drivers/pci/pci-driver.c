@@ -582,7 +582,13 @@ static void pci_pm_default_resume(struct pci_dev *pci_dev)
 
 static void pci_pm_default_resume_early(struct pci_dev *pci_dev)
 {
-	pci_pm_power_up_and_verify_state(pci_dev);
+	/*
+	 * If power-up found the device inaccessible (e.g. its Thunderbolt link
+	 * dropped while a runtime-PM resume was in flight), do not restore config
+	 * space -- the config reads would hang on the absent device.
+	 */
+	if (pci_pm_power_up_and_verify_state(pci_dev))
+		return;
 	pci_restore_state(pci_dev);
 	pci_pme_restore(pci_dev);
 }

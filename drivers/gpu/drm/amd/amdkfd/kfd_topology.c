@@ -2030,6 +2030,10 @@ static void kfd_topology_set_capabilities(struct kfd_topology_device *dev)
 				HSA_CAP_TRAP_DEBUG_PRECISE_ALU_OPERATIONS_SUPPORTED;
 	}
 
+	/* pipe-reset-port: PER_QUEUE_RESET for gfx11+ */
+	if (KFD_GC_VERSION(dev->gpu) >= IP_VERSION(11, 0, 0))
+		dev->node_props.capability |= HSA_CAP_PER_QUEUE_RESET_SUPPORTED;
+
 	kfd_topology_set_dbg_firmware_support(dev);
 }
 
@@ -2409,6 +2413,32 @@ int kfd_debugfs_rls_by_device(struct seq_file *m, void *data)
 
 		seq_printf(m, "Node %u, gpu_id %x:\n", i++, dev->gpu->id);
 		r = pm_debugfs_runlist(m, &dev->gpu->dqm->packet_mgr);
+		if (r)
+			break;
+	}
+
+	up_read(&topology_lock);
+
+	return r;
+}
+
+int kfd_debugfs_sched_by_device(struct seq_file *m, void *data)
+{
+	struct kfd_topology_device *dev;
+	unsigned int i = 0;
+	int r = 0;
+
+	down_read(&topology_lock);
+
+	list_for_each_entry(dev, &topology_device_list, list) {
+		if (!dev->gpu) {
+			i++;
+			continue;
+		}
+
+		seq_printf(m, "Node %u, gpu_id %x, %s:\n", i++, dev->gpu->id,
+			   dev_name(dev->gpu->adev->dev));
+		r = dqm_debugfs_sched_state(m, dev->gpu->dqm);
 		if (r)
 			break;
 	}

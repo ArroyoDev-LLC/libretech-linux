@@ -195,6 +195,19 @@ extern int amdgpu_noretry;
 /* Halt if HWS hang is detected */
 extern int halt_if_hws_hang;
 
+/*
+ * On an MES-scheduler hang, escalate to a full-device GPU reset (1) instead of
+ * containing the failure to the faulting process(es) (0, default).
+ */
+extern int amdgpu_mes_hang_full_reset;
+
+/*
+ * After a device reset on a device whose MES hang was contained, clear the
+ * containment halt and release the module pin so dispatch works again (1),
+ * instead of leaving the device halted until a reboot (0, default).
+ */
+extern int amdgpu_mes_hang_rearm;
+
 /* Whether MEC FW support GWS barriers */
 extern bool hws_gws_support;
 
@@ -1602,6 +1615,8 @@ int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data);
 int dqm_debugfs_hqds(struct seq_file *m, void *data);
 int kfd_debugfs_rls_by_device(struct seq_file *m, void *data);
 int pm_debugfs_runlist(struct seq_file *m, void *data);
+int kfd_debugfs_sched_by_device(struct seq_file *m, void *data);
+int dqm_debugfs_sched_state(struct seq_file *m, void *data);
 
 int kfd_debugfs_hang_hws(struct kfd_node *dev);
 int pm_debugfs_hang_hws(struct packet_manager *pm);

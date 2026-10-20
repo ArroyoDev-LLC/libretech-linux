@@ -740,6 +740,19 @@ static int xe_bo_trigger_rebind(struct xe_device *xe, struct xe_bo *bo,
 			continue;
 		}
 
+		/*
+		 * A closed VM is being torn down: xe_vm_close_and_put() frees
+		 * its page tables BEFORE it unlinks the VMAs of shared
+		 * (dma-buf / external) BOs from this list, so an eviction of
+		 * such a BO racing the teardown -- here, the peer device's
+		 * page-fault worker evicting the exporter and move_notify()
+		 * evicting the importer -- would zap PTEs of a VM whose
+		 * pt_root is already NULL. There is nothing left to
+		 * invalidate; the VMAs are about to be destroyed.
+		 */
+		if (xe_vm_is_closed(vm))
+			continue;
+
 		if (!idle) {
 			long timeout;
 

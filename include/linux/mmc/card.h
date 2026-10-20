@@ -153,6 +153,7 @@ struct sd_switch_caps {
 	unsigned int		uhs_max_dtr;
 #define HIGH_SPEED_MAX_DTR	50000000
 #define UHS_SDR104_MAX_DTR	208000000
+#define UHS_DDR200_MAX_DTR	200000000
 #define UHS_SDR50_MAX_DTR	100000000
 #define UHS_DDR50_MAX_DTR	50000000
 #define UHS_SDR25_MAX_DTR	UHS_DDR50_MAX_DTR
@@ -165,6 +166,14 @@ struct sd_switch_caps {
 #define UHS_SDR50_BUS_SPEED	2
 #define UHS_SDR104_BUS_SPEED	3
 #define UHS_DDR50_BUS_SPEED	4
+/*
+ * SD vendor (Samsung) DDR200 / DDR208: advertised as function-group-1
+ * function 15. The bus-speed value doubles as the CMD6 switch function number
+ * elsewhere, so this must equal 15. Note that function 15 is NOT itself
+ * selectable (CMD6 nibble 0xF means "no influence"): activation is done via
+ * function-group-2 function 14 -- see sd_set_bus_speed_mode() in sd.c.
+ */
+#define UHS_DDR200_BUS_SPEED	15
 
 #define SD_MODE_HIGH_SPEED	(1 << HIGH_SPEED_BUS_SPEED)
 #define SD_MODE_UHS_SDR12	(1 << UHS_SDR12_BUS_SPEED)
@@ -172,6 +181,7 @@ struct sd_switch_caps {
 #define SD_MODE_UHS_SDR50	(1 << UHS_SDR50_BUS_SPEED)
 #define SD_MODE_UHS_SDR104	(1 << UHS_SDR104_BUS_SPEED)
 #define SD_MODE_UHS_DDR50	(1 << UHS_DDR50_BUS_SPEED)
+#define SD_MODE_UHS_DDR200	(1 << UHS_DDR200_BUS_SPEED)
 	unsigned int		sd3_drv_type;
 #define SD_DRIVER_TYPE_B	0x01
 #define SD_DRIVER_TYPE_A	0x02
@@ -194,6 +204,14 @@ struct sd_switch_caps {
 #define SD4_SET_POWER_LIMIT_2_16W	2
 #define SD4_SET_POWER_LIMIT_2_88W	3
 #define SD4_SET_POWER_LIMIT_1_80W	4
+	/*
+	 * Function-group-2 (Command System) function 14 support, the
+	 * "Vendor Specific Command System / Enable DDR200 Bus" used to actually
+	 * activate Samsung SD DDR200 / DDR208 (group-1 function 15 only
+	 * advertises the capability and is not selectable). Captured from the
+	 * CMD6 switch status in mmc_read_switch().
+	 */
+	bool			ddr200_cmdsys;
 };
 
 struct sd_ext_reg {

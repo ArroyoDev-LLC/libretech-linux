@@ -1478,10 +1478,44 @@ int vcn_set_powergating_state(struct amdgpu_ip_block *ip_block,
 	return ret;
 }
 
+static struct amdgpu_fence *
+amdgpu_vcn_ring_reset_begin_helper(struct amdgpu_ring *ring,
+				   struct amdgpu_ring *guilty_ring,
+				   struct amdgpu_fence *timedout_fence)
+{
+	struct amdgpu_fence *fence;
+
+	/* reset_helper_begin also stops the sched wqueue; stop here first so
+	 * non-guilty rings are halted before we identify their first unsignalled
+	 * fence (pipe-reset series 0006).
+	 */
+	drm_sched_wqueue_stop(&ring->sched);
+	if (ring == guilty_ring)
+		fence = timedout_fence;
+	else
+		fence = amdgpu_ring_find_guilty_fence(ring);
+	amdgpu_ring_reset_helper_begin(ring, fence);
+
+	return fence;
+}
+
+static int
+amdgpu_vcn_ring_reset_end_helper(struct amdgpu_ring *ring,
+				 struct amdgpu_fence *fence)
+{
+	/* reset_helper_end tests the ring, marks guilty fences, reemits
+	 * non-guilty commands, and restarts the scheduler.
+	 */
+	return amdgpu_ring_reset_helper_end(ring, fence);
+}
+
 /**
  * amdgpu_vcn_reset_engine - Reset a specific VCN engine
- * @ring: Pointer to the VCN ring
- * @timedout_fence: fence that timed out
+ * @ring: guilty ring that triggered the reset (or any ring of the instance)
+ * @timedout_fence: fence of the timed-out job (may be NULL)
+ *
+ * Resets the whole VCN instance (dec + enc rings).  Uses the pipe-reset
+ * begin/end helpers so non-guilty ring contents can be re-emitted.
  *
  * Returns: 0 on success, or a negative error code on failure.
  */
@@ -1490,44 +1524,32 @@ static int amdgpu_vcn_reset_engine(struct amdgpu_ring *ring,
 {
 	struct amdgpu_device *adev = ring->adev;
 	struct amdgpu_vcn_inst *vinst = &adev->vcn.inst[ring->me];
+	struct amdgpu_fence *dec_fence;
+	struct amdgpu_fence *enc_fence[AMDGPU_VCN_MAX_ENC_RINGS];
 	int r, i;
 
 	mutex_lock(&vinst->engine_reset_mutex);
-	/* Stop the scheduler's work queue for the dec and enc rings if they are running.
-	 * This ensures that no new tasks are submitted to the queues while
-	 * the reset is in progress.
-	 */
-	drm_sched_wqueue_stop(&vinst->ring_dec.sched);
+	dec_fence = amdgpu_vcn_ring_reset_begin_helper(&vinst->ring_dec, ring,
+						       timedout_fence);
 	for (i = 0; i < vinst->num_enc_rings; i++)
-		drm_sched_wqueue_stop(&vinst->ring_enc[i].sched);
+		enc_fence[i] = amdgpu_vcn_ring_reset_begin_helper(&vinst->ring_enc[i],
+								  ring,
+								  timedout_fence);
 
 	/* Perform the VCN reset for the specified instance */
 	r = vinst->reset(vinst);
 	if (r)
 		goto unlock;
-	r = amdgpu_ring_test_ring(&vinst->ring_dec);
+
+	r = amdgpu_vcn_ring_reset_end_helper(&vinst->ring_dec, dec_fence);
 	if (r)
 		goto unlock;
 	for (i = 0; i < vinst->num_enc_rings; i++) {
-		r = amdgpu_ring_test_ring(&vinst->ring_enc[i]);
+		r = amdgpu_vcn_ring_reset_end_helper(&vinst->ring_enc[i],
+						     enc_fence[i]);
 		if (r)
 			goto unlock;
 	}
-	amdgpu_fence_driver_force_completion(&vinst->ring_dec,
-					     (&vinst->ring_dec == ring) ?
-					     &timedout_fence->base : NULL);
-	for (i = 0; i < vinst->num_enc_rings; i++)
-		amdgpu_fence_driver_force_completion(&vinst->ring_enc[i],
-						     (&vinst->ring_enc[i] == ring) ?
-						     &timedout_fence->base : NULL);
-
-	/* Restart the scheduler's work queue for the dec and enc rings
-	 * if they were stopped by this function. This allows new tasks
-	 * to be submitted to the queues after the reset is complete.
-	 */
-	drm_sched_wqueue_start(&vinst->ring_dec.sched);
-	for (i = 0; i < vinst->num_enc_rings; i++)
-		drm_sched_wqueue_start(&vinst->ring_enc[i].sched);
 
 unlock:
 	mutex_unlock(&vinst->engine_reset_mutex);

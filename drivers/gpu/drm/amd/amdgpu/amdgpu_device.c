@@ -475,6 +475,21 @@ void amdgpu_device_detect_runtime_pm_mode(struct amdgpu_device *adev)
 		return;
 	}
 
+	/*
+	 * lc fleet quirk (aitop, 2026-06-17): Navi48 (Radeon AI PRO R9700, GC 12.0.1)
+	 * fails to exit BACO on runtime-PM resume -- the GPU drops off the PCIe bus
+	 * ("amdgpu: device lost from bus! / SMU ArmD3? response 0xFFFFFFFF / Failed to
+	 * exit BACO state! / PSP resume failed") and stays inaccessible (config reads
+	 * 0xffffffff) until a power cycle. Root cause is in the closed PSP/SMU BACO
+	 * path, so mask it by never entering runtime PM for this ASIC. Harmless policy
+	 * for a compute box -- we never want an idle compute GPU to D3/BACO-suspend.
+	 */
+	if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(12, 0, 1)) {
+		dev_info(adev->dev,
+			 "Navi48: runtime PM disabled (BACO resume unreliable on this platform)\n");
+		return;
+	}
+
 	bamaco_support = amdgpu_device_supports_baco(adev);
 
 	switch (amdgpu_runtime_pm) {
@@ -4076,6 +4091,34 @@ static int amdgpu_device_ip_reinit_late_sriov(struct amdgpu_device *adev)
 }
 
 /**
+ * amdgpu_device_ip_reset_abort - unwind IP state after a failed GPU reset
+ *
+ * @adev: amdgpu_device pointer
+ *
+ * A GPU reset suspends IP blocks in amdgpu_device_pre_asic_reset() and resumes
+ * them once the ASIC is back.  If the reset fails, the resume half never runs
+ * and any state an IP block parked across the reset window - a lock held from
+ * its suspend callback, most notably DM's dc_lock - is leaked, wedging every
+ * later reset attempt.  Give each IP block a chance to unwind that state.
+ *
+ * This runs on a GPU that just failed to reset, so callbacks must only touch
+ * software state.
+ */
+static void amdgpu_device_ip_reset_abort(struct amdgpu_device *adev)
+{
+	int i;
+
+	for (i = adev->num_ip_blocks - 1; i >= 0; i--) {
+		if (!adev->ip_blocks[i].status.valid)
+			continue;
+		if (!adev->ip_blocks[i].version->funcs->reset_abort)
+			continue;
+
+		adev->ip_blocks[i].version->funcs->reset_abort(&adev->ip_blocks[i]);
+	}
+}
+
+/**
  * amdgpu_device_ip_resume_phase1 - run resume for hardware IPs
  *
  * @adev: amdgpu_device pointer
@@ -4600,6 +4643,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
 	spin_lock_init(&adev->wb.lock);
 
 	xa_init_flags(&adev->userq_xa, XA_FLAGS_LOCK_IRQ);
+	xa_init_flags(&adev->userq_doorbell_xa, XA_FLAGS_LOCK_IRQ);
 
 	INIT_LIST_HEAD(&adev->reset_list);
 
@@ -5703,7 +5747,16 @@ static int amdgpu_device_reset_sriov(struct amdgpu_device *adev,
 	/* need to be called during full access so we can't do it later like
 	 * bare-metal does.
 	 */
-	amdgpu_amdkfd_post_reset(adev);
+	/*
+	 * hw_reset_done=false: reaching here does imply the VF reinit succeeded
+	 * (every step above early-returns on error, including the IB ring
+	 * tests), but MES-hang containment and its module pin have only been
+	 * characterised on bare metal. Passing false keeps SRIOV behaviour
+	 * exactly as it is today -- recovery there stays a reboot -- rather than
+	 * extending an opt-in built for one bare-metal ASIC to virtual
+	 * functions on no evidence.
+	 */
+	amdgpu_amdkfd_post_reset(adev, false);
 	amdgpu_virt_release_full_gpu(adev, true);
 
 	/* Aldebaran and gfx_11_0_3 support ras in SRIOV, so need resume ras during reset */
@@ -6085,6 +6138,10 @@ int amdgpu_device_reinit_after_reset(struct amdgpu_reset_context *reset_context)
 				if (r)
 					goto out;
 
+				r = amdgpu_userq_post_reset(tmp_adev, vram_lost);
+				if (r)
+					goto out;
+
 				drm_client_dev_resume(adev_to_drm(tmp_adev));
 
 				/*
@@ -6317,6 +6374,7 @@ static inline void amdgpu_device_stop_pending_resets(struct amdgpu_device *adev)
 	if (con && adev->ras_enabled)
 		cancel_work(&con->recovery_work);
 
+	amdgpu_userq_mgr_cancel_reset_work(adev);
 }
 
 static int amdgpu_device_health_check(struct list_head *device_list_handle)
@@ -6426,6 +6484,8 @@ static void amdgpu_device_halt_activities(struct amdgpu_device *adev,
 		if (!need_emergency_restart && !amdgpu_reset_in_dpc(adev) &&
 		    amdgpu_device_ip_need_full_reset(tmp_adev))
 			amdgpu_ras_suspend(tmp_adev);
+
+		amdgpu_userq_pre_reset(tmp_adev);
 
 		for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
 			struct amdgpu_ring *ring = tmp_adev->rings[i];
@@ -6555,16 +6615,24 @@ static int amdgpu_device_sched_resume(struct list_head *device_list,
 	return r;
 }
 
+/*
+ * @hw_reset_done: a real HW ASIC reset was performed on this device list AND it
+ * succeeded. False means the hardware was NOT reset -- either it was skipped
+ * (guilty job already signalled) or this is a path that cannot vouch for it.
+ * KFD uses this to decide whether it may drop an MES-hang containment halt;
+ * see kfd_dqm_rearm_contained_mes(). Do not pass true speculatively.
+ */
 static void amdgpu_device_gpu_resume(struct amdgpu_device *adev,
 			      struct list_head *device_list,
-			      bool   need_emergency_restart)
+			      bool   need_emergency_restart,
+			      bool   hw_reset_done)
 {
 	struct amdgpu_device *tmp_adev = NULL;
 
 	list_for_each_entry(tmp_adev, device_list, reset_list) {
 		/* unlock kfd: SRIOV would do it separately */
 		if (!need_emergency_restart && !amdgpu_sriov_vf(tmp_adev))
-			amdgpu_amdkfd_post_reset(tmp_adev);
+			amdgpu_amdkfd_post_reset(tmp_adev, hw_reset_done);
 
 		/* kfd_post_reset will do nothing if kfd device is not initialized,
 		 * need to bring up kfd here if it's not be initialized before
@@ -6599,11 +6667,13 @@ int amdgpu_device_gpu_recover(struct amdgpu_device *adev,
 			      struct amdgpu_job *job,
 			      struct amdgpu_reset_context *reset_context)
 {
+	struct amdgpu_device *tmp_adev;
 	struct list_head device_list;
 	bool job_signaled = false;
 	struct amdgpu_hive_info *hive = NULL;
 	int r = 0;
 	bool need_emergency_restart = false;
+	bool hw_reset_done = false;
 	/* save the pasid here as the job may be freed before the end of the reset */
 	int pasid = job ? job->pasid : -EINVAL;
 
@@ -6679,13 +6749,32 @@ int amdgpu_device_gpu_recover(struct amdgpu_device *adev,
 
 	r = amdgpu_device_asic_reset(adev, &device_list, reset_context);
 	if (r)
-		goto reset_unlock;
+		goto reset_abort;
+	/*
+	 * The only place that may claim the hardware was really reset: the ASIC
+	 * reset ran and reported success. Deliberately NOT set on the
+	 * skip_hw_reset path above -- a guilty job that had already signalled
+	 * means no reset was performed at all, so MES is in whatever state it
+	 * was in, and KFD must not drop an MES-hang containment halt.
+	 */
+	hw_reset_done = true;
 skip_hw_reset:
 	r = amdgpu_device_sched_resume(&device_list, reset_context, job_signaled);
 	if (r)
-		goto reset_unlock;
+		goto reset_abort;
 skip_sched_resume:
-	amdgpu_device_gpu_resume(adev, &device_list, need_emergency_restart);
+	amdgpu_device_gpu_resume(adev, &device_list, need_emergency_restart,
+				 hw_reset_done);
+	goto reset_unlock;
+reset_abort:
+	/*
+	 * The reset failed, so the IP blocks suspended on the way in are never
+	 * going to be resumed.  Let them unwind whatever they parked across the
+	 * reset window before we drop the reset lock, or the next recovery
+	 * attempt deadlocks against it.
+	 */
+	list_for_each_entry(tmp_adev, &device_list, reset_list)
+		amdgpu_device_ip_reset_abort(tmp_adev);
 reset_unlock:
 	amdgpu_device_recovery_put_reset_lock(adev, &device_list);
 end_reset:
@@ -7245,6 +7334,8 @@ out:
 		dev_info(adev->dev, "PCIe error recovery succeeded\n");
 	} else {
 		dev_err(adev->dev, "PCIe error recovery failed, err:%d\n", r);
+		list_for_each_entry(tmp_adev, &device_list, reset_list)
+			amdgpu_device_ip_reset_abort(tmp_adev);
 		if (hive) {
 			list_for_each_entry(tmp_adev, &device_list, reset_list)
 				amdgpu_device_unset_mp1_state(tmp_adev);
@@ -7294,7 +7385,15 @@ void amdgpu_pci_resume(struct pci_dev *pdev)
 		list_add_tail(&adev->reset_list, &device_list);
 
 	amdgpu_device_sched_resume(&device_list, NULL, NULL);
-	amdgpu_device_gpu_resume(adev, &device_list, false);
+	/*
+	 * hw_reset_done=false: the slot reset happened in amdgpu_pci_slot_reset()
+	 * and its result is not checked here (this function ignores
+	 * amdgpu_device_sched_resume()'s return value entirely), so this path
+	 * cannot vouch for the hardware. PCIe error recovery therefore does not
+	 * re-arm KFD after an MES-hang containment; that stays a reboot, or a
+	 * deliberate amdgpu_gpu_recover.
+	 */
+	amdgpu_device_gpu_resume(adev, &device_list, false, false);
 	amdgpu_device_recovery_put_reset_lock(adev, &device_list);
 
 	if (hive) {

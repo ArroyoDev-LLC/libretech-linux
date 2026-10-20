@@ -1085,6 +1085,23 @@ static void stmmac_check_pcs_mode(struct stmmac_priv *priv)
 	}
 }
 
+static int stmmac_try_connect_phy(struct phylink *phylink, struct fwnode_handle *fwnode)
+{
+#define WAIT_TIMES 40
+		int ret = 0, i;
+		for (i = 0; i < WAIT_TIMES; i++) {
+			ret = phylink_fwnode_phy_connect(phylink, fwnode, 0);
+			if (!ret || ret != -ENODEV)
+				break;
+			msleep_interruptible(50);
+		}
+
+		if (ret)
+			pr_err("%s: fail to wait %d times, ret = %d\n", __func__, i, ret);
+
+		return ret;
+}
+
 /**
  * stmmac_init_phy - PHY initialization
  * @dev: net device structure
@@ -1143,7 +1160,8 @@ static int stmmac_init_phy(struct net_device *dev)
 		ret = phylink_connect_phy(priv->phylink, phydev);
 	} else {
 		fwnode_handle_put(phy_fwnode);
-		ret = phylink_fwnode_phy_connect(priv->phylink, fwnode, 0);
+
+		ret = stmmac_try_connect_phy(priv->phylink, fwnode);
 	}
 
 	if (ret) {
@@ -5909,6 +5927,85 @@ static int stmmac_napi_poll_rxtx(struct napi_struct *napi, int budget)
 }
 
 /**
+ *  stmmac_dump_tx_timeout_state - dump registers on TX timeout for debugging
+ *  @priv: driver private structure
+ *
+ *  Called before reset to capture the failing DMA/MAC/PHY state.
+ *  Rate-limited to first 3 occurrences to avoid log spam on reset loops.
+ *
+ *  ATOMIC CONTEXT. This runs from ->ndo_tx_timeout, which dev_watchdog()
+ *  calls from a timer callback with dev->tx_global_lock held and the TX
+ *  queues frozen. Nothing here may sleep: every read must be a plain
+ *  readl() or an already-cached field.
+ */
+static void stmmac_dump_tx_timeout_state(struct stmmac_priv *priv)
+{
+	void __iomem *ioaddr = priv->ioaddr;
+	struct phy_device *phydev = priv->dev->phydev;
+	struct stmmac_tx_queue *tx_q;
+	static int dump_count;
+
+	if (dump_count >= 3)
+		return;
+	dump_count++;
+
+	netdev_err(priv->dev, "TX timeout register dump (%d/3):\n", dump_count);
+
+	/* DMA registers (dwmac1000 core, base + 0x1000) */
+	netdev_err(priv->dev, "  DMA_BUS_MODE:    0x%08x\n",
+		   readl(ioaddr + 0x1000));
+	netdev_err(priv->dev, "  DMA_STATUS:      0x%08x\n",
+		   readl(ioaddr + 0x1014));
+	netdev_err(priv->dev, "  DMA_CONTROL:     0x%08x\n",
+		   readl(ioaddr + 0x1018));
+	netdev_err(priv->dev, "  DMA_INTR_ENA:    0x%08x\n",
+		   readl(ioaddr + 0x101c));
+	netdev_err(priv->dev, "  DMA_TX_BASE:     0x%08x\n",
+		   readl(ioaddr + 0x1010));
+	netdev_err(priv->dev, "  DMA_CUR_TX_DESC: 0x%08x\n",
+		   readl(ioaddr + 0x1048));
+	netdev_err(priv->dev, "  DMA_CUR_TX_BUF:  0x%08x\n",
+		   readl(ioaddr + 0x1050));
+
+	/* MAC registers */
+	netdev_err(priv->dev, "  MAC_CONTROL:     0x%08x\n",
+		   readl(ioaddr + 0x0000));
+	netdev_err(priv->dev, "  MAC_FRAME_FILT:  0x%08x\n",
+		   readl(ioaddr + 0x0004));
+	netdev_err(priv->dev, "  MAC_STATUS:      0x%08x\n",
+		   readl(ioaddr + 0x0038));
+
+	/* TX descriptor ring state */
+	tx_q = &priv->dma_conf.tx_queue[0];
+	netdev_err(priv->dev, "  TX ring: cur=%d dirty=%d\n",
+		   tx_q->cur_tx, tx_q->dirty_tx);
+
+	/*
+	 * PHY state, from the phylib cache -- NOT over MDIO.
+	 *
+	 * phy_read() -> mdiobus_read() takes mii_bus->mdio_lock (a mutex) and
+	 * the stmmac MDIO accessor polls with usleep_range(), so reading a PHY
+	 * register here schedules from a timer softirq. It does: the four
+	 * phy_read()s this block used to do produced
+	 *   BUG: scheduling while atomic: swapper/0/0/0x00000103
+	 * followed 173 ms later by a fatal stack-protector trip in
+	 * dev_printk_emit(), on an NFS-root board taking an early-boot TX
+	 * timeout.
+	 *
+	 * phydev->{link,speed,duplex,autoneg,state} are maintained by the PHY
+	 * state machine (polled at least once per second) and carry the same
+	 * diagnosis the BMCR/BMSR/ANAR/ANLPAR dump was decoded for, at zero
+	 * risk. They are read without phydev->lock -- also a mutex -- which is
+	 * a benign race on word-sized fields for a debug dump.
+	 */
+	if (phydev)
+		netdev_err(priv->dev,
+			   "  PHY (cached): link=%d speed=%d duplex=%d autoneg=%d state=%d\n",
+			   phydev->link, phydev->speed, phydev->duplex,
+			   phydev->autoneg, phydev->state);
+}
+
+/**
  *  stmmac_tx_timeout
  *  @dev : Pointer to net device structure
  *  @txqueue: the index of the hanging transmit queue
@@ -5921,6 +6018,7 @@ static void stmmac_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
 
+	stmmac_dump_tx_timeout_state(priv);
 	stmmac_global_err(priv);
 }
 
@@ -7867,8 +7965,10 @@ int stmmac_suspend(struct device *dev)
 	struct stmmac_priv *priv = netdev_priv(ndev);
 	u32 chan;
 
-	if (!ndev || !netif_running(ndev))
+	if (!ndev || !netif_running(ndev)) {
+		pr_debug("%s: skipping suspend\n", __func__);
 		goto suspend_bsp;
+	}
 
 	mutex_lock(&priv->lock);
 
@@ -7892,9 +7992,11 @@ int stmmac_suspend(struct device *dev)
 
 	/* Enable Power down mode by programming the PMT regs */
 	if (stmmac_wol_enabled_mac(priv)) {
+		pr_debug("%s: irq_wake\n", __func__);
 		stmmac_pmt(priv, priv->hw, priv->wolopts);
 		priv->irq_wake = 1;
 	} else {
+		pr_debug("%s: select_sleep_state\n", __func__);
 		stmmac_mac_set(priv, priv->ioaddr, false);
 		pinctrl_pm_select_sleep_state(priv->device);
 	}
@@ -7902,8 +8004,10 @@ int stmmac_suspend(struct device *dev)
 	mutex_unlock(&priv->lock);
 
 	rtnl_lock();
-	if (stmmac_wol_enabled_phy(priv))
+	if (stmmac_wol_enabled_phy(priv)) {
+		pr_debug("%s: device may wake up via phy\n", __func__);
 		phylink_speed_down(priv->phylink, false);
+	}
 
 	phylink_suspend(priv->phylink, stmmac_wol_enabled_mac(priv));
 	rtnl_unlock();
@@ -7973,8 +8077,10 @@ int stmmac_resume(struct device *dev)
 			return ret;
 	}
 
-	if (!netif_running(ndev))
+	if (!netif_running(ndev)) {
+		pr_debug("%s: skipping resume\n", __func__);
 		return 0;
+	}
 
 	/* Power Down bit, into the PM register, is cleared
 	 * automatically as soon as a magic packet or a Wake-up frame

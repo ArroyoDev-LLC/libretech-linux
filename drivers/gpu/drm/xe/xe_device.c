@@ -423,12 +423,35 @@ struct xe_device *xe_device_create(struct pci_dev *pdev,
 {
 	struct xe_device *xe;
 	int err;
+	/*
+	 * Compute-only load (probe_display=0 or CONFIG_DRM_XE_DISPLAY=n)
+	 * must leave the firmware/EFI framebuffer alone. aperture_remove
+	 * tears down efifb + deactivates the VGA console; with no xe
+	 * display path to replace it, the panel freezes and GDM/Xorg
+	 * loop forever (no /dev/fb*, no KMS).
+	 *
+	 * Measured 2026-07-18 on ai-aspire-14 (LNL 8086:64a0):
+	 *   fb0: EFI VGA frame buffer device  (1920x1200)
+	 *   xe: nomodeset active; loading compute-only
+	 *   Console: switching to colour dummy device 80x25
+	 *   xe ...: vgaarb: deactivate vga console
+	 *   -> /dev/fb0 gone; GNOME Shell/Xorg fail in a restart storm.
+	 *
+	 * Matches probe_display MODULE_PARM_DESC: display HW "left
+	 * untouched" when not probed. Full KMS path still removes
+	 * conflicting FBs as before.
+	 */
+	bool probe_display = IS_ENABLED(CONFIG_DRM_XE_DISPLAY) &&
+			     xe_modparam.probe_display;
 
 	xe_display_driver_set_hooks(&driver);
 
-	err = aperture_remove_conflicting_pci_devices(pdev, driver.name);
-	if (err)
-		return ERR_PTR(err);
+	if (probe_display) {
+		err = aperture_remove_conflicting_pci_devices(pdev,
+							     driver.name);
+		if (err)
+			return ERR_PTR(err);
+	}
 
 	xe = devm_drm_dev_alloc(&pdev->dev, &driver, struct xe_device, drm);
 	if (IS_ERR(xe))
@@ -901,9 +924,16 @@ int xe_device_probe(struct xe_device *xe)
 
 	xe_nvm_init(xe);
 
-	err = xe_heci_gsc_init(xe);
-	if (err)
-		return err;
+	/*
+	 * mei-gscfi aux device is for GSC proxy / PXP. Under compute-only
+	 * (no display) we skip async GSC load; do not publish the HECI aux
+	 * either — same LNL boot hang isolation (ai-aspire-14 2026-07-19).
+	 */
+	if (xe->info.probe_display) {
+		err = xe_heci_gsc_init(xe);
+		if (err)
+			return err;
+	}
 
 	err = xe_late_bind_init(&xe->late_bind);
 	if (err)

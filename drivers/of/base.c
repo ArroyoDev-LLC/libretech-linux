@@ -200,6 +200,7 @@ void __of_phandle_cache_inv_entry(phandle handle)
 void __init of_core_init(void)
 {
 	struct device_node *np;
+	int ret;
 
 	of_platform_register_reconfig_notifier();
 
@@ -221,6 +222,10 @@ void __init of_core_init(void)
 	/* Symlink in /proc as required by userspace ABI */
 	if (of_root)
 		proc_symlink("device-tree", NULL, "/sys/firmware/devicetree/base");
+
+	ret = of_overlay_init();
+	if (ret != 0)
+		pr_warn("of_init: of_overlay_init failed!\n");
 }
 
 static struct property *__of_find_property(const struct device_node *np,
@@ -1383,6 +1388,7 @@ int of_phandle_iterator_args(struct of_phandle_iterator *it,
 
 	return count;
 }
+EXPORT_SYMBOL_GPL(of_phandle_iterator_args);
 
 int __of_parse_phandle_with_args(const struct device_node *np,
 				 const char *list_name,

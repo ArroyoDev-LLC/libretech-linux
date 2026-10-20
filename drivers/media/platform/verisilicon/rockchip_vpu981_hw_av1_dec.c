@@ -2231,8 +2231,33 @@ int rockchip_vpu981_av1_dec_run(struct hantro_ctx *ctx)
 	return 0;
 
 prepare_error:
-	hantro_end_prepare_run(ctx);
-	hantro_irq_done(vpu, VB2_BUF_STATE_ERROR);
+	/*
+	 * Finish nothing here. This used to be
+	 *
+	 *	hantro_end_prepare_run(ctx);
+	 *	hantro_irq_done(vpu, VB2_BUF_STATE_ERROR);
+	 *	return ret;
+	 *
+	 * which was correct only while device_run()'s ->run() failure exit went
+	 * to hantro_job_finish_no_pm(): that touched neither the PM reference
+	 * nor the clocks, so the hantro_job_finish() reached through
+	 * hantro_irq_done() balanced them exactly once. b2ec5c6dcfd37 routed
+	 * that exit through hantro_job_finish() instead, and this path then
+	 * unwound the same job twice -- two pm_runtime_put_autosuspend() for
+	 * one get (a usage-count underflow, so the device suspends underneath a
+	 * later job that believes it is resumed), two clk_bulk_disable() for
+	 * one enable (WARN_ON in the clk core, clocks gated under a live job),
+	 * and two v4l2_m2m_buf_done_and_job_finish().
+	 *
+	 * hantro_irq_done() reached hantro_job_finish() at all only because
+	 * hantro_end_prepare_run() one line earlier had just armed the watchdog
+	 * it cancels. Both are dropped: this is now an ordinary non-zero return
+	 * under the contract documented at device_run(), and device_run() does
+	 * the single unwind. hantro_abort_prepare_run() releases the control
+	 * request hantro_start_prepare_run() bound, without arming a watchdog
+	 * for a job that is about to be finished.
+	 */
+	hantro_abort_prepare_run(ctx);
 	return ret;
 }
 

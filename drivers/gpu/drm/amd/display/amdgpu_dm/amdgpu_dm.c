@@ -3253,6 +3253,20 @@ static void dm_destroy_cached_state(struct amdgpu_device *adev)
 	dm->cached_state = NULL;
 }
 
+/*
+ * Drop the &dc_lock that dm_suspend() took for a GPU reset, if we still hold
+ * it.  Called from dm_resume() on the success path and from dm_reset_abort()
+ * when the reset failed and dm_resume() will never run.
+ */
+static void dm_release_reset_dc_lock(struct amdgpu_display_manager *dm)
+{
+	if (!dm->dc_lock_held_in_reset)
+		return;
+
+	dm->dc_lock_held_in_reset = false;
+	mutex_unlock(&dm->dc_lock);
+}
+
 static int dm_suspend(struct amdgpu_ip_block *ip_block)
 {
 	struct amdgpu_device *adev = ip_block->adev;
@@ -3262,6 +3276,7 @@ static int dm_suspend(struct amdgpu_ip_block *ip_block)
 		enum dc_status res;
 
 		mutex_lock(&dm->dc_lock);
+		dm->dc_lock_held_in_reset = true;
 
 		dc_allow_idle_optimizations(adev->dm.dc, false);
 
@@ -3280,7 +3295,7 @@ static int dm_suspend(struct amdgpu_ip_block *ip_block)
 			drm_err(adev_to_drm(adev), "Failed to commit zero streams: %d\n", res);
 			dc_state_release(dm->cached_dc_state);
 			dm->cached_dc_state = NULL;
-			mutex_unlock(&dm->dc_lock);
+			dm_release_reset_dc_lock(dm);
 			return -EINVAL;
 		}
 
@@ -3527,7 +3542,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
 			drm_err(adev_to_drm(adev), "DMUB interface failed to initialize: status=%d\n", r);
 			dc_state_release(dm->cached_dc_state);
 			dm->cached_dc_state = NULL;
-			mutex_unlock(&dm->dc_lock);
+			dm_release_reset_dc_lock(dm);
 			return r;
 		}
 
@@ -3565,7 +3580,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
 
 		amdgpu_dm_irq_resume_late(adev);
 
-		mutex_unlock(&dm->dc_lock);
+		dm_release_reset_dc_lock(dm);
 
 		/* set the backlight after a reset */
 		for (i = 0; i < dm->num_of_edps; i++) {
@@ -3698,6 +3713,28 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
  * The functions to do so are provided as hooks in &struct amd_ip_funcs.
  */
 
+/*
+ * dm_reset_abort - unwind the DM half of a GPU reset that failed
+ *
+ * amdgpu_device_pre_asic_reset() suspends the DCE IP block, and dm_suspend()
+ * keeps &dc_lock held for the duration of the reset.  When the ASIC reset
+ * itself fails, amdgpu_device_gpu_recover() bails out without resuming any IP
+ * block, so dm_resume() - the only other place that drops that lock - never
+ * runs.  The lock then stays held forever and the *next* recovery attempt
+ * blocks in dm_suspend() in uninterruptible sleep, holding the reset domain
+ * and a module reference: a failed reset becomes an unrecoverable wedge.
+ *
+ * Drop the lock here instead.  Touching the hardware is not safe at this
+ * point (the reset failed, the GPU may be gone), so this only unwinds
+ * software state.
+ */
+static void dm_reset_abort(struct amdgpu_ip_block *ip_block)
+{
+	struct amdgpu_device *adev = ip_block->adev;
+
+	dm_release_reset_dc_lock(&adev->dm);
+}
+
 static const struct amd_ip_funcs amdgpu_dm_funcs = {
 	.name = "dm",
 	.early_init = dm_early_init,
@@ -3709,6 +3746,7 @@ static const struct amd_ip_funcs amdgpu_dm_funcs = {
 	.hw_fini = dm_hw_fini,
 	.suspend = dm_suspend,
 	.resume = dm_resume,
+	.reset_abort = dm_reset_abort,
 	.is_idle = dm_is_idle,
 	.wait_for_idle = dm_wait_for_idle,
 	.check_soft_reset = dm_check_soft_reset,

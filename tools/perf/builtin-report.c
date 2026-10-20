@@ -670,10 +670,12 @@ static int report__browse_hists(struct report *rep)
 
 	path = system_path(TIPDIR);
 	if (perf_tip(&help, path) || help == NULL) {
+#if 0
 		/* fallback for people who don't install perf ;-) */
 		free(path);
 		path = system_path(DOCDIR);
 		if (perf_tip(&help, path) || help == NULL)
+#endif
 			help = strdup("Cannot load tips.txt file, please install perf!");
 	}
 	free(path);

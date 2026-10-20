@@ -523,6 +523,18 @@ enum usb_port_connect_type {
 #define USB_PORT_QUIRK_FAST_ENUM	BIT(1)
 
 /*
+ * Never power-cycle this port as an enumeration-retry recovery step.
+ *
+ * On some topologies a downstream port's VBUS is the attached device's only
+ * power rail (e.g. a single-board computer fed from the hub slot), so the
+ * VBUS bounce that hub_port_connect() performs halfway through its retry
+ * count is a hard reset of that device rather than a recovery for it. The
+ * port keeps all PORT_INIT_TRIES enumeration attempts; only the power cycle
+ * between them is suppressed.
+ */
+#define USB_PORT_QUIRK_NO_POWER_CYCLE	BIT(2)
+
+/*
  * USB 2.0 Link Power Management (LPM) parameters.
  */
 struct usb2_lpm_parameters {

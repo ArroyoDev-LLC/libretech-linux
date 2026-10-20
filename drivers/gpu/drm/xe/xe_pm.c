@@ -305,7 +305,13 @@ static u32 vram_threshold_value(struct xe_device *xe)
 		const char *product_name;
 
 		product_name = dmi_get_system_info(DMI_PRODUCT_NAME);
-		if (product_name && strstr(product_name, "NUC13RNG")) {
+		/* TRX50 AI TOP (Gigabyte, aitop): BMG D3cold->D0 resume fails ("Unable to
+		 * change power state from D3cold to D0, device inaccessible"), wedging both
+		 * B70s off the PCIe bus until a power cycle. Same class as NUC13RNG; add to
+		 * the deny-list (internal aitop D3cold/BACO wedge audit).
+		 */
+		if (product_name && (strstr(product_name, "NUC13RNG") ||
+				     strstr(product_name, "TRX50 AI TOP"))) {
 			drm_warn(&xe->drm, "BMG + D3Cold not supported on this platform\n");
 			return 0;
 		}

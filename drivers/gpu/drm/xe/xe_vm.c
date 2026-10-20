@@ -3352,7 +3352,8 @@ ALLOW_ERROR_INJECTION(vm_bind_ioctl_ops_execute, ERRNO);
 	 DRM_XE_VM_BIND_FLAG_DUMPABLE | \
 	 DRM_XE_VM_BIND_FLAG_CHECK_PXP | \
 	 DRM_XE_VM_BIND_FLAG_CPU_ADDR_MIRROR | \
-	 DRM_XE_VM_BIND_FLAG_MADVISE_AUTORESET)
+	 DRM_XE_VM_BIND_FLAG_MADVISE_AUTORESET | \
+	 DRM_XE_VM_BIND_FLAG_NO_CPU_ACCESS)
 
 #ifdef TEST_VM_OPS_ERROR
 #define SUPPORTED_FLAGS	(SUPPORTED_FLAGS_STUB | FORCE_OP_ERROR)
@@ -3572,12 +3573,13 @@ static int xe_vm_bind_ioctl_validate_bo(struct xe_device *xe, struct xe_bo *bo,
 				 bo->cpu_caching == DRM_XE_GEM_CPU_CACHING_WB)) {
 			return -EINVAL;
 		}
-	} else if (XE_IOCTL_DBG(xe, coh_mode == XE_COH_NONE)) {
+	} else if (XE_IOCTL_DBG(xe, coh_mode == XE_COH_NONE &&
+				!(bind_flags & DRM_XE_VM_BIND_FLAG_NO_CPU_ACCESS))) {
 		/*
-		 * Imported dma-buf from a different device should
-		 * require 1way or 2way coherency since we don't know
-		 * how it was mapped on the CPU. Just assume is it
-		 * potentially cached on CPU side.
+		 * Imported dma-buf from a different device may have
+		 * been CPU-mapped/CPU-written by the exporter; refuse a
+		 * non-coherent binding here unless userspace explicitly
+		 * asserts no CPU access via DRM_XE_VM_BIND_FLAG_NO_CPU_ACCESS.
 		 */
 		return -EINVAL;
 	}

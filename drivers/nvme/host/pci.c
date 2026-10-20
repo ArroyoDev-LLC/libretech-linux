@@ -3425,6 +3425,23 @@ static unsigned long check_vendor_combination_bug(struct pci_dev *pdev)
 		    dmi_match(DMI_BOARD_NAME, "PH4PRX1_PH6PRX1") ||
 		    dmi_match(DMI_BOARD_NAME, "PH6PG01_PH6PG71"))
 			return NVME_QUIRK_FORCE_NO_SIMPLE_SUSPEND;
+	} else if (pdev->vendor == 0x144d && pdev->device == 0xa80c) {
+		/*
+		 * Samsung SSD 990 PRO 4TB (S4LV008 "Pascal" controller,
+		 * 144d:a80c) drops off the PCIe bus under load when APST
+		 * autonomously enters its PS3 deep-idle state and then fails to
+		 * wake: an admin-queue command times out, the controller reset
+		 * fails (CSTS=0x1), the device is disabled (-19), and the btrfs
+		 * rootfs + swapfile go read-only, hard-resetting the box. Seen
+		 * (and captured over netconsole) on a Lenovo Legion
+		 * (LNVNB161216) used as a Libre Computer build host; SMART is
+		 * clean (0 media/data-integrity errors, 3% wear), so this is an
+		 * APST firmware quirk, not media failure. Disable APST entirely
+		 * (equivalent to nvme_core.default_ps_max_latency_us=0).
+		 */
+		if (dmi_match(DMI_BOARD_VENDOR, "LENOVO") &&
+		    dmi_match(DMI_BOARD_NAME, "LNVNB161216"))
+			return NVME_QUIRK_NO_APST;
 	}
 
 	/*

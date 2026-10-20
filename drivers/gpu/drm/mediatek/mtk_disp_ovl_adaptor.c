@@ -337,8 +337,17 @@ void mtk_ovl_adaptor_clk_disable(struct device *dev)
 		if (!comp || !comp_matches[i].funcs->clk_disable)
 			continue;
 		comp_matches[i].funcs->clk_disable(comp);
-		if (i < OVL_ADAPTOR_MERGE0)
-			pm_runtime_put(comp);
+		/*
+		 * Do NOT pm_runtime_put() the sub-component here. Its runtime PM
+		 * is already balanced by the mtk_ovl_adaptor_power_on() /
+		 * mtk_ovl_adaptor_power_off() pair (which call
+		 * pm_runtime_resume_and_get() / pm_runtime_put() on the mdp-rdma
+		 * devices, standing in for the CRTC atomic_enable get that does
+		 * nothing on this pseudo-device -- see mtk_ovl_adaptor_power_on()).
+		 * This put had no matching get in mtk_ovl_adaptor_clk_enable(), so
+		 * it drove usage_count negative -> "Runtime PM usage count
+		 * underflow!" on the ethdr + every mdp-rdma at each disable.
+		 */
 	}
 }
 

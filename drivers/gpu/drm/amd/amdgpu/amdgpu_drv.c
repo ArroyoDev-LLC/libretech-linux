@@ -820,6 +820,53 @@ module_param_unsafe(halt_if_hws_hang, int, 0644);
 MODULE_PARM_DESC(halt_if_hws_hang, "Halt if HWS hang is detected (0 = off (default), 1 = on)");
 
 /**
+ * DOC: mes_hang_full_reset (int)
+ * On MES-scheduled devices (gfx11/gfx12) a userspace VM fault can wedge the MES
+ * scheduler, causing an add/remove/suspend/resume queue op to fail. By default
+ * (0) KFD contains such a failure to the faulting process(es): their queues are
+ * marked reset and a reset event is signalled to userspace, WITHOUT issuing a
+ * full-device GPU reset -- the host stays up and the GPU is left for a
+ * deliberate/deferred recovery. Setting 1 restores the legacy behaviour of
+ * escalating an MES-op failure straight to a full-device GPU reset, which has
+ * been observed to deadlock the host on resume (gfx1201/R9700).
+ */
+int amdgpu_mes_hang_full_reset;
+module_param_named_unsafe(mes_hang_full_reset, amdgpu_mes_hang_full_reset, int, 0644);
+MODULE_PARM_DESC(mes_hang_full_reset,
+	"Full-device GPU reset on MES scheduler hang (0 = contain to faulting process, keep host up (default); 1 = legacy full-device reset)");
+
+/**
+ * DOC: mes_hang_rearm (int)
+ * When KFD contains an MES scheduler hang (see mes_hang_full_reset) the device
+ * is left in a sticky halted state: dqm->sched_halt is set, so every queue op
+ * short-circuits, and the amdgpu module is pinned because a reload against a
+ * contained device was measured host-fatal on gfx1201/R9700. Nothing clears
+ * that state, so the documented recovery is a reboot.
+ *
+ * A device reset issued AFTER containment has torn the faulting process(es)
+ * down (e.g. the amdgpu_gpu_recover debugfs trigger) is a different situation
+ * from the reset-during-fault that containment declines, and has been observed
+ * to complete cleanly with the host up. Setting 1 makes KFD re-arm dispatch at
+ * the end of such a reset: kgd2kfd_post_reset() clears the containment halt and
+ * releases the module pin, so a new process can submit to the reprogrammed MES
+ * without a reboot.
+ *
+ * Re-arming additionally requires that a real HW reset was performed AND
+ * succeeded (kgd2kfd_post_reset()'s hw_reset_done). post_reset is also reached
+ * when the reset was skipped because the guilty job had already signalled, and
+ * from PCIe error recovery and SRIOV FLR, neither of which vouches for MES;
+ * clearing the halt there would leave dispatch pointed at a dead scheduler.
+ *
+ * Default 0 (off): re-arming is opt-in because the evidence base for
+ * reset-after-containment is small and because dropping the module pin
+ * re-opens the host-fatal reload path.
+ */
+int amdgpu_mes_hang_rearm;
+module_param_named_unsafe(mes_hang_rearm, amdgpu_mes_hang_rearm, int, 0644);
+MODULE_PARM_DESC(mes_hang_rearm,
+	"Re-arm KFD dispatch after a device reset on an MES-hang-contained device (0 = off, recovery is a reboot (default); 1 = clear the containment halt in post_reset)");
+
+/**
  * DOC: hws_gws_support(bool)
  * Assume that HWS supports GWS barriers regardless of what firmware version
  * check says. Default value: false (rely on MEC2 firmware version check).

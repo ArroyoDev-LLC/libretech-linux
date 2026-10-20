@@ -169,6 +169,72 @@ static int mes_userq_unmap(struct amdgpu_userq_mgr *uq_mgr,
 	return r;
 }
 
+int mes_userq_reset(struct amdgpu_usermode_queue *queue)
+{
+	struct amdgpu_userq_mgr *uq_mgr = queue->userq_mgr;
+	struct amdgpu_device *adev = uq_mgr->adev;
+	struct mes_reset_queue_input queue_input;
+	int r;
+
+	/* XXX: add a FW version check for SDMA per queue reset */
+	memset(&queue_input, 0x0, sizeof(struct mes_reset_queue_input));
+	queue_input.doorbell_offset = queue->doorbell_index;
+	queue_input.queue_type = queue->queue_type;
+
+	amdgpu_mes_lock(&adev->mes);
+	r = adev->mes.funcs->reset_hw_queue(&adev->mes, &queue_input);
+	amdgpu_mes_unlock(&adev->mes);
+	if (r)
+		return r;
+	/* this tree: unmap takes (mgr, queue) */
+	return mes_userq_unmap(uq_mgr, queue);
+}
+
+int mes_userq_reset_queue(struct amdgpu_device *adev,
+			  struct amdgpu_usermode_queue *guilty_uq,
+			  int queue_type,
+			  unsigned int pipe,
+			  unsigned int queue,
+			  unsigned int db)
+{
+	struct amdgpu_userq_mgr *uqm, *tmp;
+	struct amdgpu_usermode_queue *uq;
+	bool use_mmio = adev->gfx.mec.use_mmio_for_reset;
+	int r, queue_id;
+
+	/* This tree has no userq_doorbell_xa; walk mgr list + idr instead. */
+	list_for_each_entry_safe(uqm, tmp, &adev->userq_mgr_list, list) {
+		idr_for_each_entry(&uqm->userq_idr, uq, queue_id) {
+			if (uq->queue_type != queue_type)
+				continue;
+			if (uq == guilty_uq)
+				continue;
+			if (uq->doorbell_index != db)
+				continue;
+			uq->state = AMDGPU_USERQ_STATE_HUNG;
+			/* no HQD coordinates: an MMIO reset would hit a guessed slot */
+			if (use_mmio && (pipe == AMDGPU_GFX_HQD_UNKNOWN ||
+					 queue == AMDGPU_GFX_HQD_UNKNOWN))
+				return -ENODATA;
+			if (use_mmio)
+				r = amdgpu_mes_reset_queue_mmio(adev, queue_type, 0, 1,
+								  pipe, queue, 0);
+			else
+				r = amdgpu_mes_reset_user_queue(adev, queue_type, db, 0);
+			if (r)
+				return r;
+			r = mes_userq_unmap(uqm, uq);
+			if (r)
+				return r;
+			atomic_inc(&adev->gpu_reset_counter);
+			amdgpu_userq_fence_driver_force_completion(uq);
+			drm_dev_wedged_event(adev_to_drm(adev), DRM_WEDGE_RECOVERY_NONE, NULL);
+			return 0;
+		}
+	}
+	return 0;
+}
+
 static int mes_userq_create_ctx_space(struct amdgpu_userq_mgr *uq_mgr,
 				      struct amdgpu_usermode_queue *queue,
 				      struct drm_amdgpu_userq_in *mqd_user)
@@ -189,53 +255,6 @@ static int mes_userq_create_ctx_space(struct amdgpu_userq_mgr *uq_mgr,
 	}
 
 	return 0;
-}
-
-static int mes_userq_detect_and_reset(struct amdgpu_device *adev,
-				      int queue_type)
-{
-	int db_array_size = amdgpu_mes_get_hung_queue_db_array_size(adev);
-	struct mes_detect_and_reset_queue_input input;
-	struct amdgpu_usermode_queue *queue;
-	struct amdgpu_userq_mgr *uqm, *tmp;
-	unsigned int hung_db_num = 0;
-	int queue_id, r, i;
-	u32 db_array[8];
-
-	if (db_array_size > 8) {
-		dev_err(adev->dev, "DB array size (%d vs 8) too small\n",
-			db_array_size);
-		return -EINVAL;
-	}
-
-	memset(&input, 0x0, sizeof(struct mes_detect_and_reset_queue_input));
-
-	input.queue_type = queue_type;
-
-	amdgpu_mes_lock(&adev->mes);
-	r = amdgpu_mes_detect_and_reset_hung_queues(adev, queue_type, false,
-						    &hung_db_num, db_array);
-	amdgpu_mes_unlock(&adev->mes);
-	if (r) {
-		dev_err(adev->dev, "Failed to detect and reset queues, err (%d)\n", r);
-	} else if (hung_db_num) {
-		list_for_each_entry_safe(uqm, tmp, &adev->userq_mgr_list, list) {
-			idr_for_each_entry(&uqm->userq_idr, queue, queue_id) {
-				if (queue->queue_type == queue_type) {
-					for (i = 0; i < hung_db_num; i++) {
-						if (queue->doorbell_index == db_array[i]) {
-							queue->state = AMDGPU_USERQ_STATE_HUNG;
-							atomic_inc(&adev->gpu_reset_counter);
-							amdgpu_userq_fence_driver_force_completion(queue);
-							drm_dev_wedged_event(adev_to_drm(adev), DRM_WEDGE_RECOVERY_NONE, NULL);
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return r;
 }
 
 static int mes_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
@@ -479,7 +498,7 @@ const struct amdgpu_userq_funcs userq_mes_funcs = {
 	.mqd_destroy = mes_userq_mqd_destroy,
 	.unmap = mes_userq_unmap,
 	.map = mes_userq_map,
-	.detect_and_reset = mes_userq_detect_and_reset,
 	.preempt = mes_userq_preempt,
 	.restore = mes_userq_restore,
+	.reset = mes_userq_reset,
 };

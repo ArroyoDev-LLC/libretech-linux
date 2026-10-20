@@ -446,6 +446,22 @@ struct amdgpu_display_manager {
 	struct mutex dc_lock;
 
 	/**
+	 * @dc_lock_held_in_reset:
+	 *
+	 * Set when dm_suspend() acquired &dc_lock for a GPU reset.  That
+	 * acquisition is asymmetric on purpose: the lock is held across the
+	 * whole reset window and dropped again by dm_resume().  If the reset
+	 * fails, dm_resume() is never called for this IP block, so this flag
+	 * lets dm_reset_abort() drop the lock instead.  Without it the next
+	 * reset attempt blocks forever in dm_suspend().
+	 *
+	 * Serialised by &dc_lock itself for the set/clear performed while it
+	 * is held, and by the reset domain lock (only one reset runs at a
+	 * time) for the abort path.
+	 */
+	bool dc_lock_held_in_reset;
+
+	/**
 	 * @audio_lock:
 	 *
 	 * Guards access to audio instance changes.

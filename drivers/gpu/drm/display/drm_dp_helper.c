@@ -4395,8 +4395,28 @@ static int dp_aux_backlight_update_status(struct backlight_device *bd)
 	return ret;
 }
 
+static int dp_aux_backlight_get_brightness(struct backlight_device *bd)
+{
+	struct dp_aux_backlight *bl = bl_get_data(bd);
+	u8 current_mode;
+	int level;
+
+	/*
+	 * Re-read the panel's DPCD brightness register so actual_brightness is
+	 * a live value rather than the level cached at probe time.
+	 * drm_edp_backlight_probe_state() returns the current level (>= 0) or a
+	 * negative errno on AUX failure; fall back to the cached value then.
+	 */
+	level = drm_edp_backlight_probe_state(bl->aux, &bl->info, &current_mode);
+	if (level < 0)
+		return bd->props.brightness;
+
+	return level;
+}
+
 static const struct backlight_ops dp_aux_bl_ops = {
 	.update_status = dp_aux_backlight_update_status,
+	.get_brightness = dp_aux_backlight_get_brightness,
 };
 
 /**
@@ -4457,6 +4477,7 @@ int drm_panel_dp_aux_backlight(struct drm_panel *panel, struct drm_dp_aux *aux)
 		return ret;
 
 	props.type = BACKLIGHT_RAW;
+	props.scale = BACKLIGHT_SCALE_LINEAR;
 	props.brightness = current_level;
 	props.max_brightness = bl->info.max;
 

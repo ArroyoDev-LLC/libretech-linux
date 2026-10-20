@@ -27,10 +27,14 @@ static int xe_dma_buf_attach(struct dma_buf *dmabuf,
 {
 	struct drm_gem_object *obj = attach->dmabuf->priv;
 
-	if (attach->peer2peer &&
-	    pci_p2pdma_distance(to_pci_dev(obj->dev->dev), attach->dev, false) < 0)
-		attach->peer2peer = false;
-
+	/*
+	 * Allow peer2peer for same-generation Intel GPU pairs without the
+	 * pci_p2pdma_distance() veto. On single-IOD Threadripper systems with
+	 * iommu=pt the function conservatively returns < 0 due to ACS upstream-
+	 * forwarding bits, but intra-chip root-complex routing still works.
+	 * xe_dma_buf_map / xe_dma_buf_pin will fall back gracefully if the
+	 * actual DMA mapping fails.
+	 */
 	if (!attach->peer2peer && !xe_bo_can_migrate(gem_to_xe_bo(obj), XE_PL_TT))
 		return -EOPNOTSUPP;
 
@@ -53,6 +57,22 @@ static int xe_dma_buf_pin(struct dma_buf_attachment *attach)
 	struct xe_device *xe = xe_bo_device(bo);
 	struct drm_exec *exec = XE_VALIDATION_UNSUPPORTED;
 	int ret;
+
+	/*
+	 * For peer-to-peer GPU dma-buf attachments the BO lives in the
+	 * exporter's VRAM and must not be migrated to the importer's TT.
+	 * Validate it in place and pin it so TTM cannot evict it to system
+	 * memory while the importer GPU issues PCIe peer reads against it.
+	 */
+	if (attach->peer2peer) {
+		ret = xe_bo_validate(bo, NULL, false, exec);
+		if (ret)
+			return ret;
+		ret = xe_bo_pin_external(bo, true, exec);
+		if (ret)
+			return ret;
+		return 0;
+	}
 
 	/*
 	 * For now only support pinning in TT memory, for two reasons:

@@ -169,6 +169,7 @@ static const struct ucsi_operations ucsi_gram_ops = {
 	.async_control = ucsi_acpi_async_control
 };
 
+/* Ops replacements (driver_data = struct ucsi_operations *) */
 static const struct dmi_system_id ucsi_acpi_quirks[] = {
 	{
 		.matches = {
@@ -184,6 +185,29 @@ static const struct dmi_system_id ucsi_acpi_quirks[] = {
 			DMI_MATCH(DMI_PRODUCT_NAME, "90Q"),
 		},
 		.driver_data = (void *)&ucsi_gram_ops,
+	},
+	{ }
+};
+
+/*
+ * Bitflag quirks (driver_data = unsigned long UCSI_* flags).
+ * Kept separate from ops quirks so both can apply independently.
+ */
+static const struct dmi_system_id ucsi_acpi_dmi_flags[] = {
+	{
+		/*
+		 * Acer Aspire A14-52MT (Lunar Lake, board Tiramisu_LNV):
+		 * GET_CAPABILITY.num_connectors=1 but CCI reports connector 2
+		 * and GET_CONNECTOR_CAPABILITY/STATUS for connector 2 succeed.
+		 * Without raising the count, ucsi_notify_common logs
+		 * "bogus connector number in CCI: 2" and never ACKs → spam.
+		 * Measured 2026-07-16 (BIOS V1.32).
+		 */
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire A14-52MT"),
+		},
+		.driver_data = (void *)UCSI_MIN_CONNECTORS_2,
 	},
 	{ }
 };
@@ -241,6 +265,10 @@ static int ucsi_acpi_probe(struct platform_device *pdev)
 	ua->ucsi = ucsi_create(&pdev->dev, ops);
 	if (IS_ERR(ua->ucsi))
 		return PTR_ERR(ua->ucsi);
+
+	id = dmi_first_match(ucsi_acpi_dmi_flags);
+	if (id)
+		ua->ucsi->quirks |= (unsigned long)id->driver_data;
 
 	ucsi_set_drvdata(ua->ucsi, ua);
 

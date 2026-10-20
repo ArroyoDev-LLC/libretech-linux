@@ -2719,11 +2719,27 @@ int amdgpu_vm_make_compute(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 		  "CPU update of VM recommended only for large BAR system\n");
 
 	if (vm->use_cpu_for_update) {
-		/* Sync with last SDMA update/clear before switching to CPU */
-		r = amdgpu_bo_sync_wait(vm->root.bo,
-					AMDGPU_FENCE_OWNER_UNDEFINED, true);
-		if (r)
+		long t;
+
+		/*
+		 * Sync with last SDMA update/clear before switching to CPU.
+		 *
+		 * SDMA page-table updates (including the root clear done at VM
+		 * init) are attached to the root reservation with
+		 * DMA_RESV_USAGE_BOOKKEEP. Since "drm/amdgpu: promote the implicit
+		 * sync to the dependent read fences" amdgpu_bo_sync_wait() only
+		 * collects KERNEL/WRITE/READ fences, so it no longer waits for
+		 * them, and a still-pending root clear can land after the CPU has
+		 * written PDEs and wipe them. Wait on BOOKKEEP explicitly. No KFD
+		 * eviction fence is attached yet (init_kfd_vm runs after this).
+		 */
+		t = dma_resv_wait_timeout(vm->root.bo->tbo.base.resv,
+					  DMA_RESV_USAGE_BOOKKEEP, true,
+					  MAX_SCHEDULE_TIMEOUT);
+		if (t < 0) {
+			r = t;
 			goto unreserve_bo;
+		}
 
 		vm->update_funcs = &amdgpu_vm_cpu_funcs;
 		r = amdgpu_vm_pt_map_tables(adev, vm);

@@ -522,6 +522,13 @@ struct enc_wave_param {
 	s32 chroma_cb_qp_offset; /* the value of chroma(cb) QP offset */
 	s32 chroma_cr_qp_offset; /* the value of chroma(cr) QP offset */
 	s32 initial_rc_qp;
+	u32 nr_y_enable : 1; /* enable noise reduction for Y component */
+	u32 nr_cb_enable : 1; /* enable noise reduction for Cb component */
+	u32 nr_cr_enable : 1; /* enable noise reduction for Cr component */
+	u32 nr_noise_est_enable : 1; /* enable HW noise estimation (auto sigma) */
+	u32 nr_noise_sigma_y; /* Y noise sigma (0 ~ 255, used when nr_noise_est_enable=0) */
+	u32 nr_noise_sigma_cb; /* Cb noise sigma (0 ~ 255) */
+	u32 nr_noise_sigma_cr; /* Cr noise sigma (0 ~ 255) */
 	u32 nr_intra_weight_y;
 	u32 nr_intra_weight_cb; /* weight to cb noise level for intra picture (0 ~ 31) */
 	u32 nr_intra_weight_cr; /* weight to cr noise level for intra picture (0 ~ 31) */
@@ -547,6 +554,11 @@ struct enc_wave_param {
 	u32 intra_mb_refresh_arg;
 	u32 rc_weight_param;
 	u32 rc_weight_buf;
+	u32 force_pic_qp_p; /* force QP for P pictures (0=disabled, 1-51=QP value) */
+	u32 force_pic_qp_b; /* force QP for B pictures (0=disabled, 1-51=QP value) */
+	u32 force_pic_qp_enable: 1; /* enable force picture QP */
+	u32 use_general_pb: 1; /* enable generalized P/B reference structure */
+	u32 cu_size_mode: 3; /* bit0=8x8, bit1=16x16, bit2=32x32 (default 0x7=all) */
 
 	/* flags */
 	u32 en_still_picture: 1; /* still picture profile */
@@ -620,6 +632,10 @@ struct enc_param {
 	struct enc_code_opt code_option;
 	u64 pts; /* presentation timestamp (PTS) of the input source */
 	bool src_end_flag;
+	u32 force_pic_qp_enable; /* enable force picture QP override */
+	u32 force_pic_qp_i; /* force QP for I pictures (0-63) */
+	u32 force_pic_qp_p; /* force QP for P pictures (0-63) */
+	u32 force_pic_qp_b; /* force QP for B pictures (0-63) */
 };
 
 struct enc_output_info {

@@ -958,8 +958,15 @@ static int __maybe_unused stmmac_pltfr_noirq_suspend(struct device *dev)
 	struct stmmac_priv *priv = netdev_priv(ndev);
 	int ret;
 
+	/*
+	 * Interface down: the device should already be runtime-suspended, but a
+	 * PHY suspend callback that touches MDIO (e.g. genphy_suspend) resumes
+	 * the MAC through stmmac_mdio_access() during system suspend, after
+	 * runtime PM can put it back. Force it down so its bus clocks (and the
+	 * PLLs behind them) are off for the sleep; a no-op if already suspended.
+	 */
 	if (!netif_running(ndev))
-		return 0;
+		return pm_runtime_force_suspend(dev);
 
 	if (!stmmac_wol_enabled_mac(priv)) {
 		/* Disable clock in case of PWM is off */
@@ -979,8 +986,9 @@ static int __maybe_unused stmmac_pltfr_noirq_resume(struct device *dev)
 	struct stmmac_priv *priv = netdev_priv(ndev);
 	int ret;
 
+	/* Balances the interface-down force-suspend in noirq_suspend. */
 	if (!netif_running(ndev))
-		return 0;
+		return pm_runtime_force_resume(dev);
 
 	if (!stmmac_wol_enabled_mac(priv)) {
 		/* enable the clk previously disabled */

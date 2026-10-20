@@ -57,6 +57,7 @@
 	S(SNK_DISCOVERY),			\
 	S(SNK_DISCOVERY_DEBOUNCE),		\
 	S(SNK_DISCOVERY_DEBOUNCE_DONE),		\
+	S(SNK_GET_SRC_CAPABILITIES),		\
 	S(SNK_WAIT_CAPABILITIES),		\
 	S(SNK_WAIT_CAPABILITIES_TIMEOUT),	\
 	S(SNK_NEGOTIATE_CAPABILITIES),		\
@@ -3258,6 +3259,7 @@ static void tcpm_pd_data_request(struct tcpm_port *port,
 						   PD_MSG_CTRL_NOT_SUPP,
 						   NONE_AMS);
 		} else if (port->state == SNK_WAIT_CAPABILITIES ||
+			   port->state == SNK_GET_SRC_CAPABILITIES ||
 			   port->state == SNK_WAIT_CAPABILITIES_TIMEOUT) {
 		/*
 		 * This message may be received even if VBUS is not
@@ -4688,6 +4690,19 @@ static void tcpm_acc_detach(struct tcpm_port *port)
 
 static inline enum tcpm_state hard_reset_state(struct tcpm_port *port)
 {
+	/*
+	 * A sink-only port that is not self-powered draws its own supply
+	 * through this VBUS, and a Hard Reset makes the source cycle VBUS
+	 * through vSafe0V -- i.e. it powers the machine off. Before any PD
+	 * contract exists on this attach there is nothing a Hard Reset could
+	 * restore that Type-C current does not already give, so settle there.
+	 * This also covers the boot hand-off: a source still in a contract
+	 * made by the bootloader that ignores Get_Source_Cap/Soft_Reset is
+	 * left running at its current voltage instead of being reset.
+	 */
+	if (port->port_type == TYPEC_PORT_SNK && !port->self_powered &&
+	    !port->pd_capable && port->vbus_present)
+		return SNK_READY;
 	if (port->hard_reset_count < PD_N_HARD_RESET_COUNT)
 		return HARD_RESET_SEND;
 	if (port->pd_capable)
@@ -5244,6 +5259,11 @@ static void run_state_machine(struct tcpm_port *port)
 		}
 		tcpm_set_state(port, unattached_state(port), 0);
 		break;
+	case SNK_GET_SRC_CAPABILITIES:
+		tcpm_pd_send_control(port, PD_CTRL_GET_SOURCE_CAP, TCPC_TX_SOP);
+		tcpm_set_state(port, SNK_SOFT_RESET,
+			       PD_T_SINK_WAIT_CAP);
+		break;
 	case SNK_WAIT_CAPABILITIES:
 		ret = port->tcpc->set_pd_rx(port->tcpc, true);
 		if (ret < 0) {
@@ -5258,7 +5278,7 @@ static void run_state_machine(struct tcpm_port *port)
 		 */
 		if (port->vbus_never_low) {
 			port->vbus_never_low = false;
-			upcoming_state = SNK_SOFT_RESET;
+			upcoming_state = SNK_GET_SRC_CAPABILITIES;
 		} else {
 			if (!port->self_powered)
 				upcoming_state = SNK_WAIT_CAPABILITIES_TIMEOUT;
@@ -5447,6 +5467,10 @@ static void run_state_machine(struct tcpm_port *port)
 		tcpm_ams_start(port, HARD_RESET);
 		break;
 	case HARD_RESET_START:
+		if (port->prev_state == SNK_NEGOTIATE_CAPABILITIES){
+			usb_power_delivery_unregister_capabilities(port->partner_source_caps);
+			port->partner_source_caps = NULL;
+		}
 		port->sink_cap_done = false;
 		if (port->tcpc->enable_frs)
 			port->tcpc->enable_frs(port->tcpc, false);

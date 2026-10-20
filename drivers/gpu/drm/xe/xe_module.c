@@ -96,8 +96,33 @@ MODULE_PARM_DESC(wedged_mode,
 
 static int xe_check_nomodeset(void)
 {
-	if (drm_firmware_drivers_only())
+	/*
+	 * nomodeset (drm_firmware_drivers_only) normally means "leave the
+	 * firmware FB alone — do not load KMS drivers."  That is correct when
+	 * the goal is a pure firmware console, but it also blocks GuC + render
+	 * bring-up on hosts that need *compute-only* xe under nomodeset.
+	 *
+	 * Measured need (2026-07-16): Lunar Lake Arc 130V/140V on ai-aspire-14
+	 * boots with nomodeset to avoid an LNL display hang while the host is
+	 * used as a TB4 eGPU testbed.  The iGPU PCI function is still present
+	 * and NEO/L0 needs /dev/dri/renderD* — so allow the module to load
+	 * when display will not be probed:
+	 *   - probe_display=0 (display HW left untouched; render/compute only), or
+	 *   - CONFIG_DRM_XE_DISPLAY=n (display compiled out entirely).
+	 *
+	 * Default behaviour is unchanged: nomodeset + probe_display=1 (default)
+	 * with display compiled in still returns -ENODEV.
+	 */
+	bool compute_only = !xe_modparam.probe_display ||
+			    !IS_ENABLED(CONFIG_DRM_XE_DISPLAY);
+
+	if (drm_firmware_drivers_only() && !compute_only)
 		return -ENODEV;
+
+	if (drm_firmware_drivers_only() && compute_only)
+		pr_info("xe: nomodeset active; loading compute-only (probe_display=%d display_cfg=%d)\n",
+			xe_modparam.probe_display,
+			IS_ENABLED(CONFIG_DRM_XE_DISPLAY));
 
 	return 0;
 }

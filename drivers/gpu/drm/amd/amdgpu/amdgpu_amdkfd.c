@@ -299,12 +299,12 @@ int amdgpu_amdkfd_pre_reset(struct amdgpu_device *adev,
 	return r;
 }
 
-int amdgpu_amdkfd_post_reset(struct amdgpu_device *adev)
+int amdgpu_amdkfd_post_reset(struct amdgpu_device *adev, bool hw_reset_done)
 {
 	int r = 0;
 
 	if (adev->kfd.dev)
-		r = kgd2kfd_post_reset(adev->kfd.dev);
+		r = kgd2kfd_post_reset(adev->kfd.dev, hw_reset_done);
 
 	return r;
 }
@@ -542,9 +542,29 @@ int amdgpu_amdkfd_get_dmabuf_info(struct amdgpu_device *adev, int dma_buf_fd,
 	if (IS_ERR(dma_buf))
 		return PTR_ERR(dma_buf);
 
-	if (dma_buf->ops != &amdgpu_dmabuf_ops)
-		/* Can't handle non-graphics buffers */
+	if (dma_buf->ops != &amdgpu_dmabuf_ops) {
+		/*
+		 * Cross-vendor dma-buf (e.g. Intel xe VRAM on same-IOD root
+		 * complex). Accept it for PCIe peer-to-peer import: report the
+		 * buffer size and flag it as foreign VRAM. The importing AMD GPU
+		 * will map it via GART using the exporter's PCIe BAR DMA
+		 * addresses (xe patches 0005+0006 keep the BO pinned in VRAM).
+		 * No AMD metadata available; skip metadata copy.
+		 *
+		 * Requires iommu=pt or iommu=off + pcie_acs_override=downstream
+		 * and xe kernel patches 0005+0006 (debian-linux 7baef16/eb77371).
+		 */
+		r = 0;
+		if (dmabuf_adev)
+			*dmabuf_adev = adev;
+		if (bo_size)
+			*bo_size = dma_buf->size;
+		if (flags)
+			*flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM;
+		if (xcp_id)
+			*xcp_id = -1;
 		goto out_put;
+	}
 
 	obj = dma_buf->priv;
 	if (obj->dev->driver != adev_to_drm(adev)->driver)
@@ -928,4 +948,18 @@ int amdgpu_amdkfd_config_sq_perfmon(struct amdgpu_device *adev, uint32_t xcp_id,
 					reg_override_enable, perfmon_override_enable);
 
 	return r;
+}
+
+/* Reset a KFD MES user queue (called from KGD multi-queue reset) */
+int amdgpu_amdkfd_reset_mes_queue(struct amdgpu_device *adev,
+				  uint32_t node_id,
+				  int queue_type,
+				  int pipe, int queue,
+				  unsigned int db)
+{
+	if (!adev->kfd.init_complete)
+		return 0;
+
+	return kgd2kfd_reset_mes_queue(adev->kfd.dev, node_id, queue_type,
+				       pipe, queue, db);
 }

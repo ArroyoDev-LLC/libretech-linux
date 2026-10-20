@@ -208,6 +208,12 @@ void rtw_tx_report_enqueue(struct rtw_dev *rtwdev, struct sk_buff *skb, u8 sn)
 	__skb_queue_tail(&tx_report->queue, skb);
 	spin_unlock_irqrestore(&tx_report->q_lock, flags);
 
+	/* USB devices need longer timeout due to bus latency and bandwidth
+	 * contention with Bluetooth (especially during SCO audio)
+	 */
+	if (rtwdev->hci.type == RTW_HCI_TYPE_USB)
+		timeout = RTW_TX_PROBE_TIMEOUT_USB;
+
 	if (rtwdev->chip->id == RTW_CHIP_TYPE_8723D &&
 	    rtwdev->hci.type == RTW_HCI_TYPE_USB)
 		timeout = msecs_to_jiffies(2500);

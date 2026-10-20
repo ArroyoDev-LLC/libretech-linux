@@ -1849,6 +1849,15 @@ static void pci_restore_config_space(struct pci_dev *pdev)
  */
 void pci_restore_state(struct pci_dev *dev)
 {
+	/*
+	 * A disconnected device (e.g. a surprise-removed Thunderbolt/eGPU whose
+	 * link went down) cannot be probed: every config access below would read
+	 * the absent device and, on platforms without DPC to contain it, the
+	 * ECAM read never completes -> CPU soft lockup. Bail before touching it.
+	 */
+	if (pci_dev_is_disconnected(dev))
+		return;
+
 	pci_restore_pcie_state(dev);
 	pci_restore_pasid_state(dev);
 	pci_restore_pri_state(dev);
@@ -3139,10 +3148,34 @@ void pci_d3cold_disable(struct pci_dev *dev)
 }
 EXPORT_SYMBOL_GPL(pci_d3cold_disable);
 
-void pci_pm_power_up_and_verify_state(struct pci_dev *pci_dev)
+int pci_pm_power_up_and_verify_state(struct pci_dev *pci_dev)
 {
-	pci_power_up(pci_dev);
+	int ret = pci_power_up(pci_dev);
+
+	/*
+	 * pci_power_up() returns -EIO when the device is inaccessible (PMCSR
+	 * reads as all-ones / device disconnected). Propagate it: callers must
+	 * not go on to read/restore config space, which would hang on the dead
+	 * device. A non-negative return means D0 was reached (>0 == config
+	 * restore needed).
+	 *
+	 * But -EIO is overloaded: pci_power_up() returns it for a perfectly
+	 * healthy device that merely lacks a Power Management capability, after
+	 * setting current_state to D0 by platform means (see its kerneldoc, and
+	 * the !dev->pm_cap branch). Such a device is fully accessible, and
+	 * treating it as inaccessible here would skip pci_restore_state() on
+	 * every resume path -- system, hibernate and runtime -- for every one of
+	 * them. That is not rare: 38 of 87 PCI functions on one fleet host have
+	 * no PM capability (root complexes, AMD Data Fabric, FCH SMBus/LPC).
+	 *
+	 * Discriminate on current_state exactly as pci_set_full_power_state()
+	 * already does for the same return value.
+	 */
+	if (ret < 0 && pci_dev->current_state != PCI_D0)
+		return ret;
+
 	pci_update_current_state(pci_dev, PCI_D0);
+	return 0;
 }
 
 /**

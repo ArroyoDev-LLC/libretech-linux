@@ -59,10 +59,10 @@ enum emc230x_product_id {
 };
 
 static const struct i2c_device_id emc2305_ids[] = {
-	{ "emc2305" },
-	{ "emc2303" },
-	{ "emc2302" },
 	{ "emc2301" },
+	{ "emc2302" },
+	{ "emc2303" },
+	{ "emc2305" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, emc2305_ids);
@@ -617,6 +617,9 @@ static int emc2305_probe(struct i2c_client *client)
 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA))
 		return -ENODEV;
 
+	i2c_smbus_xfer(client->adapter, client->addr, 0, I2C_SMBUS_WRITE,
+                         0, I2C_SMBUS_QUICK, NULL);
+
 	vendor = i2c_smbus_read_byte_data(client, EMC2305_REG_VENDOR);
 	if (vendor != EMC2305_VENDOR)
 		return -ENODEV;
@@ -718,6 +721,9 @@ static int emc2305_probe(struct i2c_client *client)
 }
 
 static const struct of_device_id of_emc2305_match_table[] = {
+	{ .compatible = "microchip,emc2301", },
+	{ .compatible = "microchip,emc2302", },
+	{ .compatible = "microchip,emc2303", },
 	{ .compatible = "microchip,emc2305", },
 	{},
 };

@@ -78,7 +78,6 @@ static struct amdgpu_device *dma_buf_attach_adev(struct dma_buf_attachment *atta
 static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
 				 struct dma_buf_attachment *attach)
 {
-	struct amdgpu_device *attach_adev = dma_buf_attach_adev(attach);
 	struct drm_gem_object *obj = dmabuf->priv;
 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
@@ -96,9 +95,14 @@ static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
 	    bo->flags & AMDGPU_GEM_CREATE_GFX12_DCC)
 		attach->peer2peer = false;
 
-	if (!amdgpu_dmabuf_is_xgmi_accessible(attach_adev, bo) &&
-	    pci_p2pdma_distance(adev->pdev, attach->dev, false) < 0)
-		attach->peer2peer = false;
+	/*
+	 * Allow peer2peer for non-DCC VRAM buffers without pci_p2pdma_distance()
+	 * veto. On single-IOD AMD Threadripper systems (TRX50) with IOMMU off,
+	 * pci_p2pdma_distance() conservatively returns < 0 due to ACS
+	 * UpstreamFwd being set in registers (SBIOS default), but intra-chip
+	 * root-complex routing works. amdgpu_dma_buf_pin() and amdgpu_dma_buf_map()
+	 * handle graceful fallback if the actual DMA mapping fails.
+	 */
 
 	/*
 	 * Only allow P2P while the exporter is active, and keep it active

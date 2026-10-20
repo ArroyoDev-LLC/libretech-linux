@@ -179,7 +179,7 @@ bool amdgpu_amdkfd_is_kfd_vmid(struct amdgpu_device *adev, u32 vmid);
 int amdgpu_amdkfd_pre_reset(struct amdgpu_device *adev,
 			    struct amdgpu_reset_context *reset_context);
 
-int amdgpu_amdkfd_post_reset(struct amdgpu_device *adev);
+int amdgpu_amdkfd_post_reset(struct amdgpu_device *adev, bool hw_reset_done);
 
 void amdgpu_amdkfd_gpu_reset(struct amdgpu_device *adev);
 
@@ -268,6 +268,11 @@ int amdgpu_amdkfd_stop_sched(struct amdgpu_device *adev, uint32_t node_id);
 int amdgpu_amdkfd_config_sq_perfmon(struct amdgpu_device *adev, uint32_t xcp_id,
 	bool core_override_enable, bool reg_override_enable, bool perfmon_override_enable);
 bool amdgpu_amdkfd_compute_active(struct amdgpu_device *adev, uint32_t node_id);
+int amdgpu_amdkfd_reset_mes_queue(struct amdgpu_device *adev,
+				  uint32_t node_id,
+				  int queue_type,
+				  int pipe, int queue,
+				  unsigned int db);
 
 
 /* Read user wptr from a specified user address space with page fault
@@ -421,7 +426,7 @@ void kgd2kfd_suspend_process(struct kfd_dev *kfd);
 int kgd2kfd_resume_process(struct kfd_dev *kfd);
 int kgd2kfd_pre_reset(struct kfd_dev *kfd,
 		      struct amdgpu_reset_context *reset_context);
-int kgd2kfd_post_reset(struct kfd_dev *kfd);
+int kgd2kfd_post_reset(struct kfd_dev *kfd, bool hw_reset_done);
 void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry);
 void kgd2kfd_set_sram_ecc_flag(struct kfd_dev *kfd);
 void kgd2kfd_smi_event_throttle(struct kfd_dev *kfd, uint64_t throttle_bitmask);
@@ -432,6 +437,9 @@ int kgd2kfd_start_sched_all_nodes(struct kfd_dev *kfd);
 int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id);
 int kgd2kfd_stop_sched_all_nodes(struct kfd_dev *kfd);
 bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id);
+int kgd2kfd_reset_mes_queue(struct kfd_dev *kfd, uint32_t node_id,
+			    int queue_type, int pipe, int queue,
+			    unsigned int db);
 bool kgd2kfd_vmfault_fast_path(struct amdgpu_device *adev, struct amdgpu_iv_entry *entry,
 			       bool retry_fault);
 
@@ -486,7 +494,7 @@ static inline int kgd2kfd_pre_reset(struct kfd_dev *kfd,
 	return 0;
 }
 
-static inline int kgd2kfd_post_reset(struct kfd_dev *kfd)
+static inline int kgd2kfd_post_reset(struct kfd_dev *kfd, bool hw_reset_done)
 {
 	return 0;
 }
@@ -538,6 +546,13 @@ static inline int kgd2kfd_stop_sched_all_nodes(struct kfd_dev *kfd)
 static inline bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id)
 {
 	return false;
+}
+
+static inline int kgd2kfd_reset_mes_queue(struct kfd_dev *kfd, uint32_t node_id,
+					 int queue_type, int pipe, int queue,
+					 unsigned int db)
+{
+	return 0;
 }
 
 static inline bool kgd2kfd_vmfault_fast_path(struct amdgpu_device *adev, struct amdgpu_iv_entry *entry,
