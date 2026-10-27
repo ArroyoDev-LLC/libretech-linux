@@ -84,6 +84,12 @@
 	status = "okay";
 };
 
+/*
+ * GPIOA_14/15 are I2C_EE_M3. On the V1.1C sheet they go to the CSI and
+ * DSI connectors (8J1/8J2 pins 21/20) and not to the 40-pin header.
+ * The V1 header I2C is I2C_EE_M2. V01 leaves this disabled: those balls
+ * are header pins 27 and 28.
+ */
 &i2c3 {
 	status = "okay";
 	pinctrl-0 = <&i2c3_sda_a_pins>, <&i2c3_sck_a_pins>;

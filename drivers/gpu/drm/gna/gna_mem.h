@@ -8,9 +8,14 @@
 
 #include "gna_hw.h"
 
+struct drm_gem_object;
+struct gna_buffer_with_object;
 struct gna_gem_object;
 struct work_struct;
 struct gna_device;
+
+/* requests with up to this many buffers keep their mapping for the next request (gna_mmu_map_request) */
+#define GNA_MMU_MAPPED_MAX 16
 
 struct gna_xnn_descriptor {
 	u32 labase;
@@ -43,15 +48,19 @@ struct gna_mmu_object {
 
 	u32 filled_pts;
 	u32 filled_pages;
+
+	/* the objects whose pages fill the page tables, in order, each holding a reference; 0 = nothing kept */
+	struct drm_gem_object *mapped[GNA_MMU_MAPPED_MAX];
+	u32 mapped_count;
 };
 
 int gna_mmu_init(struct gna_device *gna_priv);
 
-void gna_mmu_add(struct gna_device *gna_priv, struct drm_gem_shmem_object *drmshmemo);
+int gna_mmu_map_request(struct gna_device *gna_priv, struct gna_buffer_with_object *buffers, u64 count);
 
-void gna_mmu_clear(struct gna_device *gna_priv);
+void gna_mmu_forget(struct gna_device *gna_priv, struct drm_gem_object *obj);
 
-bool gna_gem_object_put_pages_sgt(struct gna_gem_object *gna_obj);
+void gna_mmu_release(struct gna_device *gna_priv);
 
 void gna_gem_obj_release_work(struct work_struct *work);
 

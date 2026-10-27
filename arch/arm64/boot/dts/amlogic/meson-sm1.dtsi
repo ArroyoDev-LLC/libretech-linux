@@ -123,7 +123,6 @@
 	cpu_opp_table: opp-table {
 		compatible = "operating-points-v2";
 		opp-shared;
-		clock-latency-ns = <50000>;
 
 		opp-1000000000 {
 			opp-hz = /bits/ 64 <1000000000>;

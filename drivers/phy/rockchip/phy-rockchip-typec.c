@@ -387,6 +387,13 @@ struct rockchip_typec_phy {
 	struct mutex lock;
 
 	bool flip;
+	/*
+	 * "libretech,typec-orientation-inverted": the receptacle's lanes sit
+	 * the other way round from what its CC pins report. @flip is the LANE
+	 * orientation (lane mux, DP lane map); the AUX polarity bit keeps the
+	 * value the CC orientation selects.
+	 */
+	bool orient_inverted;
 	u8 mode;
 
 	/* typec mux/switch API (alternative to extcon) */
@@ -592,7 +599,7 @@ static void tcphy_dp_aux_set_flip(struct rockchip_typec_phy *tcphy)
 	 * aux_p)
 	 */
 	tx_ana_ctrl_reg_1 = readl(tcphy->base + TX_ANA_CTRL_REG_1);
-	if (!tcphy->flip)
+	if (!(tcphy->flip ^ tcphy->orient_inverted))
 		tx_ana_ctrl_reg_1 |= AUXDA_POLARITY;
 	else
 		tx_ana_ctrl_reg_1 &= ~AUXDA_POLARITY;
@@ -756,7 +763,8 @@ static int rk_typec_orien_sw_set(struct typec_switch_dev *sw,
 		return 0;
 	}
 
-	tcphy->flip = (orien == TYPEC_ORIENTATION_REVERSE);
+	tcphy->flip = (orien == TYPEC_ORIENTATION_REVERSE) ^
+		      tcphy->orient_inverted;
 
 	mutex_unlock(&tcphy->lock);
 	return 0;
@@ -1068,7 +1076,7 @@ static int tcphy_get_mode(struct rockchip_typec_phy *tcphy)
 		return ret;
 	}
 
-	tcphy->flip = property.intval ? 1 : 0;
+	tcphy->flip = !!property.intval ^ tcphy->orient_inverted;
 
 	return mode;
 }
@@ -1365,6 +1373,9 @@ static int rockchip_typec_phy_probe(struct platform_device *pdev)
 		return ret;
 
 	tcphy->dev = dev;
+	tcphy->orient_inverted =
+		of_property_read_bool(dev->of_node,
+				      "libretech,typec-orientation-inverted");
 	platform_set_drvdata(pdev, tcphy);
 	mutex_init(&tcphy->lock);
 	BLOCKING_INIT_NOTIFIER_HEAD(&tcphy->dp_nh);

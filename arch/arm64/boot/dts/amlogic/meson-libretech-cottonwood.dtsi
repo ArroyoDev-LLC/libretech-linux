@@ -65,7 +65,9 @@
 	led-blue {
 		compatible = "gpio-leds";
 
+		/* load: activity */
 		led {
+			label = "libre-computer:blue";
 			color = <LED_COLOR_ID_BLUE>;
 			function = LED_FUNCTION_ACTIVITY;
 			linux,default-trigger = "activity";
@@ -76,10 +78,13 @@
 	led-green {
 		compatible = "gpio-leds";
 
+		/* ready: on once the bootloader has loaded; the OS heartbeat */
 		led {
+			label = "libre-computer:green";
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_STATUS;
-			linux,default-trigger = "default-on";
+			linux,default-trigger = "heartbeat";
+			default-state = "on";
 			gpios = <&gpio GPIOX_3 GPIO_ACTIVE_LOW>;
 		};
 	};
@@ -87,9 +92,12 @@
 	led-orange {
 		compatible = "gpio-leds";
 
+		/* fault: cleared once a stage has loaded, lit on panic */
 		led {
-			color = <LED_COLOR_ID_AMBER>;
-			function = LED_FUNCTION_STANDBY;
+			label = "libre-computer:orange";
+			color = <LED_COLOR_ID_ORANGE>;
+			function = LED_FUNCTION_FAULT;
+			default-state = "off";
 			gpios = <&gpio GPIOX_6 GPIO_ACTIVE_LOW>;
 			panic-indicator;
 		};
@@ -183,7 +191,7 @@
 		regulator-max-microvolt = <3300000>;
 		regulator-settling-time-up-us = <200>;
 		regulator-settling-time-down-us = <50000>;
-		vin-supply = <&vddao_3v3>;
+		vin-supply = <&vcc_card>;
 		gpios = <&gpio GPIOX_4 GPIO_ACTIVE_HIGH>;
 		states = <3300000 0>,
 			 <1800000 1>;
@@ -203,7 +211,6 @@
 		assigned-clocks = <&clkc CLKID_MPLL2>,
 				  <&clkc CLKID_MPLL0>,
 				  <&clkc CLKID_MPLL1>;
-		assigned-clock-parents = <0>, <0>, <0>;
 		assigned-clock-rates = <294912000>,
 				       <270950400>,
 				       <393216000>;
@@ -387,6 +394,7 @@
 &ext_mdio {
 	external_phy: ethernet-phy@0 {
 		/* Realtek RTL8211F (0x001cc916) */
+		compatible = "ethernet-phy-ieee802.3-c22";
 		reg = <0>;
 		max-speed = <1000>;
 

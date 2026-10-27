@@ -46,3 +46,8 @@
 &gpu_opp_table {
 	/delete-node/ opp-792000000;
 };
+
+/* GXL DDR bandwidth monitor; disabled in meson-gxl.dtsi because GXM shares it. */
+&ddr_pmu {
+	status = "okay";
+};

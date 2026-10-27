@@ -187,6 +187,26 @@
 	};
 
 	/*
+	 * J6 VCC_3V3. GPIO153 (LCM1_EN, ball L22) enables U5, and the same
+	 * rail feeds the high side of the I2C0 translator U8, so the bus and
+	 * the panel both wait on it. The J6 panel itself is the LWT overlay
+	 * dsi-rpi-7inch, which references this label.
+	 */
+	vcc_lcm: regulator-vcc-lcm {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-3v3-lcm";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&pio 153 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-always-on;
+		regulator-boot-on;
+		startup-delay-us = <20000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lcm_en_pins>;
+	};
+
+	/*
 	 * WIFI_RESET_N -- the M.2 module's reset, held asserted until the SDIO
 	 * bus is scanned. Sheet 15 labels the net "To WiFi RST"; it is
 	 * PERIPHERAL_EN10, ball Y7 = GPIO178 (same pin table as above), and
@@ -240,9 +260,12 @@
 		 * MTK_DEV_RNG* regions beside it are MMIO below the DRAM base.
 		 * The window the running BL31 does not use costs 192 KiB.
 		 *
-		 * Nothing in hardware enforces this: mt8183's emi_mpu_init()
-		 * leaves domain 0 at NO_PROTECTION in every region, so the AP
-		 * can read and write the monitor freely. Without this node
+		 * Under upstream TF-A nothing in hardware enforces this: its
+		 * emi_mpu_init() leaves domain 0 at NO_PROTECTION in every
+		 * region, so the AP can read and write the monitor freely. Our
+		 * TF-A trees make the running window a locked, secure-only EMI
+		 * MPU region instead: a normal-world read returns zeros and a
+		 * write is dropped. Either way, without this node
 		 * Linux hands 0x54600000 out as ordinary memory -- measured, a
 		 * 1 GiB allocation landed on it, the pattern and BL31's own
 		 * writes interleaved, and the SoC reset to the BootROM with no
@@ -504,6 +527,7 @@
 	pinctrl-0 = <&i2c_pins_0>;
 	status = "okay";
 	clock-frequency = <100000>;
+	vbus-supply = <&vcc_lcm>;
 };
 
 /* I2C1 -- 40-pin header CON1 pins 3 (SDA1) and 5 (SCL1), schematic sheet 19.
@@ -1308,6 +1332,15 @@
 	ext_3v3_en_pins: ext-3v3-en-pins {
 		pins-en {
 			pinmux = <PINMUX_GPIO166__FUNC_GPIO166>;
+			output-low;
+		};
+	};
+
+	/* LCM1_EN, ball L22. Parked low so the FPC rail stays off until
+	 * the fixed regulator claims the pin. */
+	lcm_en_pins: lcm-en-pins {
+		pins-en {
+			pinmux = <PINMUX_GPIO153__FUNC_GPIO153>;
 			output-low;
 		};
 	};

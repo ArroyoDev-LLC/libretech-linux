@@ -94,18 +94,19 @@
 	leds {
 		compatible = "gpio-leds";
 
+		/* ready: on once the bootloader has loaded; the OS heartbeat */
 		power_led: led-0 {
-			label = "libre-computer:blue:power";
+			label = "libre-computer:green";
 			linux,default-trigger = "heartbeat";
 			gpios = <&rk805 1 GPIO_ACTIVE_LOW>;
 			default-state = "on";
 		};
 
+		/* power: on while powered */
 		user_led: led-1 {
-			label = "libre-computer:yellow:user";
-			linux,default-trigger = "mmc0";
+			label = "libre-computer:red";
 			gpios = <&rk805 0 GPIO_ACTIVE_LOW>;
-			default-state = "off";
+			default-state = "on";
 		};
 	};
 };

@@ -391,6 +391,12 @@ struct tcpm_port {
 	bool vbus_vsafe0v;
 
 	bool vbus_never_low;
+	/*
+	 * VBUS never dropped and the TCPC still held a PD session in which
+	 * this sink was the data host (tcpc_dev.get_prior_roles): the partner
+	 * is the device, and the first message of this boot must say so.
+	 */
+	bool prior_data_host;
 	bool vbus_source;
 	bool vbus_charge;
 
@@ -3801,6 +3807,25 @@ static void tcpm_pd_rx_handler(struct kthread_work *work)
 		}
 
 		/*
+		 * On a sink-only port that is not self-powered, error recovery
+		 * opens CC, the source drops VBUS and the system loses power. A
+		 * mismatch there is what a warm reboot leaves behind: the source
+		 * kept its contract and the data role an earlier DR_Swap (the
+		 * boot loader's, or this kernel's before the reboot) gave it,
+		 * while this port restarted as the device. Take the free role.
+		 */
+		if (!!(le16_to_cpu(msg->header) & PD_HEADER_DATA_ROLE) ==
+		    (port->data_role == TYPEC_HOST) && rx_sop_type == TCPC_TX_SOP &&
+		    port->port_type == TYPEC_PORT_SNK && !port->self_powered &&
+		    port->typec_caps.data == TYPEC_PORT_DRD) {
+			tcpm_log(port, "Data role mismatch on the power inlet, taking the %s role",
+				 port->data_role == TYPEC_HOST ? "device" : "host");
+			tcpm_set_roles(port, true, TYPEC_STATE_USB, port->pwr_role,
+				       port->data_role == TYPEC_HOST ?
+				       TYPEC_DEVICE : TYPEC_HOST);
+		}
+
+		/*
 		 * If both ends believe to be DFP/host, we have a data role
 		 * mismatch.
 		 */
@@ -5278,6 +5303,22 @@ static void run_state_machine(struct tcpm_port *port)
 		 */
 		if (port->vbus_never_low) {
 			port->vbus_never_low = false;
+			/*
+			 * Inside a session the bootloader (or this kernel
+			 * before a reboot) left with this sink as data host,
+			 * the partner is the device. Asking it as "a device"
+			 * is a data role mismatch it answers with error
+			 * recovery: VBUS off, a power-on reset where this port
+			 * is the board's power inlet.
+			 */
+			if (port->prior_data_host) {
+				port->prior_data_host = false;
+				if (port->data_role == TYPEC_DEVICE) {
+					tcpm_log_force(port, "warm start in a session as data host; keeping it");
+					tcpm_set_roles(port, true, TYPEC_STATE_USB,
+						       TYPEC_SINK, TYPEC_HOST);
+				}
+			}
 			upcoming_state = SNK_GET_SRC_CAPABILITIES;
 		} else {
 			if (!port->self_powered)
@@ -6303,6 +6344,7 @@ static void _tcpm_pd_vbus_off(struct tcpm_port *port)
 	tcpm_log_force(port, "VBUS off");
 	port->vbus_present = false;
 	port->vbus_never_low = false;
+	port->prior_data_host = false;
 	switch (port->state) {
 	case SNK_HARD_RESET_SINK_OFF:
 		tcpm_set_state(port, SNK_HARD_RESET_WAIT_VBUS, 0);
@@ -7085,6 +7127,17 @@ static void tcpm_init(struct tcpm_port *port)
 	port->vbus_present = port->tcpc->get_vbus(port->tcpc);
 	if (port->vbus_present)
 		port->vbus_never_low = true;
+
+	port->prior_data_host = false;
+	if (port->vbus_present && port->tcpc->get_prior_roles &&
+	    port->typec_caps.data != TYPEC_PORT_UFP) {
+		enum typec_data_role data;
+		enum typec_role role;
+
+		if (!port->tcpc->get_prior_roles(port->tcpc, &role, &data) &&
+		    role == TYPEC_SINK && data == TYPEC_HOST)
+			port->prior_data_host = true;
+	}
 
 	/*
 	 * 1. When vbus_present is true, voltage on VBUS is already at VSAFE5V.

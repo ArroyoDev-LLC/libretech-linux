@@ -1213,13 +1213,14 @@ static int ge2d_hw_start(struct meson_ge2d *ge2d)
 	u32 hsc_en = 0, vsc_en = 0;
 	u32 reg;
 
-	/* Reset */
-	regmap_update_bits(ge2d->map, GE2D_GEN_CTRL1,
-			   GE2D_SOFT_RST, GE2D_SOFT_RST);
-	regmap_update_bits(ge2d->map, GE2D_GEN_CTRL1,
-			   GE2D_SOFT_RST, 0);
-
-	usleep_range(100, 200);
+	/*
+	 * No soft reset per job. Every register a blit depends on is written
+	 * below, the block is reset on runtime resume and after a watchdog
+	 * timeout, and the BSP resets only at power-on and on a timeout
+	 * (ge2d_wq.c ge2d_pwr_config() / the timeout paths). The per-job
+	 * reset and its usleep_range(100, 200) set the job floor: 262 us
+	 * p50 for a 16x16 copy on SM1.
+	 */
 
 	/*
 	 * Clear stale SRC2 blend state from a prior blend blit (this ctx
@@ -1791,24 +1792,19 @@ static int ge2d_hw_start(struct meson_ge2d *ge2d)
 		      */
 		     (ctx->in.fmt->deep_color ? BIT(2) : 0) |
 		     /*
-		      * SRC1 endian selects the packed-component byte order. The BSP
-		      * encodes it per format: GE2D_FMT_S16_YUV422 = 0x20102 has the
-		      * endian bit (24) CLEAR (BIG_ENDIAN), while GE2D_FMT_S16_RGB =
-		      * GE2D_LITTLE_ENDIAN|0x100 (libge2d ge2d.h:336-337). i.e. ALL
-		      * packed YUV reads BIG; only packed RGB reads LITTLE. The old
-		      * (src_nv||src_planar) gate left packed YUYV (depth-16 YUV) on
-		      * LITTLE, which swapped the Y<->chroma byte lanes -- the hw read
-		      * memory-YUYV [Y,Cb,Y,Cr] as UYVY [Cb,Y,Cr,Y], so black came out
-		      * NV12 Y=128,U=V=16 and decoded to pure green (KI 2026-06-06).
-		      * All YUV (nv/planar/packed) -> BIG (0); RGB -> LITTLE. Deep-color
-		      * YUV422 (10/12-bit placeholder formats) keeps its prior endian.
+		      * Every port LITTLE: the endian bit is a byte reversal within
+		      * each 64-bit word (BIG = reversed), applied per port. The old
+		      * per-format choice (YUV BIG, RGB LITTLE, after the BSP's
+		      * GE2D_FMT_* words) was right only when SRC and DST matched, the
+		      * two reversals cancelling; every mixed pair came out reversed
+		      * per 8 bytes. A gray ramp that changes at every pixel shows it
+		      * on 6.18 SM1: RGB -> NV12 Y 9.7 dB, NV12 -> XRGB 8.3 dB, while
+		      * NV12 -> NV12 and RGB -> RGB read 99 dB. Flat and bar patterns
+		      * (and the format matrix) cannot see an in-word reversal.
 		      */
-		     ((src_yuv && !ctx->in.fmt->deep_color) ? 0 :
-		      GE2D_SRC1_LITTLE_ENDIAN) |
-		     (ctx->blend_mode ?
-			GE2D_SRC2_LITTLE_ENDIAN :
-			((dst_nv || dst_planar) ? 0 : GE2D_SRC2_LITTLE_ENDIAN)) |
-		     ((dst_nv || dst_planar) ? 0 : GE2D_DST_LITTLE_ENDIAN) |
+		     GE2D_SRC1_LITTLE_ENDIAN |
+		     GE2D_SRC2_LITTLE_ENDIAN |
+		     GE2D_DST_LITTLE_ENDIAN |
 		     (ctx->alpha < 255 ? GE2D_SRC1_GB_ALPHA_EN : 0) |
 		     GE2D_SRC2_COLOR_EXPAND_MODE |
 		     GE2D_SRC1_COLOR_EXPAND_MODE |
@@ -2335,6 +2331,11 @@ static void ge2d_job_timeout_work(struct work_struct *work)
 	reset_control_deassert(ge2d->rst);
 	if (ge2d_settle_us)
 		udelay(ge2d_settle_us);
+	/* and the BSP's timeout soft reset (ge2d_wq.c) */
+	regmap_update_bits(ge2d->map, GE2D_GEN_CTRL1,
+			   GE2D_SOFT_RST, GE2D_SOFT_RST);
+	regmap_update_bits(ge2d->map, GE2D_GEN_CTRL1,
+			   GE2D_SOFT_RST, 0);
 
 	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
 	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
@@ -3987,12 +3988,7 @@ static void ge2d_kapi_hw_start(struct meson_ge2d *ge2d,
 				ge2d_kapi_fmts[job->src_fmt].depth == 16);
 	u32 reg;
 
-	/* Reset */
-	regmap_update_bits(ge2d->map, GE2D_GEN_CTRL1,
-			   GE2D_SOFT_RST, GE2D_SOFT_RST);
-	regmap_update_bits(ge2d->map, GE2D_GEN_CTRL1,
-			   GE2D_SOFT_RST, 0);
-	usleep_range(100, 200);
+	/* No soft reset per job: see ge2d_hw_start(). */
 
 	/* Init outside-source alpha to 0 (transparent) for both SRC1 and SRC2.
 	 * BSP ge2d_hw.c programs bits [7:0] = SRC1 outside_alpha,

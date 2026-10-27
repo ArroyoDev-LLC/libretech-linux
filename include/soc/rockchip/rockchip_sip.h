@@ -42,10 +42,22 @@
  * is legal for every MR4 code, and a longer interval is written only after
  * repeated cool readings. A failed read, an unread rank, a long gap, or
  * suspend returns to that short interval. A BL31 without the opcode
- * returns 0. The devfreq status poll calls it so a fixed-rate board still
- * samples; the result is BL31's.
+ * returns 0. rk3399_dmc calls it every 200 ms from its own work, whatever
+ * the devfreq governor, so a fixed-rate board still samples; the result is
+ * BL31's.
  */
 #define ROCKCHIP_SIP_CONFIG_DRAM_MR4_REFRESH	0x42
+/*
+ * Its result: MR4 byte per channel, AC derate asked (110b), busy (a switch
+ * held the lock, no sample), AC derate armed for BL31's next timing.
+ */
+#define ROCKCHIP_SIP_DRAM_MR4_CH0		GENMASK(7, 0)
+#define ROCKCHIP_SIP_DRAM_MR4_CH1		GENMASK(15, 8)
+#define ROCKCHIP_SIP_DRAM_MR4_DERATE		BIT(20)
+#define ROCKCHIP_SIP_DRAM_MR4_BUSY		BIT(23)
+#define ROCKCHIP_SIP_DRAM_MR4_AC_DERATE		BIT(24)
+/* Every bit a result may carry; anything outside is not a reading. */
+#define ROCKCHIP_SIP_DRAM_MR4_VALID		GENMASK(24, 0)
 #define ROCKCHIP_SIP_DRAM_RENDEZVOUS_REFUSED	BIT(31)
 #define ROCKCHIP_SIP_DRAM_RENDEZVOUS_PARKED	GENMASK(30, 24)
 #define ROCKCHIP_SIP_DRAM_RENDEZVOUS_US		GENMASK(23, 0)

@@ -1676,12 +1676,12 @@
 			};
 
 			crypto: crypto@3e000 {
-			compatible = "amlogic,g12a-crypto";
-			reg = <0x0 0x3e000 0x0 0x48>;
-			interrupts = <GIC_SPI 180 IRQ_TYPE_EDGE_RISING>;
-		};
+				compatible = "amlogic,g12a-crypto";
+				reg = <0x0 0x3e000 0x0 0x48>;
+				interrupts = <GIC_SPI 180 IRQ_TYPE_EDGE_RISING>;
+			};
 
-		mipi_dphy: phy@44000 {
+			mipi_dphy: phy@44000 {
 				compatible = "amlogic,axg-mipi-dphy";
 				reg = <0x0 0x44000 0x0 0x2000>;
 				clocks = <&clkc CLKID_MIPI_DSI_PHY>;
@@ -2177,8 +2177,8 @@
 			 * 0x100000 (1MB): 1MB overruns the GE2D MMIO at
 			 * 0xff940000, so GE2D probe fails with -EBUSY. Local fix
 			 * 55b1d476c8a2 (also adds the GE2D node, absent upstream).
-			 * Do NOT revert on an upstream DTS resync. Keep in sync
-			 * with the U-Boot DTS.
+			 * Do NOT revert on an upstream DTS resync. Keep the
+			 * kernel and U-Boot copies identical.
 			 */
 			reg = <0x0 0xff900000 0x0 0x40000>,
 			      <0x0 0xff63c000 0x0 0x1000>;
@@ -2524,9 +2524,15 @@
 				phys = <&usb2_phy1>;
 				phy-names = "usb2-phy";
 				dr_mode = "peripheral";
-				g-rx-fifo-size = <192>;
-				g-np-tx-fifo-size = <128>;
-				g-tx-fifo-size = <128 128 16 16 16>;
+				/*
+				 * 704 words, inside the core's 712 (GHWCFG3.DfifoDepth):
+				 * two 512 B packets for the bulk-IN FIFO 1 (UMS read),
+				 * EP0 IN in 32, and the shared RX FIFO takes the rest
+				 * (352 words, about 2.75 bulk-OUT packets) for UMS write.
+				 */
+				g-rx-fifo-size = <352>;
+				g-np-tx-fifo-size = <32>;
+				g-tx-fifo-size = <256 16 16 16 16>;
 			};
 
 			dwc3: usb@ff500000 {

@@ -3,6 +3,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/iopoll.h>
+#include <linux/moduleparam.h>
 
 #include <uapi/drm/gna_drm.h>
 
@@ -53,12 +54,17 @@ bool gna_hw_perf_enabled(struct gna_device *gna_priv)
 	return !!FIELD_GET(GNA_CTRL_COMP_STATS_EN, ctrl);
 }
 
+/* irq false: completion and error interrupts masked for this request (GNA_FLAG_SCORE_POLLED) */
 void gna_start_scoring(struct gna_device *gna_priv,
-		       struct gna_compute_cfg *compute_cfg)
+		       struct gna_compute_cfg *compute_cfg, bool irq)
 {
 	u32 ctrl = gna_reg_read(gna_priv, GNA_MMIO_CTRL);
 
-	ctrl |= GNA_CTRL_START_ACCEL | GNA_CTRL_COMP_INT_EN | GNA_CTRL_ERR_INT_EN;
+	ctrl |= GNA_CTRL_START_ACCEL;
+	if (irq)
+		ctrl |= GNA_CTRL_COMP_INT_EN | GNA_CTRL_ERR_INT_EN;
+	else
+		ctrl &= ~(GNA_CTRL_COMP_INT_EN | GNA_CTRL_ERR_INT_EN);
 
 	ctrl &= ~GNA_CTRL_COMP_STATS_EN;
 	ctrl |= FIELD_PREP(GNA_CTRL_COMP_STATS_EN,
@@ -92,6 +98,8 @@ int gna_abort_hw(struct gna_device *gna_priv)
 {
 	u32 val;
 
+	gna_priv->completion_latched = false;    /* the abort clears a polled request's latched completion */
+
 	/* saturation bit in the GNA status register needs
 	 * to be explicitly cleared.
 	 */
@@ -107,4 +115,21 @@ int gna_abort_hw(struct gna_device *gna_priv)
 	return readl_poll_timeout(gna_priv->iobase + GNA_MMIO_STS, val,
 				!(val & 0x1),
 				0, 1000);
+}
+
+static bool abort_always;
+module_param(abort_always, bool, 0644);
+MODULE_PARM_DESC(abort_always, "abort the accelerator after every request, not only after a failed one");
+
+/*
+ * After a request: a clean completion only needs the sticky saturation bit cleared; the accelerator abort (a
+ * control write and a status poll) is kept for errors and timeouts, or for every request with abort_always.
+ */
+int gna_finish_hw(struct gna_device *gna_priv, bool clean)
+{
+	if (clean && !abort_always) {
+		gna_clear_saturation(gna_priv);
+		return 0;
+	}
+	return gna_abort_hw(gna_priv);
 }

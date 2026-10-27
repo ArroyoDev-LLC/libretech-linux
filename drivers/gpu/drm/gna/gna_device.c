@@ -84,18 +84,52 @@ static void gna_pm_init(struct device *dev)
 	pm_runtime_put_noidle(dev);
 }
 
-static void gna_pm_fini(struct drm_device *drm, void *data)
+/*
+ * Undo gna_pm_init() from the bus driver's .remove. It must run there: pci_device_remove() drops the PCI core's
+ * runtime-PM reference (pm_runtime_put_sync) before devres and drmm cleanup, so balancing from a drmm action (as
+ * this driver did) came too late and underflowed the usage count on every unbind ("Runtime PM usage count
+ * underflow!"). pm_runtime_forbid() gives back the reference pm_runtime_allow() took over from pci_pm_init();
+ * pm_runtime_get_noresume() gives back the one probe dropped.
+ */
+void gna_remove(struct device *parent)
 {
-	struct device *dev = data;
+	struct drm_device *drm_dev = dev_get_drvdata(parent);
 
-	pm_runtime_get_noresume(dev);
+	gna_hw_acquire(to_gna_device(drm_dev));             /* no request on the hardware */
+	gna_mmu_release(to_gna_device(drm_dev));            /* objects the page tables were kept for */
+	gna_hw_release(to_gna_device(drm_dev));
+	pm_runtime_dont_use_autosuspend(parent);
+	pm_runtime_forbid(parent);
+	pm_runtime_get_noresume(parent);
 }
 
 static irqreturn_t gna_interrupt(int irq, void *priv)
 {
 	struct gna_device *gna_priv;
+	struct gna_request *direct;
+	unsigned long flags;
+	u32 sts;
 
 	gna_priv = (struct gna_device *)priv;
+
+	/* a request started from COMPUTE is completed here, with no thread woken (gna_request_complete_direct) */
+	spin_lock_irqsave(&gna_priv->direct_lock, flags);
+	direct = gna_priv->direct_req;
+	if (direct) {
+		sts = gna_reg_read(gna_priv, GNA_MMIO_STS);
+		if (!(sts & (GNA_STS_SCORE_COMPLETED | GNA_ERROR))) {
+			spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+			return IRQ_NONE;            /* the line is shared: not ours */
+		}
+		gna_priv->direct_req = NULL;
+	}
+	spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+	if (direct) {
+		gna_priv->dev_busy = false;
+		gna_request_complete_direct(direct, false);
+		return IRQ_HANDLED;
+	}
+
 	gna_priv->dev_busy = false;
 	wake_up(&gna_priv->dev_busy_waitq);
 	return IRQ_HANDLED;
@@ -198,6 +232,9 @@ int gna_probe(struct device *parent, struct gna_dev_info *dev_info, void __iomem
 	INIT_LIST_HEAD(&gna_priv->request_list);
 
 	init_waitqueue_head(&gna_priv->dev_busy_waitq);
+	sema_init(&gna_priv->hw_sem, 1);
+	spin_lock_init(&gna_priv->direct_lock);
+	gna_priv->direct_req = NULL;
 
 	err = gna_workqueue_init(gna_priv);
 	if (err)
@@ -215,9 +252,6 @@ int gna_probe(struct device *parent, struct gna_dev_info *dev_info, void __iomem
 		return err;
 
 	gna_pm_init(parent);
-	err = drmm_add_action(drm_dev, gna_pm_fini, parent);
-	if (err)
-		return err;
 
 	return 0;
 }
@@ -239,6 +273,7 @@ static u32 gna_device_type_by_hwid(u32 hwid)
 	case GNA_DEV_HWID_RPL:
 		return GNA_DEV_TYPE_3_0;
 	case GNA_DEV_HWID_MTL:
+	case GNA_DEV_HWID_ARL:
 		return GNA_DEV_TYPE_3_5;
 	default:
 		return 0;

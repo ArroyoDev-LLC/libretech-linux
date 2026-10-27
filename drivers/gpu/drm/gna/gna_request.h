@@ -39,6 +39,9 @@ struct gna_request {
 
 	int status;
 
+	/* started with the completion interrupt masked (GNA_FLAG_SCORE_POLLED): completed by gna_hw_reclaim() */
+	bool polled;
+
 	struct gna_hw_perf hw_perf;
 	struct gna_drv_perf drv_perf;
 
@@ -60,5 +63,12 @@ int gna_enqueue_request(struct gna_compute_cfg *compute_cfg,
 			struct drm_file *file, u64 *request_id);
 
 void gna_request_release(struct kref *ref);
+
+void gna_request_complete_direct(struct gna_request *score_request, bool timed_out);
+
+bool gna_hw_reclaim(struct gna_device *gna_priv);
+void gna_hw_acquire(struct gna_device *gna_priv);
+void gna_hw_release(struct gna_device *gna_priv);
+long gna_request_wait_polled(struct gna_device *gna_priv, struct gna_request *score_request, u32 timeout_ms);
 
 #endif // __GNA_REQUEST_H__

@@ -91,95 +91,59 @@ int gna_mmu_init(struct gna_device *gna_priv)
 	return 0;
 }
 
-static struct scatterlist *gna_iterate_sgl(u64 sg_elems, struct scatterlist *sgl, dma_addr_t *sg_page,
-					int *sg_page_len, int *sg_pages)
-{
-	while (sg_elems-- > 0) {
-		(*sg_page) += PAGE_SIZE;
-		(*sg_pages)++;
-		if (*sg_pages == *sg_page_len) {
-			sgl = sg_next(sgl);
-			if (!sgl)
-				break;
-
-			*sg_page = sg_dma_address(sgl);
-			*sg_page_len =
-				round_up(sg_dma_len(sgl), PAGE_SIZE)
-				>> PAGE_SHIFT;
-			*sg_pages = 0;
-		}
-	}
-
-	return sgl;
-}
-
-
-void gna_mmu_add(struct gna_device *gna_priv, struct drm_gem_shmem_object *drmshmemo)
+/*
+ * Append the object's pages to the GNA page tables, in order, so its GNA virtual addresses follow the objects
+ * added before it. Walk the DMA-mapped segments only (for_each_sgtable_dma_sg): with an IOMMU, dma_map_sgtable()
+ * merges the CPU entries into fewer DMA segments, and the entries past the mapped count carry DMA_MAPPING_ERROR
+ * with length 0. Walking the CPU list instead never left such an entry, so it filled every remaining page-table
+ * slot with addresses counted up from DMA_MAPPING_ERROR (0x0, 0x1000, ...), and the next object got no slots.
+ */
+static void gna_mmu_add_locked(struct gna_device *gna_priv, struct drm_gem_shmem_object *drmshmemo)
 {
 	struct gna_mmu_object *mmu;
-	struct scatterlist *sgl;
-	dma_addr_t sg_page;
-	int sg_page_len;
-	u32 *pagetable;
-	u32 mmu_page;
-	int sg_pages;
-	int i;
-	int j;
+	struct scatterlist *sg;
+	dma_addr_t addr;
+	unsigned int i;
+	size_t pages;
 
 	mmu = &gna_priv->mmu;
-	mutex_lock(&gna_priv->mmu_lock);
+	lockdep_assert_held(&gna_priv->mmu_lock);
 
-	j = mmu->filled_pages;
-	sgl = drmshmemo->sgt->sgl;
-
-	if (!sgl) {
+	if (!drmshmemo->sgt || !drmshmemo->sgt->nents) {
 		dev_warn(gna_dev(gna_priv), "empty scatter list in memory object\n");
-		goto warn_empty_sgl;
+		return;
 	}
-	sg_page = sg_dma_address(sgl);
-	sg_page_len = round_up(sg_dma_len(sgl), PAGE_SIZE) >> PAGE_SHIFT;
-	sg_pages = 0;
 
-	for (i = mmu->filled_pts; i < mmu->num_pagetables; i++) {
-		if (!sgl)
-			break;
-
-		pagetable = mmu->pagetables[i];
-
-		for (j = mmu->filled_pages; j < GNA_PT_LENGTH; j++) {
-			mmu_page = sg_page >> PAGE_SHIFT;
-			pagetable[j] = mmu_page;
-
-			mmu->filled_pages++;
-
-			sgl = gna_iterate_sgl(1, sgl, &sg_page, &sg_page_len,
-					&sg_pages);
-			if (!sgl)
-				break;
-		}
-
-		if (j == GNA_PT_LENGTH) {
-			mmu->filled_pages = 0;
-			mmu->filled_pts++;
+	for_each_sgtable_dma_sg(drmshmemo->sgt, sg, i) {
+		addr = sg_dma_address(sg);
+		for (pages = DIV_ROUND_UP(sg_dma_len(sg), PAGE_SIZE); pages; pages--) {
+			if (mmu->filled_pts >= mmu->num_pagetables) {
+				dev_warn(gna_dev(gna_priv), "GNA page tables full: memory object only partly mapped\n");
+				goto full;
+			}
+			mmu->pagetables[mmu->filled_pts][mmu->filled_pages++] = addr >> PAGE_SHIFT;
+			addr += PAGE_SIZE;
+			if (mmu->filled_pages == GNA_PT_LENGTH) {
+				mmu->filled_pages = 0;
+				mmu->filled_pts++;
+			}
 		}
 	}
 
+full:
 	mmu->hwdesc->mmu.vamaxaddr =
 		(mmu->filled_pts * PAGE_SIZE * GNA_PGDIR_ENTRIES) +
 		(mmu->filled_pages * PAGE_SIZE) - 1;
 	dev_dbg(gna_dev(gna_priv), "vamaxaddr: %u\n", mmu->hwdesc->mmu.vamaxaddr);
-
-warn_empty_sgl:
-	mutex_unlock(&gna_priv->mmu_lock);
 }
 
-void gna_mmu_clear(struct gna_device *gna_priv)
+static void gna_mmu_clear_locked(struct gna_device *gna_priv)
 {
 	struct gna_mmu_object *mmu;
 	int i;
 
 	mmu = &gna_priv->mmu;
-	mutex_lock(&gna_priv->mmu_lock);
+	lockdep_assert_held(&gna_priv->mmu_lock);
 
 	for (i = 0; i < mmu->filled_pts; i++)
 		memset(mmu->pagetables[i], 0, PAGE_SIZE);
@@ -190,38 +154,92 @@ void gna_mmu_clear(struct gna_device *gna_priv)
 	mmu->filled_pts = 0;
 	mmu->filled_pages = 0;
 	mmu->hwdesc->mmu.vamaxaddr = 0;
+}
 
+/* Clear the page tables and release the objects they were kept for. */
+static void gna_mmu_drop_locked(struct gna_device *gna_priv)
+{
+	struct gna_mmu_object *mmu = &gna_priv->mmu;
+	u32 i;
+
+	lockdep_assert_held(&gna_priv->mmu_lock);
+	gna_mmu_clear_locked(gna_priv);
+	for (i = 0; i < mmu->mapped_count; i++)
+		drm_gem_object_put(mmu->mapped[i]);
+	mmu->mapped_count = 0;
+}
+
+/*
+ * Map a request's buffer objects into the GNA page tables, in order -- or keep the tables as they are when the
+ * previous request mapped the same objects in the same order, which a streaming client does on every request.
+ * Mapping an object pins its pages and DMA-maps them once (drm_gem_shmem_get_pages_sgt keeps the sg table on the
+ * object; drm_gem_shmem_free unmaps it), so a kept mapping costs nothing per request. The kept objects hold a
+ * reference: a freed object can never be mistaken for a new one at the same address, and its pages stay valid
+ * while the tables point at them. gna_mmu_forget() drops the set when one of them is freed.
+ * A request with more than GNA_MMU_MAPPED_MAX buffers is mapped every time and nothing is kept.
+ * Runs on the ordered request workqueue.
+ */
+int gna_mmu_map_request(struct gna_device *gna_priv, struct gna_buffer_with_object *buffers, u64 count)
+{
+	struct gna_mmu_object *mmu = &gna_priv->mmu;
+	struct sg_table *sgt;
+	bool same;
+	u64 i;
+	int ret = 0;
+
+	mutex_lock(&gna_priv->mmu_lock);
+
+	same = count <= GNA_MMU_MAPPED_MAX && count == mmu->mapped_count;
+	for (i = 0; same && i < count; i++)
+		same = mmu->mapped[i] == &buffers[i].gem->base.base;
+	if (same)
+		goto out;
+
+	gna_mmu_drop_locked(gna_priv);
+	for (i = 0; i < count; i++) {
+		sgt = drm_gem_shmem_get_pages_sgt(&buffers[i].gem->base);
+		if (IS_ERR(sgt)) {
+			ret = PTR_ERR(sgt);
+			gna_mmu_clear_locked(gna_priv);
+			goto out;
+		}
+		gna_mmu_add_locked(gna_priv, &buffers[i].gem->base);
+	}
+	if (count <= GNA_MMU_MAPPED_MAX) {
+		for (i = 0; i < count; i++) {
+			mmu->mapped[i] = &buffers[i].gem->base.base;
+			drm_gem_object_get(mmu->mapped[i]);
+		}
+		mmu->mapped_count = count;
+	}
+
+out:
+	mutex_unlock(&gna_priv->mmu_lock);
+	return ret;
+}
+
+/* An object is being freed: if the page tables are kept for it, drop them (runs on the request workqueue). */
+void gna_mmu_forget(struct gna_device *gna_priv, struct drm_gem_object *obj)
+{
+	struct gna_mmu_object *mmu = &gna_priv->mmu;
+	u32 i;
+
+	mutex_lock(&gna_priv->mmu_lock);
+	for (i = 0; i < mmu->mapped_count; i++) {
+		if (mmu->mapped[i] == obj) {
+			gna_mmu_drop_locked(gna_priv);
+			break;
+		}
+	}
 	mutex_unlock(&gna_priv->mmu_lock);
 }
 
-bool gna_gem_object_put_pages_sgt(struct gna_gem_object *gnagemo)
+/* Device going away: release whatever the page tables were kept for. */
+void gna_mmu_release(struct gna_device *gna_priv)
 {
-	struct drm_gem_shmem_object *shmem = &gnagemo->base;
-	struct drm_gem_object *drmgemo = &shmem->base;
-
-	/*
-	 * 6.18 API drift: drm_gem_shmem_object lost its private @pages_lock
-	 * mutex (~6.7); the backing-store state is now serialised by the GEM
-	 * object's dma_resv lock. drm_gem_shmem_put_pages() was likewise
-	 * replaced by drm_gem_shmem_put_pages_locked(), which asserts the
-	 * resv lock is held. Take the resv lock for the whole teardown.
-	 */
-	if (!dma_resv_trylock(drmgemo->resv))
-		return false;
-
-	if (shmem->sgt) {
-		dma_unmap_sgtable(drmgemo->dev->dev, shmem->sgt,
-				  DMA_BIDIRECTIONAL, 0);
-		sg_free_table(shmem->sgt);
-		kfree(shmem->sgt);
-		shmem->sgt = NULL;
-	}
-
-	drm_gem_shmem_put_pages_locked(shmem);
-
-	dma_resv_unlock(drmgemo->resv);
-
-	return true;
+	mutex_lock(&gna_priv->mmu_lock);
+	gna_mmu_drop_locked(gna_priv);
+	mutex_unlock(&gna_priv->mmu_lock);
 }
 
 static void gna_delete_score_requests(u32 handle, struct gna_device *gna_priv)
@@ -256,7 +274,12 @@ void gna_gem_obj_release_work(struct work_struct *work)
 
 	gnagemo = container_of(work, struct gna_gem_object, work);
 
+	/* a request started from COMPUTE completes in the interrupt, outside this workqueue: wait for it before its
+	 * request or its mapping goes */
+	gna_hw_acquire(to_gna_device(gnagemo->base.base.dev));
 	gna_delete_score_requests(gnagemo->handle, to_gna_device(gnagemo->base.base.dev));
+	gna_mmu_forget(to_gna_device(gnagemo->base.base.dev), &gnagemo->base.base);
+	gna_hw_release(to_gna_device(gnagemo->base.base.dev));
 
 	wake_up_interruptible(&gnagemo->waitq);
 }

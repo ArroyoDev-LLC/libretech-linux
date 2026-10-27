@@ -43,6 +43,14 @@
 #define GNA_DEV_TYPE_3_5	0x35
 
 #define GNA_FLAG_SCORE_QOS	_BITUL(0)
+/*
+ * The client does not need to be woken when the request completes: it collects it later with WAIT (a pipelined
+ * client, one request behind). A request started at once is started with the completion interrupt masked, so the
+ * host takes no interrupt for it; WAIT, or the next request needing the hardware, completes it by reading the
+ * status. A request that had to queue behind another runs as usual. Kernels without it ignore the bit. (Bit 1 is
+ * reserved for an unlanded GNA_FLAG_SCORE_SYNC.)
+ */
+#define GNA_FLAG_SCORE_POLLED	_BITUL(2)
 
 /*
  * Structure describes part of memory to be overwritten before starting GNA

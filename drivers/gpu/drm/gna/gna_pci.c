@@ -59,6 +59,11 @@ static const struct gna_dev_info mtl_dev_info = {
 	GNA_GEN2_FEATURES
 };
 
+static const struct gna_dev_info arl_dev_info = {
+	.hwid = GNA_DEV_HWID_ARL,
+	GNA_GEN2_FEATURES
+};
+
 #define INTEL_GNA_DEVICE(hwid, info)				\
 	{ PCI_VDEVICE(INTEL, hwid), (kernel_ulong_t)(info) }
 
@@ -73,6 +78,7 @@ static const struct pci_device_id gna_pci_ids[] = {
 	INTEL_GNA_DEVICE(GNA_DEV_HWID_ADL, &adl_dev_info),
 	INTEL_GNA_DEVICE(GNA_DEV_HWID_RPL, &rpl_dev_info),
 	INTEL_GNA_DEVICE(GNA_DEV_HWID_MTL, &mtl_dev_info),
+	INTEL_GNA_DEVICE(GNA_DEV_HWID_ARL, &arl_dev_info),
 	{ }
 };
 
@@ -134,10 +140,16 @@ int gna_pci_probe(struct pci_dev *pcidev, const struct pci_device_id *pci_id)
 	return 0;
 }
 
+static void gna_pci_remove(struct pci_dev *pcidev)
+{
+	gna_remove(&pcidev->dev);
+}
+
 static struct pci_driver gna_pci_driver = {
 	.name = DRIVER_NAME,
 	.id_table = gna_pci_ids,
 	.probe = gna_pci_probe,
+	.remove = gna_pci_remove,
 	.driver = {
 		.pm = &gna_pm,
 	},

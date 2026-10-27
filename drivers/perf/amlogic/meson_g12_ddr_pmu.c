@@ -264,10 +264,13 @@ static void dmc_g12_counter_disable(struct dmc_info *info)
 {
 	int i;
 
-	/* clear timer */
-	writel(0, info->ddr_reg[0] + DMC_MON_G12_CTRL0);
-	writel(0, info->ddr_reg[0] + DMC_MON_G12_TIMER);
-
+	/*
+	 * CTRL0 and TIMER are not written here, as in the GXL backend. A
+	 * window may still be running, and zeroing its length makes it run the
+	 * full 32-bit count, during which the next session's arm does not take.
+	 * Left alone, the window ends at its own length and its irq does not
+	 * re-arm, since the core re-arms only while an event is active.
+	 */
 	writel(0, info->ddr_reg[0] + DMC_MON_G12_ALL_REQ_CNT);
 	writel(0, info->ddr_reg[0] + DMC_MON_G12_ALL_GRANT_CNT);
 	writel(0, info->ddr_reg[0] + DMC_MON_G12_ONE_GRANT_CNT);
@@ -432,13 +435,17 @@ static struct attribute *gxl_pmu_format_attrs[] = {
 };
 
 /*
- * The GXL DDR PLL is HHI_DPLL_TOP_I (0xc883c318 -- "DPLL" = DDR PLL, named in
- * clk-gxbb.h but not modelled as a clock), in the HHI block, supplied as
- * reg[1]/pll_reg. Found by RE of the board BL2/BL30 (which program the HHI clock
- * registers) and confirmed by reading it on an S805X (decodes to ~the measured
- * 540 MHz DMC clock). Unlike G12 (PLL at DMC+0xc00, same block as the monitor),
- * the GXL DPLL is in a different block from the DMC monitor, so the DT node sits
- * at soc level with absolute reg cells.
+ * The GXL DDR PLL is AM_DDR_PLL_CNTL0 (0xc8837000, vendor
+ * amlogic/cmd_ddr_test.c:893), in the DDR MMC block, supplied as
+ * reg[1]/pll_reg. It is the register the DRAM SPL programs (U-Boot
+ * arch/arm/mach-meson/dram-gx.c): n = 1 (bit 16) and od = 1 (bits 3:2)
+ * always; for 399-799 MHz od1 = 1 and m = clk / 12, for 800-1498 MHz
+ * od1 = 0 and m = clk / 24. The decode below gives DRAM clock / 2, the DMC
+ * clock, in both branches; e.g. 0xb00102d4 (m = 45, od1 = 0) is 540 MHz for
+ * a 1080 MHz DRAM clock, read identically after the open SPL and the vendor
+ * BL2. Unlike G12 (PLL at DMC+0xc00, same block as the monitor), the GXL PLL
+ * is in a different block from the DMC monitor, so the DT node sits at soc
+ * level with absolute reg cells.
  */
 static unsigned long dmc_gxl_get_freq_quick(struct dmc_info *info)
 {
@@ -505,8 +512,15 @@ static void dmc_gxl_counter_disable(struct dmc_info *info)
 {
 	int i;
 
-	writel(0, info->ddr_reg[0] + DMC_MON_GXL_CTRL2);
-	writel(0, info->ddr_reg[0] + DMC_MON_GXL_CTRL3);
+	/*
+	 * CTRL2 and CTRL3 are not written here. A window may still be running
+	 * (the monitor reads busy after a CTRL2 write of 0), and zeroing its
+	 * length makes it run the full 32-bit count, ~9.4 s at 456 MHz, during
+	 * which the next session's arm does not take. Left alone, the window
+	 * ends at its own length and its irq does not re-arm, since the core
+	 * re-arms only while an event is active. The vendor driver stops the
+	 * same way (ddr_band_op_gxl.c: disable only clears its mode).
+	 */
 	writel(0, info->ddr_reg[0] + DMC_MON_GXL_ALL_REQ_CNT);
 	writel(0, info->ddr_reg[0] + DMC_MON_GXL_ALL_GRANT_CNT);
 	for (i = 0; i < info->hw_info->chann_nr; i++)

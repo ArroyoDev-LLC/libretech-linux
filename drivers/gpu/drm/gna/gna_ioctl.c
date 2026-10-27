@@ -88,10 +88,28 @@ int gna_wait_ioctl(struct drm_device *dev, void *data,
 		goto out;
 	}
 
-	ret = wait_event_interruptible_timeout(score_request->waitq, score_request->state == DONE,
-					       msecs_to_jiffies(timeout));
+	if (score_request->polled)      /* started with its interrupt masked: nothing will wake this wait */
+		ret = gna_request_wait_polled(gna_priv, score_request, timeout);
+	else
+		ret = wait_event_interruptible_timeout(score_request->waitq, score_request->state == DONE,
+						       msecs_to_jiffies(timeout));
 	if (ret == 0 || ret == -ERESTARTSYS) {
 		dev_dbg(gna_dev(gna_priv), "request timed out, id: %llu\n", request_id);
+		if (ret == 0) {
+			/* a request started from COMPUTE whose interrupt never came: complete it here */
+			unsigned long flags;
+			bool stolen;
+
+			spin_lock_irqsave(&gna_priv->direct_lock, flags);
+			stolen = gna_priv->direct_req == score_request;
+			if (stolen)
+				gna_priv->direct_req = NULL;
+			spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+			if (stolen) {
+				dev_warn(gna_dev(gna_priv), "hardware timeout occurred\n");
+				gna_request_complete_direct(score_request, true);
+			}
+		}
 		ret = -EBUSY;
 		goto out;
 	}

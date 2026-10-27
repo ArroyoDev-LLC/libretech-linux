@@ -97,14 +97,20 @@
 		 * (not a dmcbus child) because reg[1], the DDR PLL, is in a different
 		 * block from the DMC monitor:
 		 *   reg[0] = DMC monitor window (0xc8838000 + 0x60, above canvas@48)
-		 *   reg[1] = HHI_DPLL_TOP_I, the DDR PLL (0xc883c318)
+		 *   reg[1] = AM_DDR_PLL_CNTL0, the DDR PLL, in the DDR MMC block
+		 *            (0xc8837000; vendor amlogic/cmd_ddr_test.c:893)
 		 * IRQ confirmed on hardware = GIC_SPI 52 (timer completion).
+		 * Disabled here because meson-gxm.dtsi includes this file and on
+		 * GXM the DDR map is unverified (the open SPL never writes
+		 * AM_DDR_PLL_CNTL0 there). The GXL SoC dtsi enable it with
+		 * &ddr_pmu { status = "okay"; };.
 		 */
-		ddr-pmu@c8838060 {
+		ddr_pmu: ddr-pmu@c8838060 {
 			compatible = "amlogic,gxl-ddr-pmu";
 			reg = <0x0 0xc8838060 0x0 0x60>,
-			      <0x0 0xc883c318 0x0 0x04>;
+			      <0x0 0xc8837000 0x0 0x04>;
 			interrupts = <GIC_SPI 52 IRQ_TYPE_EDGE_RISING>;
+			status = "disabled";
 		};
 
 		/*
@@ -115,9 +121,9 @@
 		 * (periphs ends at 0xc8836000, dmcbus starts at 0xc8838000).
 		 * Disabled here because meson-gxm.dtsi includes this file and
 		 * the GXM (S912) PUB map is unverified -- a read of a region
-		 * the non-secure world cannot reach faults the CPU. Boards
-		 * whose PUB read has been verified enable it with
-		 * &ddr_pub { status = "okay"; }; in their own .dts.
+		 * the non-secure world cannot reach faults the CPU. A board
+		 * may enable it with &ddr_pub { status = "okay"; }; in its
+		 * board dtsi only after its PUB read is verified.
 		 * amlogic,sc-shmem selects SC mode when that node is enabled
 		 * and the block validates; while it stays disabled the driver
 		 * keeps its in-kernel sampler.

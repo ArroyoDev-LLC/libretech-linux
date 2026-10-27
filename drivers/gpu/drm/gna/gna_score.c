@@ -60,54 +60,36 @@ static int gna_do_patch_memory(struct gna_device *gna_priv,
 	return 0;
 }
 
+/* Apply the request's patches to one buffer object (the mapping is gna_mmu_map_request's). */
 static int gna_patch_memory(struct gna_device *gna_priv, struct gna_buffer_with_object *buffer)
 {
 	struct drm_gem_shmem_object *drmshmemo = &buffer->gem->base;
-	struct gna_gem_object *gnagemo = buffer->gem;
 	struct gna_buffer *gnab = &buffer->gna;
 	struct gna_memory_patch *patch;
 	struct iosys_map vmap;
-	struct sg_table *sgt;
 	int ret = 0;
 	u32 i;
 
 	dev_dbg(gna_dev(gna_priv), "handle: %u, patch_count, %llu\n",
 		gnab->handle, gnab->patch_count);
 
-	sgt = drm_gem_shmem_get_pages_sgt(drmshmemo);
+	if (!gnab->patch_count)
+		return 0;
 
-	if (IS_ERR(sgt)) {
-		ret = PTR_ERR(sgt);
-		goto err;
-	}
+	ret = drm_gem_vmap(&drmshmemo->base, &vmap);
+	if (ret)
+		return ret;
 
-	if (gnab->patch_count) {
-		ret = drm_gem_vmap(&drmshmemo->base, &vmap);
-
+	patch = (struct gna_memory_patch *)(uintptr_t)gnab->patches_ptr;
+	for (i = 0; i < gnab->patch_count; i++, patch++) {
+		ret = gna_do_patch_memory(gna_priv, patch, vmap.vaddr);
 		if (ret)
-			goto err_pages_sgt;
-
-		patch = (struct gna_memory_patch *)(uintptr_t)gnab->patches_ptr;
-		for (i = 0; i < gnab->patch_count; i++, patch++) {
-			ret = gna_do_patch_memory(gna_priv, patch, vmap.vaddr);
-			if (ret)
-				break;
-		}
-
-		kvfree((void *)(uintptr_t)gnab->patches_ptr);
-		gnab->patches_ptr = 0;
-		drm_gem_vunmap(&drmshmemo->base, &vmap);
-		if (ret) // ret from gna_do_patch_memory
-			goto err_pages_sgt;
+			break;
 	}
 
-	gna_mmu_add(gna_priv, drmshmemo);
-
-	return 0;
-
-err_pages_sgt:
-	gna_gem_object_put_pages_sgt(gnagemo);
-err:
+	kvfree((void *)(uintptr_t)gnab->patches_ptr);
+	gnab->patches_ptr = 0;
+	drm_gem_vunmap(&drmshmemo->base, &vmap);
 	return ret;
 }
 
@@ -195,6 +177,10 @@ int gna_score(struct gna_request *score_request)
 			goto err;
 	}
 
+	ret = gna_mmu_map_request(gna_priv, score_request->buffer_list, buffer_count);
+	if (ret)
+		goto err;
+
 	switch (compute_cfg->gna_mode) {
 	case GNA_MODE_XNN:
 		dev_dbg(gna_dev(gna_priv), "xNN mode; labase: %d, lacount: %d\n",
@@ -217,7 +203,13 @@ int gna_score(struct gna_request *score_request)
 	desc_base = (u32)(mmu->hwdesc_dma >> PAGE_SHIFT);
 	gna_reg_write(gna_priv, GNA_MMIO_DESBASE, desc_base);
 
-	gna_start_scoring(gna_priv, compute_cfg);
+	/* the interrupt is about to be enabled: clear a polled request's latched completion first, or it fires now */
+	if (!score_request->polled && gna_priv->completion_latched) {
+		ret = gna_abort_hw(gna_priv);
+		if (ret)
+			goto err;
+	}
+	gna_start_scoring(gna_priv, compute_cfg, !score_request->polled);
 
 err:
 	return ret;

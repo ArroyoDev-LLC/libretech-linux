@@ -44,6 +44,7 @@ struct gna_device;
 #define GNA_DEV_HWID_ADL	0x464F
 #define GNA_DEV_HWID_RPL	0xA74F
 #define GNA_DEV_HWID_MTL	0x7E4C
+#define GNA_DEV_HWID_ARL	0x774C
 
 /* GNA MMIO registers */
 #define GNA_MMIO_STS		0x80
@@ -98,10 +99,11 @@ struct gna_dev_info {
 };
 
 int gna_abort_hw(struct gna_device *gna_priv);
+int gna_finish_hw(struct gna_device *gna_priv, bool clean);
 bool gna_hw_perf_enabled(struct gna_device *gna_priv);
 int gna_parse_hw_status(struct gna_device *gna_priv, u32 hw_status);
 void gna_print_error_status(struct gna_device *gna_priv, u32 hw_status);
 void gna_start_scoring(struct gna_device *gna_priv,
-		struct gna_compute_cfg *compute_cfg);
+		struct gna_compute_cfg *compute_cfg, bool irq);
 
 #endif // __GNA_HW_H__

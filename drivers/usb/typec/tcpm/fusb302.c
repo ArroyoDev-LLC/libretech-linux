@@ -87,6 +87,9 @@ struct fusb302_chip {
 	int gpio_int_n_irq;
 	struct extcon_dev *extcon;
 
+	/* SWITCHES1 as the previous session left it, read before the reset */
+	u8 prior_switches1;
+
 	struct workqueue_struct *wq;
 	struct delayed_work bc_lvl_handler;
 
@@ -451,12 +454,37 @@ static int fusb302_set_power_mode(struct fusb302_chip *chip, u8 power_mode)
 	return ret;
 }
 
+static int tcpm_get_prior_roles(struct tcpc_dev *dev, enum typec_role *role,
+				enum typec_data_role *data)
+{
+	struct fusb302_chip *chip = container_of(dev, struct fusb302_chip,
+						 tcpc_dev);
+	u8 sw1 = chip->prior_switches1;
+
+	if (!(sw1 & FUSB_REG_SWITCHES1_AUTO_GCRC))
+		return -ENOENT;
+
+	*role = sw1 & FUSB_REG_SWITCHES1_POWERROLE ? TYPEC_SOURCE : TYPEC_SINK;
+	*data = sw1 & FUSB_REG_SWITCHES1_DATAROLE ? TYPEC_HOST : TYPEC_DEVICE;
+
+	return 0;
+}
+
 static int tcpm_init(struct tcpc_dev *dev)
 {
 	struct fusb302_chip *chip = container_of(dev, struct fusb302_chip,
 						 tcpc_dev);
 	int ret = 0;
 	u8 data;
+
+	/*
+	 * The chip is not reset with the SoC. SWITCHES1 still holds the roles
+	 * the last session (the bootloader, or this kernel before a reboot)
+	 * put in its GoodCRC headers, and AUTO_GCRC says whether it spoke PD
+	 * at all; the reset below clears both.
+	 */
+	if (fusb302_i2c_read(chip, FUSB_REG_SWITCHES1, &chip->prior_switches1) < 0)
+		chip->prior_switches1 = 0;
 
 	ret = fusb302_sw_reset(chip);
 	if (ret < 0)
@@ -1213,6 +1241,7 @@ done:
 static void init_tcpc_dev(struct tcpc_dev *fusb302_tcpc_dev)
 {
 	fusb302_tcpc_dev->init = tcpm_init;
+	fusb302_tcpc_dev->get_prior_roles = tcpm_get_prior_roles;
 	fusb302_tcpc_dev->get_vbus = tcpm_get_vbus;
 	fusb302_tcpc_dev->get_current_limit = tcpm_get_current_limit;
 	fusb302_tcpc_dev->set_cc = tcpm_set_cc;

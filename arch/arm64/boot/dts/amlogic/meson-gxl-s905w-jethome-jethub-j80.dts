@@ -244,3 +244,8 @@
 		status = "okay";
 	};
 };
+
+/* S905W (the S905X die) includes meson-gxl.dtsi directly, not the s905x dtsi. */
+&ddr_pmu {
+	status = "okay";
+};

@@ -12,6 +12,8 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pm_runtime.h>
+#include <linux/semaphore.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 #include "gna_gem.h"
@@ -27,6 +29,7 @@
 #define DRIVER_PATCHLEVEL	0
 
 struct workqueue_struct;
+struct gna_request;
 union gna_parameter;
 struct drm_file;
 struct device;
@@ -49,6 +52,23 @@ struct gna_device {
 
 	/* if true, then gna device is processing */
 	bool dev_busy;
+
+	/*
+	 * A polled request (GNA_FLAG_SCORE_POLLED) completed cleanly without the abort: its completion is still latched,
+	 * and would fire as soon as a request enables the interrupt -- gna_score aborts first in that case. Written and
+	 * read with hw_sem held (or by the completion that gives it back).
+	 */
+	bool completion_latched;
+
+	/*
+	 * One request on the hardware at a time. A request started directly from COMPUTE (nothing else queued) takes
+	 * hw_sem there and the interrupt gives it back -- a semaphore, because the release is in another context; the
+	 * request workqueue, the GEM release and remove take it too.
+	 */
+	struct semaphore hw_sem;
+	/* the directly started request the interrupt will complete, under direct_lock */
+	struct gna_request *direct_req;
+	spinlock_t direct_lock;
 	struct wait_queue_head dev_busy_waitq;
 
 	struct list_head request_list;
@@ -62,6 +82,7 @@ struct gna_device {
 };
 
 int gna_probe(struct device *parent, struct gna_dev_info *dev_info, void __iomem *iobase, int irq);
+void gna_remove(struct device *parent);
 int gna_getparam(struct gna_device *gna_priv, union gna_parameter *param);
 
 int gna_getparam_ioctl(struct drm_device *dev, void *data,
