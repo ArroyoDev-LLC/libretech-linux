@@ -38,7 +38,7 @@ void gna_print_error_status(struct gna_device *gna_priv, u32 hw_status)
 		dev_dbg(gna_dev(gna_priv), "GNA error: PCI MMU Error\n");
 
 	if (hw_status & GNA_STS_PCI_DMA_ERR)
-		dev_dbg(gna_dev(gna_priv), "GNA error: PCI MMU Error\n");
+		dev_dbg(gna_dev(gna_priv), "GNA error: PCI DMA Error\n");
 
 	if (hw_status & GNA_STS_PCI_UNEXCOMPL_ERR)
 		dev_dbg(gna_dev(gna_priv), "GNA error: PCI Unexpected Completion Error\n");

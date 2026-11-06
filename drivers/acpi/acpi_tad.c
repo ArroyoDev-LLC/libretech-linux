@@ -734,7 +734,10 @@ static int acpi_tad_probe(struct platform_device *pdev)
 
 fail:
 	acpi_tad_remove(pdev);
-	/* Don't fallthrough because cmos rtc space handler is removed in acpi_tad_remove() */
+	/*
+	 * acpi_tad_remove() already released the SystemCMOS handler; that
+	 * release is a no-op, as the handler stays installed system-wide.
+	 */
 	return ret;
 
 remove_handler:

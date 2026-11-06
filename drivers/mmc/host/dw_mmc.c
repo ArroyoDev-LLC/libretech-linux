@@ -2167,6 +2167,25 @@ static void dw_mci_set_drto(struct dw_mci *host)
 
 	dev_dbg(host->dev, "drto_ms: %u\n", drto_ms);
 
+	/*
+	 * TMOUT bounds a read: the gap before each block comes back. It says
+	 * nothing about a write, where the card may hold DAT0 busy while it
+	 * programs before the CIU can send the next block. The core gives a
+	 * write its own limit (3 s for SD, above the spec's 250/500 ms because
+	 * real cards exceed it); a backstop shorter than that turns a card
+	 * that is merely slow into a timeout, a controller reset and a retry.
+	 */
+	if (host->data && (host->data->flags & MMC_DATA_WRITE)) {
+		u64 wr_ms = DIV_ROUND_UP_ULL(host->data->timeout_ns,
+					     NSEC_PER_MSEC);
+
+		if (host->data->timeout_clks && host->bus_hz)
+			wr_ms += DIV_ROUND_UP_ULL((u64)MSEC_PER_SEC *
+						  host->data->timeout_clks *
+						  drto_div, host->bus_hz);
+		drto_ms = max_t(u64, drto_ms, wr_ms);
+	}
+
 	/* add a bit spare time */
 	drto_ms += 10;
 

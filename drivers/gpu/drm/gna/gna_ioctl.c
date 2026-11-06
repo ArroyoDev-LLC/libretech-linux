@@ -2,6 +2,7 @@
 // Copyright(c) 2017-2022 Intel Corporation
 
 #include <drm/drm_device.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_file.h>
 
@@ -23,13 +24,16 @@ int gna_score_ioctl(struct drm_device *dev, void *data,
 {
 	union gna_compute *score_args = data;
 	u64 request_id;
-	int ret;
+	int ret, idx;
+
+	/* may start the hardware: gna_remove()'s drm_dev_unplug() waits for this section, then refuses it */
+	if (!drm_dev_enter(dev, &idx))
+		return -ENODEV;
 
 	ret = gna_validate_score_config(&score_args->in.config, to_gna_device(dev));
-	if (ret)
-		return ret;
-
-	ret = gna_enqueue_request(&score_args->in.config, file, &request_id);
+	if (!ret)
+		ret = gna_enqueue_request(&score_args->in.config, file, &request_id);
+	drm_dev_exit(idx);
 	if (ret)
 		return ret;
 
@@ -70,6 +74,7 @@ int gna_wait_ioctl(struct drm_device *dev, void *data,
 	struct gna_request *score_request;
 	u64 request_id;
 	u32 timeout;
+	long left;
 	int ret = 0;
 
 	request_id = wait_data->in.request_id;
@@ -88,20 +93,24 @@ int gna_wait_ioctl(struct drm_device *dev, void *data,
 		goto out;
 	}
 
-	if (score_request->polled)      /* started with its interrupt masked: nothing will wake this wait */
-		ret = gna_request_wait_polled(gna_priv, score_request, timeout);
+	/* long: the jiffies left of a timeout near U32_MAX ms do not fit an int (truncated, they read as -ERESTARTSYS) */
+	if (READ_ONCE(score_request->polled))   /* started with its interrupt masked: nothing will wake this wait */
+		left = gna_request_wait_polled(gna_priv, score_request, timeout);
 	else
-		ret = wait_event_interruptible_timeout(score_request->waitq, score_request->state == DONE,
-						       msecs_to_jiffies(timeout));
-	if (ret == 0 || ret == -ERESTARTSYS) {
+		left = wait_event_interruptible_timeout(score_request->waitq, score_request->state == DONE,
+							msecs_to_jiffies(timeout));
+	if (left == 0 || left == -ERESTARTSYS) {
 		dev_dbg(gna_dev(gna_priv), "request timed out, id: %llu\n", request_id);
-		if (ret == 0) {
+		ret = -ERESTARTSYS;
+		if (left == 0) {
 			/* a request started from COMPUTE whose interrupt never came: complete it here */
 			unsigned long flags;
 			bool stolen;
 
+			/* only once its START is written: before that, its submitter (another thread of this client) is still
+			 * starting it with the hardware held, and completing it here would hand the hardware on under it */
 			spin_lock_irqsave(&gna_priv->direct_lock, flags);
-			stolen = gna_priv->direct_req == score_request;
+			stolen = gna_priv->direct_req == score_request && score_request->hw_started;
 			if (stolen)
 				gna_priv->direct_req = NULL;
 			spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
@@ -109,10 +118,13 @@ int gna_wait_ioctl(struct drm_device *dev, void *data,
 				dev_warn(gna_dev(gna_priv), "hardware timeout occurred\n");
 				gna_request_complete_direct(score_request, true);
 			}
+			ret = -EBUSY;
 		}
-		ret = -EBUSY;
+		/* interrupted by a signal: not a timeout -- the request is left as it is and the call restarts */
 		goto out;
 	}
+
+	gna_request_wait_done(score_request);   /* its completion may still be waking us: let it finish first */
 
 	wait_data->out.hw_perf = score_request->hw_perf;
 	wait_data->out.drv_perf = score_request->drv_perf;
@@ -123,7 +135,8 @@ int gna_wait_ioctl(struct drm_device *dev, void *data,
 	dev_dbg(gna_dev(gna_priv), "request status: %d, hw status: %#x\n",
 		score_request->status, score_request->hw_status);
 
-	cancel_work_sync(&score_request->work);
+	if (cancel_work_sync(&score_request->work))   /* not after DONE, but a cancelled work's reference is ours */
+		kref_put(&score_request->refcount, gna_request_release);
 	mutex_lock(&gna_priv->reqlist_lock);
 	if (!list_empty(&score_request->node)) {
 		list_del_init(&score_request->node);
@@ -139,9 +152,7 @@ out:
 int gna_gem_free_ioctl(struct drm_device *dev, void *data,
 		struct drm_file *file)
 {
-	struct gna_device *gna_priv = to_gna_device(dev);
 	struct gna_gem_free *args = data;
-	struct gna_gem_object *gnagemo;
 	struct drm_gem_object *drmgemo;
 	int ret;
 
@@ -149,19 +160,9 @@ int gna_gem_free_ioctl(struct drm_device *dev, void *data,
 	if (!drmgemo)
 		return -ENOENT;
 
-	gnagemo = to_gna_gem_obj(to_drm_gem_shmem_obj(drmgemo));
-
-	queue_work(gna_priv->request_wq, &gnagemo->work);
-	if (wait_event_interruptible(gnagemo->waitq, true)) {
-		ret = -ERESTARTSYS;
-		goto out;
-	}
-
-	cancel_work_sync(&gnagemo->work);
-
+	gna_gem_free_requests(to_gna_device(dev), file, args->handle, drmgemo);
 	ret = drm_gem_handle_delete(file, args->handle);
 
-out:
 	drm_gem_object_put(drmgemo);
 	return ret;
 }
@@ -175,52 +176,30 @@ int gna_getparam_ioctl(struct drm_device *dev, void *data,
 	return gna_getparam(gna_priv, param);
 }
 
-static struct drm_gem_shmem_object *
-drm_gem_shmem_create_with_handle(struct drm_file *file_priv,
-				struct drm_device *dev, size_t size,
-				uint32_t *handle)
-{
-	struct drm_gem_shmem_object *shmem;
-	int ret;
-
-	shmem = drm_gem_shmem_create(dev, size);
-	if (IS_ERR(shmem))
-		return shmem;
-
-	/*
-	 * Allocate an id of idr table where the obj is registered
-	 * and handle has the id what user can see.
-	 */
-	ret = drm_gem_handle_create(file_priv, &shmem->base, handle);
-	/* drop reference from allocate - handle holds it now. */
-	drm_gem_object_put(&shmem->base);
-	if (ret)
-		return ERR_PTR(ret);
-
-	return shmem;
-}
-
 int gna_gem_new_ioctl(struct drm_device *dev, void *data,
 		struct drm_file *file)
 {
 	struct drm_gem_shmem_object *drmgemshm;
-	struct gna_gem_object *gnagemo;
 	union gna_gem_new *args = data;
+	u32 handle;
+	int ret;
 
-	drmgemshm = drm_gem_shmem_create_with_handle(file, dev, args->in.size,
-						&args->out.handle);
-
+	drmgemshm = drm_gem_shmem_create(dev, args->in.size);
 	if (IS_ERR(drmgemshm))
 		return PTR_ERR(drmgemshm);
 
+	/*
+	 * Everything is read from the object before its handle exists: another thread of the client can close the
+	 * handle, and so free the object, the moment it is published.
+	 */
 	args->out.size_granted = drmgemshm->base.size;
 	args->out.vma_fake_offset = drm_vma_node_offset_addr(&drmgemshm->base.vma_node);
 
-	gnagemo = to_gna_gem_obj(drmgemshm);
-	gnagemo->handle = args->out.handle;
+	ret = drm_gem_handle_create(file, &drmgemshm->base, &handle);
+	drm_gem_object_put(&drmgemshm->base);   /* the handle holds it now */
+	if (ret)
+		return ret;
 
-	INIT_WORK(&gnagemo->work, gna_gem_obj_release_work);
-	init_waitqueue_head(&gnagemo->waitq);
-
+	args->out.handle = handle;
 	return 0;
 }

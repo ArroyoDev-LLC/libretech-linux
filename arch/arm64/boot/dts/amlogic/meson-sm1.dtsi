@@ -560,6 +560,22 @@
 	compatible = "amlogic,sm1-ddr-pmu";
 };
 
+&dmc {
+	/*
+	 * Same channel-control window as G12B (DMC_AM0_CHAN_CTRL at 0xff638180,
+	 * firmware leaves every priority at 0). Scanout cannot wait: the VPU
+	 * read ports (16/17/18) get the top weight. Port 16 is the OSD
+	 * scanout here too: the DDR PMU's vpu_read1 filter reads the mode's
+	 * whole 1024x768x4x60 rate on an AML-S905D3-CC.
+	 */
+	dmc_qos: qos@180 {
+		compatible = "amlogic,sm1-dmc-port-priority",
+			     "amlogic,g12b-dmc-port-priority";
+		reg = <0x0 0x180 0x0 0x140>;
+		amlogic,port-priority = <16 7>, <17 7>, <18 7>;
+	};
+};
+
 &pwrc {
 	compatible = "amlogic,meson-sm1-pwrc";
 };

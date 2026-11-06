@@ -125,11 +125,12 @@
  * 6 / 7 measured one boot each on this board; 7 buys nothing over 4). The
  * CPU's own channel pays 12-15 % of its DDR rate only while the NPU runs.
  * Board-scoped: measured on the A311D only; the S905D3 has no vendor
- * priority table.
+ * priority table. The list replaces the SoC's, so it restates the VPU
+ * read ports at 7: scanout stays above the NPU.
  */
 &dmc_qos {
-	status = "okay";
-	amlogic,port-priority = <10 4>;	/* NNA */
+	amlogic,port-priority = <16 7>, <17 7>, <18 7>,	/* VPU read */
+				<10 4>;				/* NNA */
 };
 
 /*

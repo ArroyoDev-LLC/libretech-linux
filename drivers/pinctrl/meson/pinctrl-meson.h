@@ -142,6 +142,12 @@ struct meson_pinctrl {
 	struct device_node *of_irq;
 	unsigned long *irq_mapped;	/* lines whose to_irq made the mapping */
 	struct meson_sm_firmware *fw;
+	/*
+	 * The SMC bank's (TEST_N's) direction as the secure monitor last
+	 * confirmed it: 1 output, 0 input, -1 unknown.  The direction register is
+	 * secure-only and the SMC cannot read it back, so this is the only answer.
+	 */
+	int smc_dir;
 };
 
 #define FUNCTION(fn)							\

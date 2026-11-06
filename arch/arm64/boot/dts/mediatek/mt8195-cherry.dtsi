@@ -1569,6 +1569,8 @@
 
 	rx-fifo-depth = <3072>;
 	vbus-supply = <&usb_vbus>;
+	/* the Type-A port's GL3523 hub needs its USB2 attach before USB3 training */
+	mediatek,usb3-power-after-usb2;
 };
 
 &xhci1 {

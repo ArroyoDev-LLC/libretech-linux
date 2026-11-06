@@ -330,9 +330,14 @@ static int of_bus_default_match(struct device_node *np)
 {
 	/*
 	 * Check for presence first since of_bus_n_addr_cells() will warn when
-	 * walking parent nodes.
+	 * walking parent nodes. Platforms excluded from that warning (old
+	 * coreboot firmware writes /firmware without #address-cells and will
+	 * never be updated) keep the default bus with the inherited cells, as
+	 * before this match existed; otherwise their /firmware/coreboot "reg"
+	 * no longer translates and coreboot_table probes with -EINVAL.
 	 */
-	return of_property_present(np, "#address-cells");
+	return of_property_present(np, "#address-cells") ||
+	       of_default_cells_excluded();
 }
 
 /*

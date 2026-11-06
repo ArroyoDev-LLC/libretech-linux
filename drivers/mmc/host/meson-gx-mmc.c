@@ -33,20 +33,21 @@
 #define DRIVER_NAME "meson-gx-mmc"
 
 /*
- * eMMC HS400 / HS400-ES opt-in. Default OFF: the V3 data-strobe port is not
- * validated on hardware, and enabling it on a board whose SPI NOR shares the
- * eMMC d4/d5/d6 lines silently corrupts 8-bit HS400 writes. The strobe state
- * is torn down on every timing change (meson_mmc_check_resampling()), but the
- * driver has no .hs400_downgrade, so the core's HS400 -> HS200 downgrade runs
- * its status polls with the strobe still armed; and a failed HS400 tuning is
- * returned to the core, which then frees the card (no step-down to HS200), so
- * an eMMC rootfs is lost. Only set hs400_enable=1 on hardware where HS400 is
- * safe (SPI NOR de-populated) and recoverable.
+ * eMMC HS400 / HS400-ES opt-in. Default OFF. On a board whose SPI NOR shares
+ * the eMMC d4/d5/d6 lines, 8-bit HS400 writes are silently corrupted. The V2
+ * (GX/GXL) DS_EN path reads on GXL at a 100-125 MHz bus and fails -84 above
+ * it; V3 is not validated on hardware. The strobe state is torn down on every
+ * timing change (meson_mmc_check_resampling()), at power-off, when the core
+ * turns enhanced strobe off, and in .hs400_downgrade
+ * (meson_mmc_hs400_downgrade()). A card init that fails with an HS400 cap set
+ * steps the mode down and re-detects (meson_mmc_hs400_step_down(): HS400-ES ->
+ * HS400 -> HS200), measured on GXL. Only set hs400_enable=1 where HS400 is
+ * safe (SPI NOR de-populated).
  */
 static bool hs400_enable;
 module_param(hs400_enable, bool, 0644);
 MODULE_PARM_DESC(hs400_enable,
-		 "Enable experimental eMMC HS400/HS400-ES on V3 controllers (default 0; UNTESTED, needs SPI NOR de-populated)");
+		 "Enable experimental eMMC HS400/HS400-ES (default 0; falls back to HS200 on failure; needs SPI NOR de-populated)");
 
 #define SD_EMMC_CLOCK 0x0
 #define   CLK_DIV_MASK GENMASK(5, 0)
@@ -75,6 +76,7 @@ MODULE_PARM_DESC(hs400_enable,
 #define SD_EMMC_ADJUST 0x8
 #define   ADJUST_ADJ_DELAY_MASK GENMASK(21, 16)
 #define   ADJUST_DS_EN BIT(15)
+#define   ADJUST_V2_DS_DLY_MASK GENMASK(7, 4)	/* V2: Dly[9], the DS delay line */
 #define   ADJUST_ADJ_EN BIT(13)
 
 #define SD_EMMC_DELAY1 0x4
@@ -133,6 +135,7 @@ MODULE_PARM_DESC(hs400_enable,
 #define   CFG_BLK_LEN_MASK GENMASK(7, 4)
 #define   CFG_RESP_TIMEOUT_MASK GENMASK(11, 8)
 #define   CFG_RC_CC_MASK GENMASK(15, 12)
+#define   CFG_OUT_FALL BIT(16)		/* DDR: command and TXD start on the falling edge */
 #define   CFG_STOP_CLOCK BIT(22)
 #define   CFG_CLK_ALWAYS_ON BIT(18)
 #define   CFG_CHK_DS BIT(20)
@@ -187,6 +190,8 @@ MODULE_PARM_DESC(hs400_enable,
 #define SD_EMMC_CFG_RESP_TIMEOUT 256 /* in clock cycles */
 #define SD_EMMC_CMD_TIMEOUT 1024 /* in ms */
 #define SD_EMMC_CMD_TIMEOUT_DATA 4096 /* in ms */
+/* software timeout = the command's hardware timeout + this */
+#define SD_EMMC_REQ_TIMEOUT_MARGIN 1000 /* in ms */
 #define SD_EMMC_CFG_CMD_GAP 16 /* in clock cycles */
 #define SD_EMMC_DESC_BUF_LEN PAGE_SIZE
 
@@ -250,6 +255,12 @@ struct meson_host {
 	bool ddr;
 	unsigned char timing;	/* last ios->timing, to skip no-op set_ios */
 
+	/*
+	 * HS400 mode fallback: the bus was powered up since the last
+	 * power-off. See meson_mmc_hs400_step_down().
+	 */
+	bool powered_up;
+
 	unsigned int ddr200_clk_ceiling;	/* 0 = full DDR200 rate; else the
 						 * max SD clock to use, lowered on
 						 * CRC storms; re-armed on a fresh
@@ -272,6 +283,10 @@ struct meson_host {
 	dma_addr_t descs_dma_addr;
 
 	int irq;
+
+	/* software timeout for a command the controller never answers */
+	struct delayed_work req_timeout;
+	unsigned long req_deadline;	/* jiffies */
 
 	bool needs_pre_post_req;
 
@@ -808,6 +823,9 @@ static int meson_mmc_ddr200_eye_scan(struct mmc_host *mmc, u32 opcode,
 /* Do not step DDR200 below this SD clock -- at/under it SDR104 is as fast. */
 #define MESON_DDR200_MIN_CLK	100000000
 
+/* V2 (GX/GXL) HS400 bus-clock ceiling, see meson_mmc_prepare_ios_clock() */
+#define MESON_V2_HS400_MAX_RATE	125000000
+
 /*
  * SD DDR200 RX eye-scan tuning. Scan for a passing eye at the negotiated DDR200
  * clock; if none is found, step the clock down 25% and rescan, down to
@@ -815,10 +833,10 @@ static int meson_mmc_ddr200_eye_scan(struct mmc_host *mmc, u32 opcode,
  * one slightly slower (still well above SDR104). This is the removable SD slot,
  * so a total failure (-EIO) just falls back to SDR104.
  *
- * NOTE: the reduced-clock retry is not yet hardware-validated (it needs a card
- * that fails the eye only at the full DDR200 rate). The full-rate scan is
- * unchanged, so cards that tune today are unaffected, and a card with no eye at
- * any rate ends at the same -EIO -> SDR104 fallback as before.
+ * Both outcomes of the reduced-clock retry have run on hardware: a card with no
+ * eye at any rate ends at -EIO -> SDR104 (S905D3, SanDisk SC32G), and a card
+ * whose eye opens only below the full rate is selected at 150 MHz, at boot and
+ * after every system resume (S905D3, a 239 GiB SDXC card, 12 of 12 resumes).
  */
 static int meson_mmc_ddr200_tuning(struct mmc_host *mmc, u32 opcode)
 {
@@ -1118,7 +1136,9 @@ static int meson_mmc_hs400_tuning(struct mmc_host *mmc, u32 opcode)
  * HS400-ES (drivers/mmc/core/mmc.c). The data-strobe path is already
  * programmed by meson_mmc_check_resampling() at that point; here we run the
  * per-line DELAY-tap eye scan (meson_mmc_hs400_tuning()) against the eMMC
- * HS200 tuning block. Its error is returned to the core as is. Routing it as
+ * HS200 tuning block (V3 only; V2 has no DELAY taps and returns 0). On an
+ * error the current top cap is cleared before returning, so the next
+ * mmc_init_card() selects the next mode down. Routing it as
  * .execute_hs400_tuning (not branching .execute_tuning on ios.timing) is
  * required: the core never calls .execute_tuning while in HS400 timing, so a
  * timing-branch in .execute_tuning would leave HS400 running with zeroed line
@@ -1127,15 +1147,39 @@ static int meson_mmc_hs400_tuning(struct mmc_host *mmc, u32 opcode)
 static int meson_mmc_execute_hs400_tuning(struct mmc_host *mmc,
 					  struct mmc_card *card)
 {
-	return meson_mmc_hs400_tuning(mmc, MMC_SEND_TUNING_BLOCK_HS200);
+	struct meson_host *host = mmc_priv(mmc);
+	int err;
+
+	/*
+	 * V2 controllers (GX/GXL) lack per-line DELAY1/DELAY2 taps, so there
+	 * is nothing to tune -- rely on the data strobe alone. The core calls
+	 * this hook for plain HS400 (mmc_select_hs400) AND for HS400-ES
+	 * (mmc_init_card, after mmc_select_hs400es).
+	 */
+	if (host->data->adjust != SD_EMMC_V3_ADJUST)
+		return 0;
+
+	err = meson_mmc_hs400_tuning(mmc, MMC_SEND_TUNING_BLOCK_HS200);
+	/*
+	 * The core does `goto free_card` on our error; the power-off that
+	 * follows finds no card and steps the mode down
+	 * (meson_mmc_hs400_step_down()).
+	 */
+	if (err)
+		dev_warn(host->dev, "HS400%s tuning failed\n",
+			 mmc->ios.enhanced_strobe ? "-ES" : "");
+	return err;
 }
+
+static void meson_mmc_clear_hs400_strobe(struct meson_host *host);
 
 /*
  * HS400 Enhanced Strobe. In HS400-ES the device drives the data strobe for
  * CMD responses as well as data, so the CMD line no longer needs per-line
  * DELAY-tap tuning. mmc_select_hs400es() itself does not call
  * .execute_hs400_tuning, but mmc_init_card() calls it right afterwards, so
- * the DELAY-tap eye scan still runs for HS400-ES. The core calls this op from
+ * the DELAY-tap eye scan still runs for HS400-ES on V3 (V2 has no taps and
+ * skips it). The core calls this op from
  * mmc_select_hs400es() after switching the bus to HS400-ES
  * (drivers/mmc/core/mmc.c:1457).
  *
@@ -1152,26 +1196,48 @@ static void meson_mmc_hs400_enhanced_strobe(struct mmc_host *mmc,
 	struct meson_host *host = mmc_priv(mmc);
 	u32 val;
 
-	val = readl(host->regs + SD_EMMC_V3_ADJUST);
-	val |= ADJUST_DS_EN;
-	writel(val, host->regs + SD_EMMC_V3_ADJUST);
+	/*
+	 * mmc_set_initial_state() calls this with enhanced_strobe false on
+	 * every power-up of an HS400_ES host: the legacy-timing init that
+	 * follows must not sample a strobe the card does not drive, and no
+	 * timing change comes to tear it down.
+	 */
+	if (!ios->enhanced_strobe) {
+		meson_mmc_clear_hs400_strobe(host);
+		return;
+	}
 
-	val = readl(host->regs + SD_EMMC_INTF3);
-	val &= ~(DS_SHT_M_MASK | DS_SHT_EXP_MASK);
-	val |= SD_INTF3;
-	writel(val, host->regs + SD_EMMC_INTF3);
+	val = readl(host->regs + host->data->adjust);
+	val |= ADJUST_DS_EN;
+	writel(val, host->regs + host->data->adjust);
+
+	if (host->data->adjust == SD_EMMC_V3_ADJUST) {
+		val = readl(host->regs + SD_EMMC_INTF3);
+		val &= ~(DS_SHT_M_MASK | DS_SHT_EXP_MASK);
+		val |= SD_INTF3;
+		writel(val, host->regs + SD_EMMC_INTF3);
+	}
 }
 
 static int meson_mmc_prepare_ios_clock(struct meson_host *host,
 				       struct mmc_ios *ios)
 {
+	unsigned long rate = ios->clock;
 	bool ddr;
 
 	switch (ios->timing) {
+	case MMC_TIMING_MMC_HS400:
+		/*
+		 * V2 (GX/GXL): the command response fails CRC above a 125 MHz
+		 * bus, whatever the strobe, phase and delay fields say; 125 MHz
+		 * is the highest rate measured working (Le Potato).
+		 */
+		if (host->data->adjust != SD_EMMC_V3_ADJUST)
+			rate = min_t(unsigned long, rate, MESON_V2_HS400_MAX_RATE);
+		fallthrough;
 	case MMC_TIMING_MMC_DDR52:
 	case MMC_TIMING_UHS_DDR50:
 	case MMC_TIMING_SD_DDR200:
-	case MMC_TIMING_MMC_HS400:
 		/*
 		 * HS400 is double-data-rate at 200 MHz, so it needs the same
 		 * 400 MHz module clock (raised clkin0/fclk_div5) as DDR200.
@@ -1185,7 +1251,7 @@ static int meson_mmc_prepare_ios_clock(struct meson_host *host,
 		break;
 	}
 
-	return meson_mmc_clk_set(host, ios->clock, ddr);
+	return meson_mmc_clk_set(host, rate, ddr);
 }
 
 /*
@@ -1205,62 +1271,101 @@ static void meson_mmc_set_hs400_strobe(struct meson_host *host)
 {
 	u32 val;
 
-	val = readl(host->regs + SD_EMMC_V3_ADJUST);
+	val = readl(host->regs + host->data->adjust);
 	val |= ADJUST_DS_EN;
-	writel(val, host->regs + SD_EMMC_V3_ADJUST);
+	writel(val, host->regs + host->data->adjust);
 
-	val = readl(host->regs + SD_EMMC_IRQ_EN);
-	val |= CFG_CMD_SETUP;
-	writel(val, host->regs + SD_EMMC_IRQ_EN);
+	val = readl(host->regs + SD_EMMC_CFG);
+	val |= CFG_CHK_DS;
+	writel(val, host->regs + SD_EMMC_CFG);
 
-	val = readl(host->regs + SD_EMMC_INTF3);
-	val |= SD_INTF3;
-	writel(val, host->regs + SD_EMMC_INTF3);
+	dev_dbg(host->dev, "HS400 strobe: ADJUST=%08x CFG=%08x CLOCK=%08x\n",
+		 readl(host->regs + host->data->adjust),
+		 readl(host->regs + SD_EMMC_CFG),
+		 readl(host->regs + SD_EMMC_CLOCK));
+
+	/*
+	 * CFG_CMD_SETUP (IRQ_EN bit 17) and INTF3 exist on V3 only: the S905X
+	 * datasheet lists IRQ_EN bits 31:17 as unused on the V2 controller.
+	 */
+	if (host->data->adjust == SD_EMMC_V3_ADJUST) {
+		val = readl(host->regs + SD_EMMC_IRQ_EN);
+		val |= CFG_CMD_SETUP;
+		writel(val, host->regs + SD_EMMC_IRQ_EN);
+
+		val = readl(host->regs + SD_EMMC_INTF3);
+		val |= SD_INTF3;
+		writel(val, host->regs + SD_EMMC_INTF3);
+	}
+}
+
+/*
+ * Clear the HS400 device-strobe state so a mode that does not drive a
+ * strobe is never left waiting on one. Common path for V2 (GX/GXL) and V3
+ * (AXG+): DS_EN from the adjust register and CHK_DS from CFG; on V3 also
+ * CFG_CMD_SETUP from IRQ_EN and the INTF3 strobe interface (SD_INTF3 +
+ * DS_SHT_*).
+ * The ADJUST_ADJ_DELAY / ADJUST_ADJ_EN resampling field and the per-line
+ * DELAY taps are left alone.
+ */
+static void meson_mmc_clear_hs400_strobe(struct meson_host *host)
+{
+	u32 val;
+
+	val = readl(host->regs + host->data->adjust);
+	val &= ~ADJUST_DS_EN;
+	if (host->data->adjust != SD_EMMC_V3_ADJUST)
+		val &= ~ADJUST_V2_DS_DLY_MASK;
+	writel(val, host->regs + host->data->adjust);
+
+	val = readl(host->regs + SD_EMMC_CFG);
+	val &= ~CFG_CHK_DS;
+	if (host->data->adjust != SD_EMMC_V3_ADJUST)
+		val &= ~CFG_OUT_FALL;
+	writel(val, host->regs + SD_EMMC_CFG);
+
+	if (host->data->adjust == SD_EMMC_V3_ADJUST) {
+		val = readl(host->regs + SD_EMMC_IRQ_EN);
+		val &= ~CFG_CMD_SETUP;
+		writel(val, host->regs + SD_EMMC_IRQ_EN);
+
+		val = readl(host->regs + SD_EMMC_INTF3);
+		val &= ~(SD_INTF3 | DS_SHT_M_MASK | DS_SHT_EXP_MASK);
+		writel(val, host->regs + SD_EMMC_INTF3);
+	}
+}
+
+/*
+ * Core .hs400_downgrade hook. mmc_hs400_to_hs200() (the error/retune
+ * downgrade path) calls it right AFTER it switches the card off HS400
+ * (CMD6 -> HS) and BEFORE it lowers the host timing; mmc_select_hs400()
+ * calls it at the same point of its HS200 -> HS step. Tear the strobe down
+ * here so the controller stops sampling a data strobe the card no longer
+ * drives -- meson_mmc_check_resampling() does the same teardown, but only on
+ * the later set_ios(timing) call, after the downgrade's status polls have
+ * already run in this window (mmc_hs400_to_hs200 failed -110 on 6.12 without
+ * this hook).
+ */
+static void meson_mmc_hs400_downgrade(struct mmc_host *mmc)
+{
+	meson_mmc_clear_hs400_strobe(mmc_priv(mmc));
 }
 
 static void meson_mmc_check_resampling(struct meson_host *host,
 				       struct mmc_ios *ios)
 {
-	u32 val;
+	/* a no-op set_ios at the same timing must not wipe live tuning */
+	if (host->timing == ios->timing)
+		return;
+	host->timing = ios->timing;
 
-	/*
-	 * On the V3 adjust block (axg/g12/sm1) the eMMC data strobe shares the
-	 * DELAY1/DELAY2 taps, the INTF3 strobe controls and the V3 adjust
-	 * DS_ENABLE bit with the resampling / DDR200 eye-scan tuning of the
-	 * other speed modes. Mirror the BSP meson_mmc_check_resampling()
-	 * (meson-g12a-mmc.c:1284-1316): on EVERY timing change, FIRST tear the
-	 * strobe state down -- before programming the new timing -- so a mode
-	 * that does not drive a device strobe (HS200, SDR104, DDR50, DDR200,
-	 * legacy) is never left waiting on one. The previous port did the
-	 * teardown only inside the HS400 branch, so de-selecting HS400 left
-	 * DS_ENABLE / SD_INTF3 / CFG_CMD_SETUP set and the controller kept
-	 * waiting for a strobe the re-inited HS200 card never drives -> the
-	 * rootfs eMMC went unreachable.
-	 *
-	 * The ADJUST_ADJ_DELAY resampling field (and its ADJUST_ADJ_EN enable)
-	 * that SDR104/HS200/DDR50/DDR200 rely on is preserved: only the
-	 * strobe-specific ADJUST_DS_EN bit is cleared here.
-	 */
+	/* tear down HS400 strobe state on EVERY timing change */
+	meson_mmc_clear_hs400_strobe(host);
+
+	/* V3-only: reset the per-line DELAY taps */
 	if (host->data->adjust == SD_EMMC_V3_ADJUST) {
-		/* a no-op set_ios at the same timing must not wipe live tuning */
-		if (host->timing == ios->timing)
-			return;
-		host->timing = ios->timing;
-
 		writel(0, host->regs + SD_EMMC_DELAY1);
 		writel(0, host->regs + SD_EMMC_DELAY2);
-
-		val = readl(host->regs + SD_EMMC_INTF3);
-		val &= ~(SD_INTF3 | DS_SHT_M_MASK | DS_SHT_EXP_MASK);
-		writel(val, host->regs + SD_EMMC_INTF3);
-
-		val = readl(host->regs + SD_EMMC_V3_ADJUST);
-		val &= ~ADJUST_DS_EN;	/* keep ADJUST_ADJ_DELAY / ADJUST_ADJ_EN */
-		writel(val, host->regs + SD_EMMC_V3_ADJUST);
-
-		val = readl(host->regs + SD_EMMC_IRQ_EN);
-		val &= ~CFG_CMD_SETUP;
-		writel(val, host->regs + SD_EMMC_IRQ_EN);
 	}
 
 	switch (ios->timing) {
@@ -1271,15 +1376,45 @@ static void meson_mmc_check_resampling(struct meson_host *host,
 		meson_mmc_disable_resampling(host);
 		break;
 	case MMC_TIMING_MMC_HS400:
-		/*
-		 * HS400 uses the device data strobe instead of rx resampling.
-		 * Only the V3 adjust block has the strobe registers; HS400 is
-		 * cap-cleared on GX/GXL so the core never selects it there.
-		 */
-		if (host->data->adjust == SD_EMMC_V3_ADJUST)
-			meson_mmc_set_hs400_strobe(host);
+		meson_mmc_set_hs400_strobe(host);
 		break;
 	}
+}
+
+/*
+ * HS400 mode fallback. When mmc_select_hs400() / mmc_select_hs400es() (or the
+ * HS400 tuning after them) fails, the core frees the card and powers the bus
+ * off -- and for a non-removable eMMC nothing attaches it again: mmc_rescan()
+ * retries only while freqs[i] > f_min, and f_min is 400 kHz here. So on a
+ * power-off that follows a power-up and finds no card attached, with an HS400
+ * cap still set, drop the top HS400 mode and ask for a new detect:
+ *   HS400-ES cap set -> clear HS400_ES -> next attach selects plain HS400
+ *   HS400 cap set    -> clear HS400    -> next attach selects HS200
+ * The test is "no card", not "an error in HS400 timing": on GXL HS400-ES
+ * has failed both before the switch (in legacy timing) and after it, once
+ * commands had already completed in HS400. A suspend keeps mmc->card and
+ * steps nothing down; host removal (rescan_disable) is left alone. Caps only
+ * shrink, so this ends.
+ */
+static void meson_mmc_hs400_step_down(struct meson_host *host)
+{
+	struct mmc_host *mmc = host->mmc;
+	bool powered_up = host->powered_up;
+
+	host->powered_up = false;
+	if (!powered_up || mmc->card || mmc->rescan_disable)
+		return;
+
+	if (mmc->caps2 & MMC_CAP2_HS400_ES) {
+		mmc->caps2 &= ~MMC_CAP2_HS400_ES;
+		dev_warn(host->dev, "HS400-ES failed; retrying as HS400\n");
+	} else if (mmc->caps2 & MMC_CAP2_HS400) {
+		mmc->caps2 &= ~MMC_CAP2_HS400;
+		dev_warn(host->dev, "HS400 failed; retrying as HS200\n");
+	} else {
+		return;
+	}
+	mmc_detect_change(mmc, msecs_to_jiffies(200));
 }
 
 static void meson_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
@@ -1287,6 +1422,9 @@ static void meson_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	struct meson_host *host = mmc_priv(mmc);
 	u32 bus_width, val;
 	int err;
+
+	if (ios->power_mode == MMC_POWER_OFF)
+		meson_mmc_hs400_step_down(host);
 
 	/*
 	 * GPIO regulator, only controls switching between 1v8 and
@@ -1296,12 +1434,15 @@ static void meson_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	case MMC_POWER_OFF:
 		mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, 0);
 		mmc_regulator_disable_vqmmc(mmc);
+		/* the next init starts in legacy timing: no strobe left behind */
+		meson_mmc_clear_hs400_strobe(host);
 		msleep(50);
 
 		break;
 
 	case MMC_POWER_UP:
 		mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, ios->vdd);
+		host->powered_up = true;
 
 		break;
 
@@ -1346,6 +1487,7 @@ static void meson_mmc_request_done(struct mmc_host *mmc,
 {
 	struct meson_host *host = mmc_priv(mmc);
 
+	cancel_delayed_work(&host->req_timeout);
 	host->cmd = NULL;
 	if (host->needs_pre_post_req)
 		meson_mmc_post_req(mmc, mrq, 0);
@@ -1485,11 +1627,24 @@ static void meson_mmc_start_cmd(struct mmc_host *mmc, struct mmc_command *cmd)
 	struct mmc_data *data = cmd->data;
 	u32 cmd_cfg = 0, cmd_data = 0;
 	unsigned int xfer_bytes = 0;
+	unsigned long wait;
 
 	/* Setup descriptors */
 	dma_rmb();
 
 	host->cmd = cmd;
+
+	/*
+	 * The controller normally ends every command with an interrupt, a
+	 * timeout included. If it never raises one, nothing would complete
+	 * the request and its caller (mmc_rescan, a block queue) would wait
+	 * forever: meson_mmc_req_timeout() fails it after the hardware
+	 * timeout plus a margin.
+	 */
+	wait = msecs_to_jiffies((data ? meson_mmc_get_timeout_msecs(data) :
+				 SD_EMMC_CMD_TIMEOUT) + SD_EMMC_REQ_TIMEOUT_MARGIN);
+	host->req_deadline = jiffies + wait;
+	mod_delayed_work(system_wq, &host->req_timeout, wait);
 
 	cmd_cfg |= FIELD_PREP(CMD_CFG_CMD_INDEX_MASK, cmd->opcode);
 	cmd_cfg |= CMD_CFG_OWNER;  /* owned by CPU */
@@ -1722,6 +1877,34 @@ static int meson_mmc_wait_desc_stop(struct meson_host *host)
 	return readl_poll_timeout(host->regs + SD_EMMC_STATUS, status,
 				  !(status & (STATUS_BUSY | STATUS_DESC_BUSY)),
 				  100, 5000);
+}
+
+/*
+ * Software timeout, armed per command by meson_mmc_start_cmd(). With the IRQ
+ * disabled (which waits for a running hard handler and IRQ thread) no other
+ * path can complete the request, so a command still pending past its
+ * deadline is stopped and failed -ETIMEDOUT. A command that completed, or a
+ * newer one with a later deadline, is left alone.
+ */
+static void meson_mmc_req_timeout(struct work_struct *work)
+{
+	struct meson_host *host = container_of(to_delayed_work(work),
+					       struct meson_host, req_timeout);
+	struct mmc_command *cmd;
+
+	disable_irq(host->irq);
+	cmd = host->cmd;
+	if (cmd && time_after_eq(jiffies, host->req_deadline)) {
+		dev_err(host->dev,
+			"CMD%u: no interrupt from the controller, timing out (status 0x%08x)\n",
+			cmd->opcode, readl(host->regs + SD_EMMC_STATUS));
+		writel(0, host->regs + SD_EMMC_START);	/* stop the descriptor */
+		meson_mmc_wait_desc_stop(host);
+		writel(IRQ_EN_MASK, host->regs + SD_EMMC_STATUS);	/* ack */
+		cmd->error = -ETIMEDOUT;
+		meson_mmc_request_done(host->mmc, cmd->mrq);
+	}
+	enable_irq(host->irq);
 }
 
 static irqreturn_t meson_mmc_irq_thread(int irq, void *dev_id)
@@ -2128,6 +2311,7 @@ static const struct mmc_host_ops meson_mmc_ops = {
 	.execute_tuning = meson_mmc_execute_tuning,
 	.lower_bus_clock = meson_mmc_lower_bus_clock,
 	.execute_hs400_tuning = meson_mmc_execute_hs400_tuning,
+	.hs400_downgrade = meson_mmc_hs400_downgrade,
 	.hs400_enhanced_strobe = meson_mmc_hs400_enhanced_strobe,
 	.card_busy	= meson_mmc_card_busy,
 	.start_signal_voltage_switch = meson_mmc_voltage_switch,
@@ -2220,6 +2404,8 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	writel(IRQ_EN_MASK, host->regs + SD_EMMC_STATUS);
 	writel(IRQ_EN_MASK, host->regs + SD_EMMC_IRQ_EN);
 
+	INIT_DELAYED_WORK(&host->req_timeout, meson_mmc_req_timeout);
+
 	ret = request_threaded_irq(host->irq, meson_mmc_irq,
 				   meson_mmc_irq_thread, IRQF_ONESHOT,
 				   dev_name(&pdev->dev), host);
@@ -2243,24 +2429,19 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	mmc->max_seg_size = mmc->max_req_size;
 
 	/*
-	 * HS400 / HS400-ES (eMMC data-strobe + per-line DELAY-tap eye-scan
-	 * tuning) is only wired up for the V3 adjust block (axg/g12/sm1
-	 * match-data, .adjust == SD_EMMC_V3_ADJUST): the strobe registers (INTF3,
-	 * DS_ENABLE, CFG_CMD_SETUP) and the per-line DELAY1/DELAY2 taps the
-	 * tuning sweeps only exist there.
+	 * HS400 / HS400-ES is default-OFF: the caps (from DT mmc-hs400-1_8v /
+	 * mmc-hs400-enhanced-strobe) are kept only when hs400_enable is set.
+	 * V3 controllers (AXG+) use INTF3 + per-line DELAY-tap eye-scan tuning;
+	 * V2 controllers (GX/GXL) use the ADJUST DS_EN bit + CFG CHK_DS only
+	 * (no INTF3, no per-line tuning -- ES mode does not need it).
 	 *
-	 * The port is not validated on hardware and is default-OFF: keep
-	 * HS400/HS400-ES (gated by mmc-hs400-1_8v / mmc-hs400-enhanced-strobe in
-	 * DT) only when BOTH the V3 strobe path exists AND the hs400_enable
-	 * module param is set. With the default hs400_enable=false the caps are
-	 * cleared on every controller, so behaviour is identical to mainline
-	 * (HS200) -- nothing changes unless an operator opts in on hardware where
-	 * it is safe (SPI NOR de-populated; see emmc-hs400-plan.md), and even
-	 * then the risks in the hs400_enable comment at the top of this file
-	 * (no .hs400_downgrade, no step-down on a tuning failure) stand. GX/GXL
-	 * never has the strobe path at all.
+	 * With the default hs400_enable=false the caps are cleared on every
+	 * controller, so behaviour is identical to mainline (HS200) -- nothing
+	 * changes unless an operator opts in on hardware where it is safe (SPI
+	 * NOR de-populated; see emmc-hs400-plan.md), and even then the limits in
+	 * the hs400_enable comment at the top of this file stand.
 	 */
-	if (host->data->adjust != SD_EMMC_V3_ADJUST || !hs400_enable)
+	if (!hs400_enable)
 		mmc->caps2 &= ~(MMC_CAP2_HS400 | MMC_CAP2_HS400_ES);
 
 	if (host->dram_access_quirk) {
@@ -2303,6 +2484,7 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	return 0;
 
 err_free_irq:
+	cancel_delayed_work_sync(&host->req_timeout);
 	free_irq(host->irq, host);
 err_init_clk:
 	clk_disable_unprepare(host->mmc_clk);
@@ -2314,6 +2496,7 @@ static void meson_mmc_remove(struct platform_device *pdev)
 	struct meson_host *host = dev_get_drvdata(&pdev->dev);
 
 	mmc_remove_host(host->mmc);
+	cancel_delayed_work_sync(&host->req_timeout);
 
 	/* disable interrupts */
 	writel(0, host->regs + SD_EMMC_IRQ_EN);

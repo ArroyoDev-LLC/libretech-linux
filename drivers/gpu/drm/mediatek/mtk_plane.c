@@ -267,6 +267,29 @@ static int mtk_plane_atomic_check(struct drm_plane *plane,
 	if (ret)
 		return ret;
 
+	/*
+	 * An AFBC primary completes frames on its own (kmscube). The same
+	 * primary with any other plane enabled on this CRTC does not: the OVL
+	 * stops delivering vblanks and the RDMA faults. Refuse the modifier
+	 * so the client retries that plane as linear.
+	 */
+	if (fb->modifier != DRM_FORMAT_MOD_LINEAR) {
+		struct drm_plane *other;
+
+		drm_for_each_plane(other, plane->dev) {
+			struct drm_plane_state *other_state;
+
+			if (other == plane)
+				continue;
+			other_state = drm_atomic_get_plane_state(state, other);
+			if (IS_ERR(other_state))
+				return PTR_ERR(other_state);
+			if (other_state->crtc == new_plane_state->crtc &&
+			    other_state->fb)
+				return -EINVAL;
+		}
+	}
+
 	crtc_state = drm_atomic_get_crtc_state(state,
 					       new_plane_state->crtc);
 	if (IS_ERR(crtc_state))
@@ -340,7 +363,7 @@ int mtk_plane_init(struct drm_device *dev, struct drm_plane *plane,
 	err = drm_universal_plane_init(dev, plane, possible_crtcs,
 				       &mtk_plane_funcs, formats,
 				       num_formats,
-				       supports_afbc ? modifiers : NULL,
+				       supports_afbc && type == DRM_PLANE_TYPE_PRIMARY ? modifiers : NULL,
 				       type, NULL);
 	if (err) {
 		DRM_ERROR("failed to initialize plane\n");

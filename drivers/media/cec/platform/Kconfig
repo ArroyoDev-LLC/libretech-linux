@@ -52,6 +52,18 @@ config CEC_GPIO
 	  The CEC bus is present in the HDMI connector and enables communication
 	  between compatible devices.
 
+config CEC_MEDIATEK
+	tristate "MediaTek MT8188 HDMI CEC driver"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on COMMON_CLK && OF
+	select CEC_CORE
+	select CEC_NOTIFIER
+	help
+	  This is a driver for the HDMI CEC controller of the MediaTek
+	  MT8188 SoC (MT8370, MT8390).
+	  The CEC bus is present in the HDMI connector and enables communication
+	  between compatible devices.
+
 config CEC_SAMSUNG_S5P
 	tristate "Samsung S5P CEC driver"
 	depends on ARCH_EXYNOS || COMPILE_TEST

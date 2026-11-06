@@ -9,9 +9,9 @@
 #include "gna_hw.h"
 
 struct drm_gem_object;
+struct drm_file;
 struct gna_buffer_with_object;
 struct gna_gem_object;
-struct work_struct;
 struct gna_device;
 
 /* requests with up to this many buffers keep their mapping for the next request (gna_mmu_map_request) */
@@ -62,6 +62,7 @@ void gna_mmu_forget(struct gna_device *gna_priv, struct drm_gem_object *obj);
 
 void gna_mmu_release(struct gna_device *gna_priv);
 
-void gna_gem_obj_release_work(struct work_struct *work);
+void gna_gem_free_requests(struct gna_device *gna_priv, struct drm_file *file, u32 handle,
+			   struct drm_gem_object *obj);
 
 #endif // __GNA_MEM_H__

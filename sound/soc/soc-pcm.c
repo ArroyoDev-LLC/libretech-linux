@@ -1401,11 +1401,24 @@ void dpcm_be_disconnect(struct snd_soc_pcm_runtime *fe, int stream)
 	snd_pcm_stream_unlock_irq(substream);
 
 	while (!list_empty(&deleted_dpcms)) {
+		struct snd_soc_pcm_runtime *be;
+
 		dpcm = list_first_entry(&deleted_dpcms, struct snd_soc_dpcm,
 					list_fe);
+		be = dpcm->be;
 		list_del(&dpcm->list_fe);
 		dpcm_remove_debugfs_state(dpcm);
 		kfree(dpcm);
+
+		/*
+		 * dpcm_be_connect() forces a BE nonatomic for a nonatomic FE.
+		 * Once no FE is left on the BE, give it back its own setting,
+		 * or an atomic FE can never connect to it again.
+		 */
+		if (be->pcm &&
+		    list_empty(&be->dpcm[SNDRV_PCM_STREAM_PLAYBACK].fe_clients) &&
+		    list_empty(&be->dpcm[SNDRV_PCM_STREAM_CAPTURE].fe_clients))
+			be->pcm->nonatomic = be->dai_link->nonatomic;
 	}
 }
 

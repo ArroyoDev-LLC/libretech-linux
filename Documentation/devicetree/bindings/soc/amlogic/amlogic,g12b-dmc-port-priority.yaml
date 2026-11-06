@@ -26,7 +26,11 @@ description: |
 
 properties:
   compatible:
-    const: amlogic,g12b-dmc-port-priority
+    oneOf:
+      - const: amlogic,g12b-dmc-port-priority
+      - items:
+          - const: amlogic,sm1-dmc-port-priority
+          - const: amlogic,g12b-dmc-port-priority
 
   reg:
     maxItems: 1

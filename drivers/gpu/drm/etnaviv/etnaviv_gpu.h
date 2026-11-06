@@ -380,6 +380,26 @@ struct etnaviv_gpu {
 	bool npu_poll_completion;
 	struct delayed_work npu_poll_work;
 	int npu_poll_event;
+	/*
+	 * 0x99: the ISR and npu_poll_work each try to complete the armed job;
+	 * whichever takes it under this lock (npu_claim()) signals its fence,
+	 * the other backs off.
+	 */
+	spinlock_t npu_claim_lock;
+	/*
+	 * 0x99: every event whose job dispatched NN/TP work and is not yet
+	 * completed. npu_poll_event names only the latest; with more than one
+	 * job in flight (credit_limit > 1) the ISR completes each from this set.
+	 */
+	unsigned long npu_pe_armed;
+	/*
+	 * 0x99, credit_limit > 1: FROM_PE interrupts each event still owes,
+	 * one per job armed on it. The poll can complete a job before its
+	 * FROM_PE arrives; the event is then re-armed by a later job, and the
+	 * late interrupt must not complete that later job (under
+	 * npu_claim_lock).
+	 */
+	u8 npu_pe_owed[ETNA_NR_EVENTS];
 
 	/*
 	 * N9 deferred size-scaled NN-AXI drain (A311D 0x88). When the ISR's

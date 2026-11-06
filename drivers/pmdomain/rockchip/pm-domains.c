@@ -88,6 +88,7 @@ struct rockchip_pmu_info {
 #define QOS_BANDWIDTH		0x10
 #define QOS_SATURATION		0x14
 #define QOS_EXTCONTROL		0x18
+#define QOS_PRIO_UNSET		U32_MAX
 
 struct rockchip_pm_domain {
 	struct generic_pm_domain genpd;
@@ -96,6 +97,8 @@ struct rockchip_pm_domain {
 	int num_qos;
 	struct regmap **qos_regmap;
 	u32 *qos_save_regs[MAX_QOS_REGS_NUM];
+	/* per QoS port: the DT "priority-init" value, or QOS_PRIO_UNSET */
+	u32 *qos_prio_init;
 	int num_clks;
 	struct clk_bulk_data *clks;
 	struct device_node *node;
@@ -470,6 +473,24 @@ static int rockchip_pmu_restore_qos(struct rockchip_pm_domain *pd)
 	return 0;
 }
 
+/*
+ * Program the QoS priorities a board asks for with "priority-init" on a QoS
+ * node. The registers sit in the domain, so this only runs with the domain
+ * powered and its clocks on; a read or write while it is off hangs the bus.
+ */
+static void rockchip_pmu_init_qos(struct rockchip_pm_domain *pd)
+{
+	int i;
+
+	if (!pd->qos_prio_init)
+		return;
+
+	for (i = 0; i < pd->num_qos; i++)
+		if (pd->qos_prio_init[i] != QOS_PRIO_UNSET)
+			regmap_write(pd->qos_regmap[i], QOS_PRIORITY,
+				     pd->qos_prio_init[i]);
+}
+
 static bool rockchip_pmu_domain_is_on(struct rockchip_pm_domain *pd)
 {
 	struct rockchip_pmu *pmu = pd->pmu;
@@ -650,6 +671,7 @@ static int rockchip_pd_power(struct rockchip_pm_domain *pd, bool power_on)
 			goto out;
 
 		rockchip_pmu_restore_qos(pd);
+		rockchip_pmu_init_qos(pd);
 	}
 
 out:
@@ -855,10 +877,28 @@ static int rockchip_pm_add_one_domain(struct rockchip_pmu *pmu,
 		}
 
 		for (j = 0; j < pd->num_qos; j++) {
+			u32 prio;
+
 			qos_node = of_parse_phandle(node, "pm_qos", j);
 			if (!qos_node) {
 				error = -ENODEV;
 				goto err_unprepare_clocks;
+			}
+			if (!of_property_read_u32(qos_node, "priority-init", &prio)) {
+				if (!pd->qos_prio_init) {
+					pd->qos_prio_init = devm_kmalloc_array(pmu->dev,
+									       pd->num_qos,
+									       sizeof(u32),
+									       GFP_KERNEL);
+					if (!pd->qos_prio_init) {
+						of_node_put(qos_node);
+						error = -ENOMEM;
+						goto err_unprepare_clocks;
+					}
+					memset32(pd->qos_prio_init, QOS_PRIO_UNSET,
+						 pd->num_qos);
+				}
+				pd->qos_prio_init[j] = prio;
 			}
 			pd->qos_regmap[j] = syscon_node_to_regmap(qos_node);
 			of_node_put(qos_node);
@@ -882,6 +922,17 @@ static int rockchip_pm_add_one_domain(struct rockchip_pmu *pmu,
 	 */
 	if (pd->info->need_regulator)
 		rockchip_pd_power(pd, false);
+
+	/* A domain left on by the bootloader never sees a power-on here. */
+	if (pd->qos_prio_init && rockchip_pmu_domain_is_on(pd) &&
+	    !clk_bulk_enable(pd->num_clks, pd->clks)) {
+		mutex_lock(&pmu->mutex);
+		rockchip_pmu_ungate_clk(pd, true);
+		rockchip_pmu_init_qos(pd);
+		rockchip_pmu_ungate_clk(pd, false);
+		mutex_unlock(&pmu->mutex);
+		clk_bulk_disable(pd->num_clks, pd->clks);
+	}
 
 	pd->genpd.power_off = rockchip_pd_power_off;
 	pd->genpd.power_on = rockchip_pd_power_on;

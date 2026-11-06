@@ -69,7 +69,7 @@ struct meson_ge2d_src2_info {
 	__u32 blend_op;		/* packed ALU factors */
 	__u32 src2_gb_alpha;	/* SRC2 global alpha 0-255 (G12B+, 0=off) */
 	__u32 const_color;	/* ALU constant color ARGB8888 */
-	__u32 def_color;	/* SRC2 default fill color ARGB8888 */
+	__u32 def_color;	/* SRC2 default fill color 0xRRGGBBAA */
 	__u32 color_key;	/* SRC2 color key value (0 = disabled) */
 	__u32 color_key_mask;	/* SRC2 color key mask */
 	__u32 repeat_x;		/* SRC2 X pixel repeat: 0=1x,1=2x,2=4x,3=8x */
@@ -355,7 +355,7 @@ struct ge2d_ctx {
 	u32 blend_op;
 	u32 src2_gb_alpha;
 	u32 const_color;		/* GE2D_ALU_CONST_COLOR ARGB8888 */
-	u32 def_color;			/* GE2D_SRC2_DEF_COLOR ARGB8888 */
+	u32 def_color;			/* GE2D_SRC2_DEF_COLOR 0xRRGGBBAA */
 	u32 src2_color_key, src2_color_key_mask;
 	u32 src2_repeat_x, src2_repeat_y;
 	u32 src2_flags;			/* MESON_GE2D_SRC2_FLAG_* */
@@ -530,40 +530,37 @@ static const struct ge2d_fmt formats[] = {
 	/*
 	 * 32-bit RGB formats.
 	 *
-	 * V4L2 names describe MEMORY byte order on LE (e.g. ARGB32 =
-	 * {B,G,R,A} in memory = 0xAARRGGBB as LE u32).
+	 * V4L2 32-bit RGB fourccs are defined by their MEMORY byte order,
+	 * byte 0 first (pixfmt-rgb.rst, "8 Bits Per Component"); they are
+	 * NOT the DRM names.  E.g. ARGB32 'BA24' = {A,R,G,B} and
+	 * ABGR32 'AR24' = {B,G,R,A} (the DRM ARGB8888 layout).
 	 *
-	 * GE2D color map names describe the 32-bit REGISTER WORD order
-	 * (MSB to LSB). ARGB8888 = A[31:24] R[23:16] G[15:8] B[7:0]
-	 * = 0xAARRGGBB. On LE this stores as {B,G,R,A} in memory.
+	 * GE2D color map names give the 32-bit word MSB to LSB, read
+	 * little-endian: ARGB8888 = 0xAARRGGBB = memory {B,G,R,A}.  So:
+	 *   ARGB8888 (1) = {B,G,R,A}: ABGR32, XBGR32, BGR32
+	 *   RGBA8888 (0) = {A,B,G,R}: BGRA32, BGRX32
+	 *   ABGR8888 (2) = {R,G,B,A}: RGBA32, RGBX32
+	 *   BGRA8888 (3) = {A,R,G,B}: ARGB32, XRGB32, RGB32
+	 * The alpha lane the hardware writes for a no-alpha format is that
+	 * map's A byte, i.e. the X byte of the fourcc.
 	 *
-	 * So V4L2 ARGB32 (memory {B,G,R,A}) = GE2D ARGB8888 (register
-	 * 0xAARRGGBB). The mapping is by the 32-bit word interpretation,
-	 * not by memory byte name.
-	 *
-	 * BSP ge2d.h confirms: GE2D_FORMAT_S32_ARGB uses COLOR_MAP_ARGB8888.
+	 * Until 2026-10 this table read the spec's byte columns backwards
+	 * and every entry was byte-mirrored (N5): XBGR32 copies forced
+	 * byte 0 (blue) to 0xFF, and every conversion between a 32-bit
+	 * RGB format and any other format swapped channels.
+	 * The deprecated RGB32 'RGB4' is {A,R,G,B} and BGR32 'BGR4' is
+	 * {B,G,R,A} (pixfmt-rgb.rst, deprecated table).
 	 */
-	FMT(V4L2_PIX_FMT_XRGB32, false, 32, ARGB8888),
-	FMT(V4L2_PIX_FMT_RGB32, true, 32, ARGB8888),
-	FMT(V4L2_PIX_FMT_ARGB32, true, 32, ARGB8888),
-	FMT(V4L2_PIX_FMT_RGBX32, false, 32, RGBA8888),
-	FMT(V4L2_PIX_FMT_RGBA32, true, 32, RGBA8888),
-	/*
-	 * GI-015: the BGR-family V4L2 formats were mapped to swapped GE2D
-	 * color maps. Per the V4L2 byte layout (pixfmt-rgb.rst) and the
-	 * channel probe (tests/ge2d/ge2d-fmt-channel-probe.c):
-	 *   - memory {R,G,B,*} (R at byte0) -> ABGR8888 (reg 0xAABBGGRR,
-	 *     LE mem {R,G,B,A}): BGRX32, BGRA32.
-	 *   - memory {*,R,G,B} (R at byte1) -> BGRA8888 (reg 0xBBGGRRAA,
-	 *     LE mem {A,R,G,B}): XBGR32, ABGR32.
-	 * (RGB/ARGB/RGBX/RGBA families were already correct.) BGR32 is the
-	 * deprecated alias and is left unchanged (not covered by the probe).
-	 */
-	FMT(V4L2_PIX_FMT_BGRX32, false, 32, ABGR8888),
-	FMT(V4L2_PIX_FMT_BGRA32, true, 32, ABGR8888),
-	FMT(V4L2_PIX_FMT_BGR32, true, 32, ABGR8888),
-	FMT(V4L2_PIX_FMT_ABGR32, true, 32, BGRA8888),
-	FMT(V4L2_PIX_FMT_XBGR32, false, 32, BGRA8888),
+	FMT(V4L2_PIX_FMT_XRGB32, false, 32, BGRA8888),
+	FMT(V4L2_PIX_FMT_RGB32, true, 32, BGRA8888),
+	FMT(V4L2_PIX_FMT_ARGB32, true, 32, BGRA8888),
+	FMT(V4L2_PIX_FMT_RGBX32, false, 32, ABGR8888),
+	FMT(V4L2_PIX_FMT_RGBA32, true, 32, ABGR8888),
+	FMT(V4L2_PIX_FMT_BGRX32, false, 32, RGBA8888),
+	FMT(V4L2_PIX_FMT_BGRA32, true, 32, RGBA8888),
+	FMT(V4L2_PIX_FMT_BGR32, true, 32, ARGB8888),
+	FMT(V4L2_PIX_FMT_ABGR32, true, 32, ARGB8888),
+	FMT(V4L2_PIX_FMT_XBGR32, false, 32, ARGB8888),
 
 	FMT(V4L2_PIX_FMT_RGB24, false, 24, BGR888),
 	FMT(V4L2_PIX_FMT_BGR24, false, 24, RGB888),
@@ -577,16 +574,14 @@ static const struct ge2d_fmt formats[] = {
 	FMT(V4L2_PIX_FMT_ARGB444, true, 16, ARGB4444),
 
 	/*
-	 * 16-bit packed YUV422. The hw color_map (=0) is VYUY-ordered
-	 * ([Cr,Y0,Cb,Y1] -- chroma-first AND Cb<->Cr-swapped vs UYVY), NOT YUYV.
-	 * RE 2026-06-07: YUYV fed here decoded chroma-first (black->green); a
-	 * relabel to UYVY fixed black, but the colour harness (red/blue test,
-	 * GI-023) then showed the chroma lanes are also Cb<->Cr swapped -- ge2d
-	 * consumes [Cr,Y0,Cb,Y1] = VYUY (ffmpeg uyvy422 red rendered blue). No
-	 * tunable SRC1 register changes the byte order. So advertise VYUY; a
-	 * YUYV/UYVY source gets an automatic videoconvert before ge2d.
+	 * 16-bit packed YUV422, hw color_map 0: memory {Cb,Y0,Cr,Y1} = UYVY.
+	 * Measured on SM1 with every port little-endian
+	 * (tests/ge2d/ge2d-yuv422-probe.c): luma from the odd bytes, Cb from
+	 * byte 0, Cr from byte 2.  GI-023 (2026-06-07) labelled it VYUY, but
+	 * measured it while YUV ports were big-endian, which reversed every
+	 * 64-bit word.  The hardware has no other 16-bit YUV422 order.
 	 */
-	FMTYUV(V4L2_PIX_FMT_VYUY, false, 16, YUV422),
+	FMTYUV(V4L2_PIX_FMT_UYVY, false, 16, YUV422),
 
 	/*
 	 * 16-bit packed YUV565 (V4L2_PIX_FMT_YUV565, hw color_map 5 + yuv flag)
@@ -598,29 +593,31 @@ static const struct ge2d_fmt formats[] = {
 	 */
 
 	/*
-	 * 24-bit packed YUV444 (V4L2_PIX_FMT_YUV24) REMOVED 2026-06-07 (GI-024):
-	 * colour-broken on HW -- black decodes (32,126,49), gradients 6-13 dB, no
-	 * byte-order round-trips. Do not advertise a corrupting format; re-add only
-	 * behind a confirmed datapath + colour probe.
+	 * 24-bit packed YUV444 YUV24 'YUV3' = memory {Y,Cb,Cr}.  The YUV
+	 * maps share codes with the RGB maps channel for channel (R=Y,
+	 * G=Cb, B=Cr), so it takes VUY888 (5), the map RGB24 {R,G,B}
+	 * uses.  GI-024 (2026-06-07) dropped it as colour-broken, but it
+	 * was mapped YUV444 (0) and measured under the big-endian port
+	 * setting, which scrambles 3-byte pixels across 64-bit words.
 	 */
+	FMTYUV(V4L2_PIX_FMT_YUV24, false, 24, VUY888),
 
-	/* 32-bit packed YUV/YUVA variants */
-	FMTYUV(V4L2_PIX_FMT_YUV32, false, 32, YUVA8888),
-	FMTYUV(V4L2_PIX_FMT_YUVA32, true, 32, YUVA8888),
-	FMTYUV(V4L2_PIX_FMT_YUVX32, false, 32, YUVA8888),
-	FMTYUV(V4L2_PIX_FMT_AYUV32, true, 32, AYUV8888),
-	FMTYUV(V4L2_PIX_FMT_VUYA32, true, 32, VUYA8888),
-	FMTYUV(V4L2_PIX_FMT_VUYX32, false, 32, VUYA8888),
 	/*
-	 * XYUV32 is the X-alpha twin of AYUV32: identical memory layout
-	 * (byte0 X/A, byte1 Y, byte2 Cb, byte3 Cr per pixfmt-packed-yuv.rst)
-	 * with the alpha byte don't-care. AYUV32 already maps to AYUV8888
-	 * (register MSB->LSB A:Y:U:V), so XYUV32 takes the same hw map --
-	 * exactly as YUVX32 mirrors YUVA32 above. (GE2D format coverage F-25.)
-	 * VERIFIED 2026-06-07 (GI-026): black/white/red/green/blue round-trip
-	 * (deltas <=2) via ge2d-color-characterize.sh on SM1.
+	 * 32-bit packed YUV, memory order per pixfmt-packed-yuv.rst, maps
+	 * by the same rule as the 32-bit RGB block above:
+	 *   AYUV8888 (1) = {Cr,Cb,Y,A}: VUYA32, VUYX32
+	 *   AVUY8888 (2) = {Y,Cb,Cr,A}: YUVA32, YUVX32
+	 *   VUYA8888 (3) = {A,Y,Cb,Cr}: AYUV32, XYUV32, YUV32
+	 * These were byte-mirrored with the RGB block (N5); the test
+	 * packer had been calibrated to the mirror.
 	 */
-	FMTYUV(V4L2_PIX_FMT_XYUV32, false, 32, AYUV8888),
+	FMTYUV(V4L2_PIX_FMT_YUV32, false, 32, VUYA8888),
+	FMTYUV(V4L2_PIX_FMT_YUVA32, true, 32, AVUY8888),
+	FMTYUV(V4L2_PIX_FMT_YUVX32, false, 32, AVUY8888),
+	FMTYUV(V4L2_PIX_FMT_AYUV32, true, 32, VUYA8888),
+	FMTYUV(V4L2_PIX_FMT_VUYA32, true, 32, AYUV8888),
+	FMTYUV(V4L2_PIX_FMT_VUYX32, false, 32, AYUV8888),
+	FMTYUV(V4L2_PIX_FMT_XYUV32, false, 32, VUYA8888),
 
 	/* NV12/NV21 semi-planar YUV420 -- multi-canvas addressing */
 	FMTNV(V4L2_PIX_FMT_NV12, NV12),
@@ -819,6 +816,19 @@ static const u16 csc_bt601_yuv2rgb[9] = {
 	0x04a8, 0x0811, 0x0000,
 };
 
+/*
+ * BT.601 YCbCr(0-255) -> RGB(0-255), the JPEG / JFIF encoding
+ * (BSP ge2d_hw.c MATRIX_FULL_RANGE_YCC_TO_RGB)
+ * 0     1  0         1.402
+ * -128  1 -0.34414  -0.71414
+ * -128  1  1.772     0
+ */
+static const u16 csc_bt601f_yuv2rgb[9] = {
+	0x0400, 0x0000, 0x059c,
+	0x0400, 0x1ea0, 0x1d25,
+	0x0400, 0x0717, 0x0000,
+};
+
 /* BT.601 RGB(0-255) -> YCbCr(16-235) (BSP ge2d_hw.c:973-981) */
 static const u16 csc_bt601_rgb2yuv[9] = {
 	0x0107, 0x0204, 0x0064,
@@ -855,24 +865,33 @@ static const u16 csc_bt709_rgb2yuv[9] = {
  * @ge2d: device
  * @yuv2rgb: true for YUV->RGB, false for RGB->YUV
  * @bt709: true for BT.709 matrix, false for BT.601
+ * @full: YUV->RGB from full-range (0-255) BT.601 YCbCr, as a JPEG decodes
+ *	  to; ignored for BT.709 and for RGB->YUV
  */
 static void ge2d_set_csc_matrix(struct meson_ge2d *ge2d, bool yuv2rgb,
-				bool bt709)
+				bool bt709, bool full)
 {
 	const u16 *coef;
 
-	if (yuv2rgb)
+	full = full && yuv2rgb && !bt709;
+	if (full)
+		coef = csc_bt601f_yuv2rgb;
+	else if (yuv2rgb)
 		coef = bt709 ? csc_bt709_yuv2rgb : csc_bt601_yuv2rgb;
 	else
 		coef = bt709 ? csc_bt709_rgb2yuv : csc_bt601_rgb2yuv;
 
 	/*
 	 * Pre-offset: subtract bias from input before matrix multiply.
-	 * YUV->RGB: Y-16, Cb-128, Cr-128 (limited range YUV input).
+	 * YUV->RGB: Y-16, Cb-128, Cr-128 (limited range YUV input);
+	 * Cb-128, Cr-128 only for full range.
 	 * RGB->YUV: no pre-offset (full range RGB input).
 	 * Same pre-offsets for BT.601 and BT.709 (BSP vdin_ctl.c:408).
 	 */
-	if (yuv2rgb) {
+	if (full) {
+		regmap_write(ge2d->map, GE2D_MATRIX_PRE_OFFSET,
+			     (0x180 << 10) | 0x180);
+	} else if (yuv2rgb) {
 		regmap_write(ge2d->map, GE2D_MATRIX_PRE_OFFSET,
 			     (0x1f0 << 20) | (0x180 << 10) | 0x180);
 	} else {
@@ -889,7 +908,7 @@ static void ge2d_set_csc_matrix(struct meson_ge2d *ge2d, bool yuv2rgb,
 		     (coef[6] << 16) | coef[7]);
 	regmap_write(ge2d->map, GE2D_MATRIX_COEF22_CTRL,
 		     (coef[8] << 16) |
-		     (yuv2rgb ? GE2D_MATRIX_SAT_IN_EN : 0) |
+		     (yuv2rgb && !full ? GE2D_MATRIX_SAT_IN_EN : 0) |
 		     GE2D_MATRIX_EN);
 
 	/*
@@ -919,6 +938,15 @@ static bool ge2d_is_bt709(const struct v4l2_pix_format_mplane *pix)
 	if (pix->colorspace == V4L2_COLORSPACE_REC709)
 		return true;
 	return false;
+}
+
+/* Whether a YUV source is full range (0-255), as a JPEG decodes to. */
+static bool ge2d_is_full_range(const struct v4l2_pix_format_mplane *pix)
+{
+	if (pix->quantization == V4L2_QUANTIZATION_FULL_RANGE)
+		return true;
+	return pix->quantization == V4L2_QUANTIZATION_DEFAULT &&
+	       pix->colorspace == V4L2_COLORSPACE_JPEG;
 }
 
 /*
@@ -979,7 +1007,9 @@ static void ge2d_fixup_colorimetry(struct v4l2_pix_format_mplane *pix,
 	/* xfer_func DEFAULT (0) is a valid round-trip value -- leave it. */
 
 	if (pix->quantization == V4L2_QUANTIZATION_DEFAULT)
-		pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+		pix->quantization = pix->colorspace == V4L2_COLORSPACE_JPEG ?
+				    V4L2_QUANTIZATION_FULL_RANGE :
+				    V4L2_QUANTIZATION_LIM_RANGE;
 }
 
 /* SRC2 compositing helpers (F-04) */
@@ -1677,11 +1707,15 @@ static int ge2d_hw_start(struct meson_ge2d *ge2d)
 		regmap_write(ge2d->map, GE2D_SRC1_KEY_MASK, ctx->colorkey_mask);
 	}
 
-	/* Fill mode: use constant color instead of source buffer */
-	if (ctx->fillcolor) {
-		reg |= GE2D_SRC1_FILL_MODE;
+	/*
+	 * Solid fill: SRC1 reads SRC1_DEF_COLOR instead of its buffer.  The
+	 * switch is CMD_CTRL SRC1_FILL_COLOR_EN, set at job start below, as
+	 * the BSP fillrect does (fillrect.c:50 src1_fill_color_en = 1).
+	 * GEN_CTRL0 SRC1_FILL_MODE is a different setting -- what SRC1
+	 * reads OUTSIDE its clip window -- and alone it copied SRC1 (N7).
+	 */
+	if (ctx->fillcolor)
 		regmap_write(ge2d->map, GE2D_SRC1_DEF_COLOR, ctx->fillcolor);
-	}
 
 	/* Bitmask: selective per-pixel write control */
 	if (ctx->bitmask) {
@@ -1869,10 +1903,11 @@ static int ge2d_hw_start(struct meson_ge2d *ge2d)
 	 */
 	if (src_yuv && !dst_yuv)
 		ge2d_set_csc_matrix(ge2d, true,
-				    ge2d_is_bt709(&ctx->in.pix_mp));
+				    ge2d_is_bt709(&ctx->in.pix_mp),
+				    ge2d_is_full_range(&ctx->in.pix_mp));
 	else if (!src_yuv && dst_yuv)
 		ge2d_set_csc_matrix(ge2d, false,
-				    ge2d_is_bt709(&ctx->out.pix_mp));
+				    ge2d_is_bt709(&ctx->out.pix_mp), false);
 	else
 		regmap_write(ge2d->map, GE2D_MATRIX_COEF22_CTRL, 0);
 
@@ -1886,38 +1921,39 @@ static int ge2d_hw_start(struct meson_ge2d *ge2d)
 		u32 fmt_ctrl;
 
 		/*
-		 * X_CHR_PHASE: horizontal chroma-formatter phase, chosen by the BSP
-		 * per destination type (ge2d_hw.c:1157-1205, non-reversed): YUV->RGB
-		 * uses 0xc4 (:1167), YUV->YUV uses 0x08 (:1190). The driver hardcoded
-		 * 0xc4 for both -- benign for semi-planar sources (chroma in its own
-		 * plane) but WRONG for PACKED YUYV (chroma interleaved with luma): the
-		 * wrong phase mis-extracts the interleaved lanes so the hw reads YUYV
-		 * [Y,Cb,Y,Cr] as UYVY [Cb,Y,Cr,Y] and black decodes to pure green
-		 * (NV12 Y=128,U=V=16). Use 0x08 for YUV->YUV, 0xc4 for YUV->RGB.
+		 * X_CHR_PHASE 0x08 with the SRC1_X_START_END x-start extra bits
+		 * 0 (below) puts 4:2:2 chroma co-sited: even pixels take their
+		 * sample, odd pixels the mean of the two neighbours.  Measured on
+		 * SM1 (tests/ge2d/ge2d-yuv422-probe.c) for UYVY and NV16 sources
+		 * into both AYUV32 and XRGB32.  The BSP pairs extra bits 2 with
+		 * 0x08 for YUV->YUV and 0xc4 for YUV->RGB (ge2d_hw.c:1157-1205):
+		 * the first lags chroma one 2-pixel group, the second half a
+		 * pixel (status GI-032).
 		 */
 		fmt_ctrl = GE2D_SRC1_HFMT_EN |
-			   FIELD_PREP(GE2D_SRC1_X_CHR_PHASE, dst_yuv ? 0x08 : 0xc4);
+			   FIELD_PREP(GE2D_SRC1_X_CHR_PHASE, 0x08);
 
 		/*
-		 * Multi-plane with vertical subsampling (4:2:0):
-		 * enable vertical chroma upsampling.
-		 * BSP (ge2d_hw.c:1170-1178) sets y_chr_phase to 0xc4
-		 * for YUV->RGB with y_yc_ratio (non-reversed case).
-		 * For YUV->YUV it uses 0x4c (ge2d_hw.c:1194-1202).
+		 * Multi-plane with vertical subsampling (4:2:0): enable vertical
+		 * chroma upsampling.  Y_CHR_PHASE 0xc4, with the SRC1_Y_START_END
+		 * extra bits 2/3 below, sites chroma between its two luma rows
+		 * (MPEG-2): measured on SM1 (tests/ge2d/ge2d-yuv422-probe.c NV12,
+		 * a sweep of extra bits 0..3 x eleven phases) as exactly C-4/C+4
+		 * on a 16-per-row chroma ramp.  The BSP uses 0xc4 for YUV->RGB
+		 * (ge2d_hw.c:1170-1178) but 0x4c for YUV->YUV (:1194-1202),
+		 * which lags chroma one luma row (status GI-033).
 		 */
-		if (src_y_yc_ratio) {
-			u8 y_phase = !dst_yuv ? 0xc4 : 0x4c;
-
+		if (src_y_yc_ratio)
 			fmt_ctrl |= GE2D_SRC1_VFMT_EN |
-				    FIELD_PREP(GE2D_SRC1_Y_CHR_PHASE, y_phase);
-		}
+				    FIELD_PREP(GE2D_SRC1_Y_CHR_PHASE, 0xc4);
 
-		if (ctx->in.crop.width == ctx->out.crop.width &&
-		    ctx->in.crop.height == ctx->out.crop.height) {
-			fmt_ctrl |= GE2D_SRC1_CHFMT_RPT_PIX |
-				    GE2D_SRC1_CVFMT_RPT_PIX;
-		}
-
+		/*
+		 * CHFMT/CVFMT_RPT_PIX stay clear, as the BSP keeps them
+		 * (ge2d_wq.c chfmt_rpt_pix = cvfmt_rpt_pix = 0 on every path).
+		 * Set at unscaled sizes, as this driver did until 2026-10, the
+		 * chroma formatter lagged one 2-pixel group: a UYVY source's
+		 * pixels 2-3 took the Cb/Cr of pixels 0-1.
+		 */
 		regmap_write(ge2d->map, GE2D_SRC1_FMT_CTRL, fmt_ctrl);
 	} else {
 		regmap_write(ge2d->map, GE2D_SRC1_FMT_CTRL, 0);
@@ -1974,30 +2010,43 @@ static int ge2d_hw_start(struct meson_ge2d *ge2d)
 					ctx->in.crop.top + ctx->in.crop.height - 1) |
 		     (src_y_yc_ratio ? (3 << 14) : 0));
 	/*
-	 * SRC1_X_START_END: same crop-window rule. The x_extra_bit_start=2 /
-	 * x_extra_bit_end=3 chroma-addressing bits are set whenever the source
-	 * has horizontal chroma subsampling -- the BSP sets them in BOTH the
-	 * YUV->RGB branch (ge2d_hw.c:1165-1166) AND the YUV->YUV branch
-	 * (:1188-1189) for the non-reversed case. The earlier `!dst_yuv` gate
-	 * (YUV->RGB only) missed the YUV->YUV branch, so for PACKED YUYV->NV12
-	 * the chroma extraction was mis-addressed: the hw read YUYV [Y,Cb,Y,Cr]
-	 * as UYVY [Cb,Y,Cr,Y] and black decoded to pure green. (Benign for
-	 * semi-planar sources, where chroma is in a separate plane.)
+	 * SRC1_X_START_END: same crop-window rule. For a source with
+	 * horizontal chroma subsampling, the x-start extra bits [31:30] stay 0
+	 * and the x-end extra bits [15:14] are 3. With x-start extra 2 (the
+	 * BSP value, ge2d_hw.c:1165-1166 and :1188-1189) chroma lagged (see
+	 * X_CHR_PHASE above); 0 and 1 measured the same, and the end bits had
+	 * no measured effect at 0..3.
 	 */
 	regmap_write(ge2d->map, GE2D_SRC1_X_START_END,
-		     (src_x_yc_ratio ? (2 << 30) : 0) |
 		     FIELD_PREP(GE2D_START, ctx->in.crop.left) |
 		     FIELD_PREP(GE2D_END,
 				ctx->in.crop.left + ctx->in.crop.width - 1) |
 		     (src_x_yc_ratio ? (3 << 14) : 0));
+	/*
+	 * DST_X/Y_START_END is the *write window*: the scaler's output
+	 * starts at its start, so it MUST be the compose rectangle, the
+	 * same rule as SRC1's read window above (the BSP programs it from
+	 * cfg->dst_{x,y}_{start,end}, ge2d_hw.c). As the full frame, with a
+	 * compose origin below 0,0 the scaled image began at row/column 0
+	 * and the DST clip kept only its tail: a 1280x720 frame composed
+	 * at 0,140 640x360 showed source rows 280-719 at the top of the
+	 * rectangle and nothing below. SRC2 (the DST read back, or a
+	 * frame-sized SRC2 buffer) is read over the same window so it
+	 * stays aligned with DST. With the compose origin at 0,0, the
+	 * default, nothing changes.
+	 */
 	regmap_write(ge2d->map, GE2D_SRC2_Y_START_END,
-		     FIELD_PREP(GE2D_END, ctx->out.pix_mp.height - 1));
+		     FIELD_PREP(GE2D_START, ctx->out.crop.top) |
+		     FIELD_PREP(GE2D_END, ctx->out.crop.top + ctx->out.crop.height - 1));
 	regmap_write(ge2d->map, GE2D_SRC2_X_START_END,
-		     FIELD_PREP(GE2D_END, ctx->out.pix_mp.width - 1));
+		     FIELD_PREP(GE2D_START, ctx->out.crop.left) |
+		     FIELD_PREP(GE2D_END, ctx->out.crop.left + ctx->out.crop.width - 1));
 	regmap_write(ge2d->map, GE2D_DST_Y_START_END,
-		     FIELD_PREP(GE2D_END, ctx->out.pix_mp.height - 1));
+		     FIELD_PREP(GE2D_START, ctx->out.crop.top) |
+		     FIELD_PREP(GE2D_END, ctx->out.crop.top + ctx->out.crop.height - 1));
 	regmap_write(ge2d->map, GE2D_DST_X_START_END,
-		     FIELD_PREP(GE2D_END, ctx->out.pix_mp.width - 1));
+		     FIELD_PREP(GE2D_START, ctx->out.crop.left) |
+		     FIELD_PREP(GE2D_END, ctx->out.crop.left + ctx->out.crop.width - 1));
 
 	/* Scaler setup */
 	widthi  = ctx->in.crop.width;
@@ -2271,6 +2320,7 @@ static int ge2d_hw_start(struct meson_ge2d *ge2d)
 		u32 cmd = (ctx->xy_swap ? GE2D_DST_XY_SWAP : 0) |
 			  (ctx->hflip ? GE2D_SRC1_X_REV : 0) |
 			  (ctx->vflip ? GE2D_SRC1_Y_REV : 0) |
+			  (ctx->fillcolor ? GE2D_SRC1_FILL_COLOR_EN : 0) |
 			  GE2D_CBUS_CMD_WR;
 
 		if (ctx->blend_mode) {
@@ -3254,28 +3304,41 @@ static const struct v4l2_ctrl_ops ge2d_ctrl_ops = {
 	.s_ctrl = ge2d_s_ctrl,
 };
 
+/*
+ * The colour key, key mask, fill colour and bitmask are full 32-bit
+ * register values, written as given.  An INTEGER control
+ * stops at 0x7FFFFFFF, which cannot carry alpha 0xFF; a BITMASK control
+ * is the 32-bit unsigned scalar V4L2 offers on G/S_CTRL.
+ */
 static const struct v4l2_ctrl_config ge2d_ctrl_colorkey = {
 	.ops  = &ge2d_ctrl_ops,
 	.id   = V4L2_CID_USER_MESON_GE2D_COLORKEY,
 	.name = "Color Key",
-	.type = V4L2_CTRL_TYPE_INTEGER,
-	.min  = 0, .max = 0x7FFFFFFF, .step = 1, .def = 0,
+	.type = V4L2_CTRL_TYPE_BITMASK,
+	.max  = 0xFFFFFFFF, .def = 0,
 };
 
 static const struct v4l2_ctrl_config ge2d_ctrl_colorkey_mask = {
 	.ops  = &ge2d_ctrl_ops,
 	.id   = V4L2_CID_USER_MESON_GE2D_COLORKEY_MASK,
 	.name = "Color Key Mask",
-	.type = V4L2_CTRL_TYPE_INTEGER,
-	.min  = 0, .max = 0x7FFFFFFF, .step = 1, .def = 0,
+	.type = V4L2_CTRL_TYPE_BITMASK,
+	.max  = 0xFFFFFFFF, .def = 0,
 };
 
+/*
+ * Non-zero fills the destination with this colour instead of reading
+ * SRC1.  The value is 0xRRGGBBAA whatever the formats: SRC1_DEF_COLOR is
+ * consumed after the colour map (measured on SM1 into AR24, AB24 and
+ * BA24), the same order as the SRC2 def_color.  Zero means no fill;
+ * LOGIC_OP CLEAR gives an all-zero output.
+ */
 static const struct v4l2_ctrl_config ge2d_ctrl_fillcolor = {
 	.ops  = &ge2d_ctrl_ops,
 	.id   = V4L2_CID_USER_MESON_GE2D_FILLCOLOR,
 	.name = "Fill Color",
-	.type = V4L2_CTRL_TYPE_INTEGER,
-	.min  = 0, .max = 0x7FFFFFFF, .step = 1, .def = 0,
+	.type = V4L2_CTRL_TYPE_BITMASK,
+	.max  = 0xFFFFFFFF, .def = 0,
 };
 
 static const struct v4l2_ctrl_config ge2d_ctrl_antiflicker = {
@@ -3290,8 +3353,8 @@ static const struct v4l2_ctrl_config ge2d_ctrl_bitmask = {
 	.ops  = &ge2d_ctrl_ops,
 	.id   = V4L2_CID_USER_MESON_GE2D_BITMASK,
 	.name = "Destination Bitmask",
-	.type = V4L2_CTRL_TYPE_INTEGER,
-	.min  = 0, .max = 0x7FFFFFFF, .step = 1, .def = 0,
+	.type = V4L2_CTRL_TYPE_BITMASK,
+	.max  = 0xFFFFFFFF, .def = 0,
 };
 
 static const struct v4l2_ctrl_config ge2d_ctrl_scale_filter = {
@@ -3819,9 +3882,11 @@ static const struct {
 				 32, false, false },
 	[GE2D_FMT_ARGB8888] = { GE2D_FORMAT_32BIT, GE2D_COLOR_MAP_ARGB8888,
 				 32, false, true },
-	[GE2D_FMT_RGB888]   = { GE2D_FORMAT_24BIT, GE2D_COLOR_MAP_BGR888,
+	/* DRM RGB888 = memory {B,G,R}: hw map RGB888 (V4L2 BGR24 uses it) */
+	[GE2D_FMT_RGB888]   = { GE2D_FORMAT_24BIT, GE2D_COLOR_MAP_RGB888,
 				 24, false, false },
-	[GE2D_FMT_YUYV]     = { GE2D_FORMAT_16BIT, GE2D_COLOR_MAP_YUV422,
+	/* hw map 0 = memory {Cb,Y0,Cr,Y1}, see the V4L2 UYVY entry */
+	[GE2D_FMT_UYVY]     = { GE2D_FORMAT_16BIT, GE2D_COLOR_MAP_YUV422,
 				 16, true, false },
 	[GE2D_FMT_NV12]     = { GE2D_FORMAT_24BIT, GE2D_COLOR_MAP_NV12,
 				 8, true, false },
@@ -4064,30 +4129,22 @@ static void ge2d_kapi_hw_start(struct meson_ge2d *ge2d,
 
 	/* CSC -- kapi always uses BT.601 (no colorspace in job struct) */
 	if (src_yuv && !dst_yuv)
-		ge2d_set_csc_matrix(ge2d, true, false);
+		ge2d_set_csc_matrix(ge2d, true, false, false);
 	else if (!src_yuv && dst_yuv)
-		ge2d_set_csc_matrix(ge2d, false, false);
+		ge2d_set_csc_matrix(ge2d, false, false, false);
 	else
 		regmap_write(ge2d->map, GE2D_MATRIX_COEF22_CTRL, 0);
 
 	/* Chroma formatter: only for sources with chroma subsampling */
 	if (src_x_yc_ratio) {
+		/* co-sited horizontal chroma, as the V4L2 path (GI-032) */
 		u32 fmt_ctrl = GE2D_SRC1_HFMT_EN |
-			       FIELD_PREP(GE2D_SRC1_X_CHR_PHASE, 0xc4) |
-			       GE2D_SRC1_CHFMT_RPT_PIX |
-			       GE2D_SRC1_CVFMT_RPT_PIX;
+			       FIELD_PREP(GE2D_SRC1_X_CHR_PHASE, 0x08);
 
-		/*
-		 * NV12/NV21 sources have vertical chroma subsampling.
-		 * BSP (ge2d_hw.c:1170-1178) sets y_chr_phase to 0xc4
-		 * for YUV->RGB, 0x4c for YUV->YUV.
-		 */
-		if (src_nv) {
-			u8 y_phase = !dst_yuv ? 0xc4 : 0x4c;
-
+		/* NV12/NV21: vertical chroma sited as the V4L2 path (GI-033) */
+		if (src_nv)
 			fmt_ctrl |= GE2D_SRC1_VFMT_EN |
-				    FIELD_PREP(GE2D_SRC1_Y_CHR_PHASE, y_phase);
-		}
+				    FIELD_PREP(GE2D_SRC1_Y_CHR_PHASE, 0xc4);
 
 		regmap_write(ge2d->map, GE2D_SRC1_FMT_CTRL, fmt_ctrl);
 	} else {
@@ -4117,7 +4174,6 @@ static void ge2d_kapi_hw_start(struct meson_ge2d *ge2d,
 				src_nv ? job->src_h : job->src_h - 1) |
 		     (src_nv ? (3 << 14) : 0));
 	regmap_write(ge2d->map, GE2D_SRC1_X_START_END,
-		     (src_x_yc_ratio && !dst_yuv ? (2 << 30) : 0) |
 		     FIELD_PREP(GE2D_END, job->src_w - 1) |
 		     (src_x_yc_ratio && !dst_yuv ? (3 << 14) : 0));
 	regmap_write(ge2d->map, GE2D_SRC2_Y_START_END,

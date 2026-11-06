@@ -786,7 +786,13 @@ static const int rk3368_vop_intrs[] = {
 	LINE_FLAG_INTR,
 	0,
 	BUS_ERROR_INTR,
-	0, 0, 0, 0, 0, 0, 0,
+	WIN0_EMPTY_INTR,
+	WIN1_EMPTY_INTR,
+	WIN2_EMPTY_INTR,
+	WIN3_EMPTY_INTR,
+	HWC_EMPTY_INTR,
+	POST_BUF_EMPTY_INTR,
+	0,
 	DSP_HOLD_VALID_INTR,
 };
 
@@ -890,6 +896,7 @@ static const struct vop_intr rk3366_vop_intr = {
 	.status = VOP_REG_MASK_SYNC(RK3366_INTR_STATUS0, 0xffff, 0),
 	.enable = VOP_REG_MASK_SYNC(RK3366_INTR_EN0, 0xffff, 0),
 	.clear = VOP_REG_MASK_SYNC(RK3366_INTR_CLEAR0, 0xffff, 0),
+	.raw_status = VOP_REG(RK3366_INTR_RAW_STATUS0, 0xffff, 0),
 };
 
 static const struct vop_data rk3366_vop = {
@@ -1155,6 +1162,7 @@ static const struct vop_intr rk3328_vop_intr = {
 	.status = VOP_REG_MASK_SYNC(RK3328_INTR_STATUS0, 0xffff, 0),
 	.enable = VOP_REG_MASK_SYNC(RK3328_INTR_EN0, 0xffff, 0),
 	.clear = VOP_REG_MASK_SYNC(RK3328_INTR_CLEAR0, 0xffff, 0),
+	.raw_status = VOP_REG(RK3328_INTR_RAW_STATUS0, 0xffff, 0),
 };
 
 static const struct vop_win_data rk3328_vop_win_data[] = {

@@ -63,6 +63,18 @@ static bool h264_drain_halt = true;
 module_param(h264_drain_halt, bool, 0644);
 MODULE_PARM_DESC(h264_drain_halt, "H.264: halt the firmware at drain completion: 1=on (default), 0=off");
 
+/*
+ * KI-179: on GXL the firmware can lose an SPS and PPS that arrive as their own
+ * OUTPUT buffers, as Android codec2 sends them.  It then discards every slice
+ * and never raises source change: 8 of 20 sessions, against 0 of 20 with the
+ * same slices and the headers also in the first sample.  1 = keep such headers
+ * and put them in front of the first slice buffer (default), 0 = leave the
+ * stream alone, kept for A/B runs.
+ */
+static bool h264_hdr_resend = true;
+module_param(h264_hdr_resend, bool, 0644);
+MODULE_PARM_DESC(h264_hdr_resend, "H.264 GXL: repeat out-of-band SPS/PPS before the first slice: 1=on (default), 0=off");
+
 #include "vdec_helpers.h"
 #include "vdec_debugfs.h"
 #include "dos_regs.h"
@@ -70,6 +82,11 @@ MODULE_PARM_DESC(h264_drain_halt, "H.264: halt the firmware at drain completion:
 #include "codec_h264.h"
 #include "vdec_hevc.h"
 #include "vdec_1.h"
+
+/* KI-179: largest SPS+PPS kept; a larger set is left to the firmware alone */
+#define H264_HDR_CACHE_SIZE	256
+/* Plane space left for the esparser's padding and search pattern */
+#define H264_HDR_PLANE_MARGIN	SZ_8K
 
 #define SIZE_EXT_FW	(20 * SZ_1K)
 #define SIZE_WORKSPACE	0x1ee000
@@ -380,6 +397,11 @@ struct codec_h264 {
 	u32 sps_mb_width;	/* pic_width_in_mbs_minus1 + 1 */
 	u32 sps_mb_height;	/* (pic_height_in_map_units_minus1 + 1) * 2 if !frame_mbs_only */
 	u8  sps_level_idc;	/* level_idc from SPS; 0 if not yet parsed */
+
+	/* KI-179: SPS/PPS seen as their own buffers, for the first slice */
+	u8  hdr_cache[H264_HDR_CACHE_SIZE];
+	u32 hdr_cache_len;
+	bool hdr_cache_done;	/* the first slice buffer has gone by */
 };
 
 /*
@@ -1830,6 +1852,98 @@ static bool codec_h264_skip_non_idr(const u8 *data, u32 size)
 	return has_vcl;
 }
 
+/**
+ * codec_h264_scan_nals() - report which NAL types an Annex B buffer holds.
+ * @data: buffer
+ * @size: bytes in @data
+ * @has_sps: set when the buffer holds an SPS
+ * @has_slice: set when the buffer holds a coded slice (NAL type 1 or 5)
+ */
+static void codec_h264_scan_nals(const u8 *data, u32 size, bool *has_sps,
+				 bool *has_slice)
+{
+	u32 i;
+
+	*has_sps = false;
+	*has_slice = false;
+
+	for (i = 0; i + 3 < size; i++) {
+		u8 nal_type;
+
+		if (data[i] || data[i + 1] || data[i + 2] != 0x01)
+			continue;
+
+		nal_type = data[i + 3] & 0x1f;
+		if (nal_type == 7)
+			*has_sps = true;
+		else if (nal_type == 1 || nal_type == 5)
+			*has_slice = true;
+
+		if (*has_slice)
+			return;
+	}
+}
+
+/**
+ * codec_h264_resend_headers() - KI-179 workaround, GXL only.
+ * @sess: session
+ * @vb: OUTPUT buffer about to reach the esparser
+ *
+ * A buffer of headers alone is kept and still fed as usual.  The first buffer
+ * with a slice gets the kept headers in front of it, unless it carries its own
+ * SPS, so the firmware sees them next to the slice data.  The plane holds the
+ * esparser's padding too, so this is one memmove per session.
+ *
+ * Return: the new payload size.
+ */
+static u32 codec_h264_resend_headers(struct amvdec_session *sess,
+				     struct vb2_buffer *vb)
+{
+	struct amvdec_core *core = sess->core;
+	struct codec_h264 *h264 = sess->priv;
+	u8 *data = vb2_plane_vaddr(vb, 0);
+	u32 size = vb2_get_plane_payload(vb, 0);
+	bool has_sps, has_slice;
+
+	if (!h264_hdr_resend || !data || !size || !h264 ||
+	    core->platform->revision != VDEC_REVISION_GXL ||
+	    h264->hdr_cache_done)
+		return size;
+
+	codec_h264_scan_nals(data, size, &has_sps, &has_slice);
+
+	if (!has_slice) {
+		if (has_sps || h264->hdr_cache_len) {
+			if (h264->hdr_cache_len + size <= sizeof(h264->hdr_cache)) {
+				memcpy(h264->hdr_cache + h264->hdr_cache_len,
+				       data, size);
+				h264->hdr_cache_len += size;
+			} else {
+				h264->hdr_cache_done = true;
+			}
+		}
+		return size;
+	}
+
+	h264->hdr_cache_done = true;
+
+	if (has_sps || !h264->hdr_cache_len ||
+	    size + h264->hdr_cache_len + H264_HDR_PLANE_MARGIN >
+	    vb2_plane_size(vb, 0))
+		return size;
+
+	memmove(data + h264->hdr_cache_len, data, size);
+	memcpy(data, h264->hdr_cache, h264->hdr_cache_len);
+	size += h264->hdr_cache_len;
+	vb2_set_plane_payload(vb, 0, size);
+
+	dev_warn(core->dev,
+		 "H.264 KI-179: firmware workaround: %u bytes of SPS/PPS repeated before the first slice\n",
+		 h264->hdr_cache_len);
+
+	return size;
+}
+
 static int codec_h264_pre_queue(struct amvdec_session *sess,
 				struct vb2_buffer *vb)
 {
@@ -1862,7 +1976,7 @@ static int codec_h264_pre_queue(struct amvdec_session *sess,
 	if (!data)
 		return 0;
 
-	size = vb2_get_plane_payload(vb, 0);
+	size = codec_h264_resend_headers(sess, vb);
 
 	/*
 	 * SPS profile and dimension scan.

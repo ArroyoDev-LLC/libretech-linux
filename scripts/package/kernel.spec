@@ -3,7 +3,10 @@
 %{!?make: %define make make}
 %define makeflags %{?_smp_mflags} ARCH=%{ARCH}
 
-Name: kernel
+# lc_pkgname (rpmbuild --define): a distribution kernel's own name, e.g. kernel-lc-lts. Our kernel then
+# installs beside the distribution's `kernel` instead of replacing it, dnf keeps several (installonlypkg),
+# and the glibc `kernel-headers` sub-package is not built (it would replace the distribution's).
+Name: %{?lc_pkgname}%{!?lc_pkgname:kernel}
 Summary: The Linux Kernel
 Version: %(echo %{KERNELRELEASE} | sed -e 's/-/_/g')
 Release: %{pkg_release}
@@ -15,6 +18,9 @@ Source0: linux.tar.gz
 Source1: config
 Source2: diff.patch
 Provides: kernel-%{KERNELRELEASE}
+%if %{defined lc_pkgname}
+Provides: installonlypkg(kernel)
+%endif
 BuildRequires: bc binutils bison dwarves
 BuildRequires: (elfutils-devel or libdw-devel)
 BuildRequires: (elfutils-libelf-devel or libelf-devel) flex
@@ -23,6 +29,7 @@ BuildRequires: gcc make openssl openssl-devel perl python3 rsync
 %description
 The Linux Kernel, the operating system core itself
 
+%if %{undefined lc_pkgname}
 %package headers
 Summary: Header files for the Linux kernel for use by glibc
 Group: Development/System
@@ -34,13 +41,14 @@ between the Linux kernel and userspace libraries and programs.  The
 header files define structures and constants that are needed for
 building most standard programs and are also needed for rebuilding the
 glibc package.
+%endif
 
 %if %{with_devel}
 %package devel
 Summary: Development package for building kernel modules to match the %{version} kernel
 Group: System Environment/Kernel
 AutoReqProv: no
-%description -n kernel-devel
+%description devel
 This package provides kernel headers and makefiles sufficient to build modules
 against the %{version} kernel package.
 %endif
@@ -102,7 +110,9 @@ mkdir -p %{buildroot}/lib/modules/%{KERNELRELEASE}
 cp $(%{make} %{makeflags} -s image_name) %{buildroot}/lib/modules/%{KERNELRELEASE}/vmlinuz
 # DEPMOD=true makes depmod no-op. We do not package depmod-generated files.
 %{make} %{makeflags} INSTALL_MOD_PATH=%{buildroot} %{?install_mod_strip:INSTALL_MOD_STRIP=1} DEPMOD=true modules_install
+%if %{undefined lc_pkgname}
 %{make} %{makeflags} INSTALL_HDR_PATH=%{buildroot}/usr headers_install
+%endif
 cp System.map %{buildroot}/lib/modules/%{KERNELRELEASE}
 cp .config %{buildroot}/lib/modules/%{KERNELRELEASE}/config
 if %{make} %{makeflags} run-command KBUILD_RUN_COMMAND='test -d ${srctree}/arch/${SRCARCH}/boot/dts' 2>/dev/null; then
@@ -197,9 +207,11 @@ fi
 %defattr (-, root, root)
 %exclude /kernel.list
 
+%if %{undefined lc_pkgname}
 %files headers
 %defattr (-, root, root)
 /usr/include
+%endif
 
 %if %{with_devel}
 %files devel

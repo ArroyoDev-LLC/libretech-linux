@@ -68,6 +68,8 @@ struct gna_device {
 	struct semaphore hw_sem;
 	/* the directly started request the interrupt will complete, under direct_lock */
 	struct gna_request *direct_req;
+	/* the queued request the worker has on the hardware, whose interrupt wakes it; under direct_lock */
+	struct gna_request *queued_req;
 	spinlock_t direct_lock;
 	struct wait_queue_head dev_busy_waitq;
 
@@ -75,7 +77,8 @@ struct gna_device {
 	/* protects request_list */
 	struct mutex reqlist_lock;
 	struct workqueue_struct *request_wq;
-	atomic_t request_count;
+	/* request ids: 64 bits, so an id is never reused (the UAPI id is a u64) */
+	atomic64_t request_count;
 
 	/* requests that are in queue to be run +1 for currently processed one */
 	atomic_t enqueued_requests;

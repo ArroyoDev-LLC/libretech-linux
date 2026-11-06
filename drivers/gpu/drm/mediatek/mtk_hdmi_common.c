@@ -437,6 +437,15 @@ struct mtk_hdmi *mtk_hdmi_common_probe(struct platform_device *pdev)
 	    ver_conf->bridge_funcs->hdmi_clear_infoframe)
 		hdmi->bridge.ops |= DRM_BRIDGE_OP_HDMI;
 
+	/*
+	 * Without an MT8173-style CEC module, a standalone CEC controller
+	 * (MT8188) learns the sink's physical address through the CEC notifier.
+	 */
+	if (!hdmi->cec_dev && IS_ENABLED(CONFIG_DRM_DISPLAY_HDMI_CEC_NOTIFIER_HELPER)) {
+		hdmi->bridge.ops |= DRM_BRIDGE_OP_HDMI_CEC_NOTIFIER;
+		hdmi->bridge.hdmi_cec_dev = dev;
+	}
+
 	hdmi->bridge.type = DRM_MODE_CONNECTOR_HDMIA;
 	hdmi->bridge.ddc = hdmi->ddc_adpt;
 	hdmi->bridge.vendor = "MediaTek";

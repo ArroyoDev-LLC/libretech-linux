@@ -151,11 +151,13 @@ snap-pkg:
 
 PHONY += pacman-pkg
 pacman-pkg:
-	@ln -srf $(srctree)/scripts/package/PKGBUILD $(objtree)/PKGBUILD
-	+BUILDDIR="$(realpath $(objtree))/pacman" \
+	@ln -srf $(srctree)/scripts/package/PKGBUILD $(or $(PACMAN_STARTDIR),$(objtree))/PKGBUILD
+	+cd $(or $(PACMAN_STARTDIR),$(objtree)) && \
+		BUILDDIR="$(or $(PACMAN_BUILDDIR),$(realpath $(objtree))/pacman)" \
 		CARCH="$(UTS_MACHINE)" \
+		KBUILD_OBJTREE="$(realpath $(objtree))" \
 		KBUILD_MAKEFLAGS="$(MAKEFLAGS)" \
-		KBUILD_REVISION="$(shell $(srctree)/scripts/build-version)" \
+		KBUILD_REVISION="$(or $(KPACMAN_PKGREL),$(shell $(srctree)/scripts/build-version))" \
 		makepkg $(MAKEPKGOPTS)
 
 # dir-pkg tar*-pkg - tarball targets

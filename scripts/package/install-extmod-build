@@ -72,4 +72,7 @@ if [ "${CC}" != "${HOSTCC}" ]; then
 	rm -f "${destdir}/scripts/Kbuild"
 fi
 
-find "${destdir}" \( -name '.*.cmd' -o -name '*.o' \) -delete
+# Generated assembly (scripts/mod/devicetable-offsets.s) is an intermediate like the
+# objects: nothing builds from it once modpost exists, and its -fverbose-asm comments
+# carry the build machine's absolute source paths.
+find "${destdir}" \( -name '.*.cmd' -o -name '*.o' -o -name '*.s' \) -delete

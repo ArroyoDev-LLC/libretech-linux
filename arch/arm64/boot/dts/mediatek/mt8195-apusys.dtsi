@@ -53,15 +53,12 @@
 
 	apusys_reviser@19021000 {
 		compatible = "mediatek, rv-reviser";
-		#address-cells = <2>;
-		#size-cells = <2>;
 		reg = <0 0x19021000 0 0x1000>,		/* apu_sctrl_reviser */
 		      <0 0x1d800000 0 0x400000>,	/* VLM */
 		      <0 0x1d000000 0 0x100000>,	/* TCM */
 		      <0 0x19001000 0 0x1000>;		/* apusys int */
 		interrupts = <GIC_SPI 439 IRQ_TYPE_LEVEL_HIGH 0>;
 		default-dram = <0x1 0x01 0x88000000>;
-		dma-ranges = <0x0 0x0 0x0 0x40000000 0x1 0x0>;
 		boundary = <0x0>;
 		iommus = <&iommu_apu0 0x340>;		/* IOMMU_PORT_APU_DATA */
 	};
@@ -83,14 +80,6 @@
 
 	vpu_core0: vpu_core0@19030000 {
 		compatible = "mediatek,mt8195-vpu_core0";
-		/*
-		 * #address-cells / #size-cells REQUIRED on every dma-ranges
-		 * node: 6.18's of_dma_get_max_cpu_address() (bootmem_init)
-		 * reads the node's own cell counts; missing them NULL-derefs +
-		 * panics. Same fix mt8188-apusys.dtsi carries.
-		 */
-		#address-cells = <2>;
-		#size-cells = <2>;
 		reg = <0 0x19030000 0 0x1000>,
 		      <0 0x1d400000 0 0x40000>,
 		      <0 0x1d440000 0 0x30000>,
@@ -102,7 +91,6 @@
 		kernel-lib = <0x7de00000 0x00500000 0xffffffff>;
 		work-buf = <0x0 0x12000 0xffffffff>;
 		iommus = <&iommu_apu0 0x343>;		/* IOMMU_PORT_APU_VPU */
-		dma-ranges = <0x0 0x20000000 0x0 0x40000000 0x0 0xe0000000>;
 		#cooling-cells = <2>;
 		memory-region = <&vpu_mem>;
 
@@ -118,8 +106,6 @@
 
 	vpu_core1: vpu_core1@19031000 {
 		compatible = "mediatek,mt8195-vpu_core1";
-		#address-cells = <2>;
-		#size-cells = <2>;
 		reg = <0 0x19031000 0 0x1000>,
 		      <0 0x1d500000 0 0x40000>,
 		      <0 0x1d540000 0 0x30000>,
@@ -130,7 +116,6 @@
 		main-prog = <0x7e400000 0x00300000 0x500000>;
 		kernel-lib = <0x7e700000 0x00500000 0xffffffff>;
 		work-buf = <0x0 0x12000 0xffffffff>;
-		dma-ranges = <0x0 0x20000000 0x0 0x40000000 0x0 0xe0000000>;
 		iommus = <&iommu_apu1 0x343>;		/* IOMMU_PORT_APU_VPU */
 		#cooling-cells = <2>;
 		memory-region = <&vpu_mem>;
@@ -148,11 +133,8 @@
 
 	mtk_mdla: mtk_mdla {
 		compatible = "mediatek, mdla-rv";
-		#address-cells = <2>;
-		#size-cells = <2>;
 		core_num = <2>;
 		version = <0x81950200>;
-		dma-ranges = <0x0 0x0 0x0 0x40000000 0x1 0x0>;
 		iommus = <&iommu_apu0 0x340>;		/* IOMMU_PORT_APU_DATA */
 		status = "okay";
 	};
@@ -270,18 +252,13 @@
 
 	apusys_sw_logger: apusys_sw_logger {
 		compatible = "mediatek,apusys_sw_logger";
-		#address-cells = <2>;
-		#size-cells = <2>;
 		reg = <0 0x19000000 0 0x1000>;
 		reg-names = "apu_mbox";
-		dma-ranges = <0x0 0x0 0x0 0x40000000 0x1 0x0>;
 		iommus = <&iommu_apu1 0x360>;		/* apu_iommu1 DATA */
 	};
 
 	apusys_rv: apusys_rv@19001000 {
 		compatible = "mediatek,mt8195-apusys_rv";
-		#address-cells = <2>;
-		#size-cells = <2>;
 		memory-region = <&apu_mem>;
 		reg = <0 0x19000000 0 0x1000>,
 		      <0 0x19001000 0 0x1000>,
@@ -305,7 +282,6 @@
 		apu_iommu0 = <&iommu_apu0>;
 		apu_iommu1 = <&iommu_apu1>;
 
-		dma-ranges = <0x0 0x0 0x0 0x40000000 0x1 0x0>;
 		iommus = <&iommu_apu0 0x340>;		/* IOMMU_PORT_APU_DATA */
 
 		interrupts = <GIC_SPI 425 IRQ_TYPE_LEVEL_HIGH 0>,
@@ -366,21 +342,15 @@
 
 	mtk_apu_mem_code: mtk_apu_mem_code {
 		compatible = "mediatek, apu_mem_code";
-		#address-cells = <2>;
-		#size-cells = <2>;
 		type = <1>;
 		mask = /bits/ 64 <0x00000003ffffffff>;
-		dma-ranges = <0x0 0x0 0x0 0x40000000 0x1 0x0>;
 		iommus = <&iommu_apu0 0x340>;		/* IOMMU_PORT_APU_DATA */
 	};
 
 	mtk_apu_mem_data: mtk_apu_mem_data {
 		compatible = "mediatek, apu_mem_data";
-		#address-cells = <2>;
-		#size-cells = <2>;
 		type = <2>;
 		mask = /bits/ 64 <0x00000003ffffffff>;
-		dma-ranges = <0x0 0x8000000 0x0 0x40000000 0x0 0x8000000>;
 		iommus = <&iommu_apu0 0x341>;		/* IOMMU_PORT_APU_VLM */
 	};
 

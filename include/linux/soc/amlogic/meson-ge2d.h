@@ -11,12 +11,12 @@
 struct device;
 struct meson_ge2d_dev;
 
-/* Pixel formats for GE2D kernel API */
+/* Pixel formats for GE2D kernel API, named and laid out as the DRM fourccs */
 enum meson_ge2d_fmt {
-	GE2D_FMT_XRGB8888,	/* [X][R][G][B] in memory (LE) */
-	GE2D_FMT_ARGB8888,
-	GE2D_FMT_RGB888,
-	GE2D_FMT_YUYV,		/* Packed YUV422 */
+	GE2D_FMT_XRGB8888,	/* memory {B,G,R,X} */
+	GE2D_FMT_ARGB8888,	/* memory {B,G,R,A} */
+	GE2D_FMT_RGB888,	/* memory {B,G,R} */
+	GE2D_FMT_UYVY,		/* packed YUV422, memory {Cb,Y0,Cr,Y1} */
 	GE2D_FMT_NV12,		/* Semi-planar YUV420: Y + UV */
 	GE2D_FMT_NV21,		/* Semi-planar YUV420: Y + VU */
 };

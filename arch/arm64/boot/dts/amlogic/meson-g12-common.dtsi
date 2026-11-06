@@ -2574,6 +2574,17 @@
 					type = "passive";
 				};
 
+				/*
+				 * The media cooling devices' trip: passive, because
+				 * no governor drives a device bound to a "hot" trip
+				 * (step_wise skips hot and critical trips).
+				 */
+				cpu_media: cpu-media {
+					temperature = <95000>; /* millicelsius */
+					hysteresis = <2000>; /* millicelsius */
+					type = "passive";
+				};
+
 				cpu_hot: cpu-hot {
 					temperature = <95000>; /* millicelsius */
 					hysteresis = <2000>; /* millicelsius */
@@ -2589,12 +2600,12 @@
 
 			cooling-maps {
 				map_vdec {
-					trip = <&cpu_hot>;
+					trip = <&cpu_media>;
 					cooling-device = <&vdec THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 
 				map_ge2d {
-					trip = <&cpu_hot>;
+					trip = <&cpu_media>;
 					cooling-device = <&ge2d THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};

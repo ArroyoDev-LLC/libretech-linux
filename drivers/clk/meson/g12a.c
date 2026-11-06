@@ -3006,10 +3006,11 @@ static struct clk_regmap g12a_vdec_hcodec_sel = {
 	},
 	.hw.init = &(struct clk_init_data){
 		.name = "vdec_hcodec_sel",
-		.ops = &clk_regmap_mux_ops,
+		.ops = &clk_regmap_mux_retune_ops,
 		.parent_hws = g12a_vdec_parents,
 		.num_parents = ARRAY_SIZE(g12a_vdec_parents),
-		.flags = 0,
+		/* the encoder's levels above 800 MHz are made by a HiFi / GP0 PLL */
+		.flags = CLK_SET_RATE_PARENT,
 	},
 };
 
@@ -3022,7 +3023,7 @@ static struct clk_regmap g12a_vdec_hcodec_div = {
 	},
 	.hw.init = &(struct clk_init_data){
 		.name = "vdec_hcodec_div",
-		.ops = &clk_regmap_divider_ops,
+		.ops = &clk_regmap_divider_retune_ops,
 		.parent_hws = (const struct clk_hw *[]) {
 			&g12a_vdec_hcodec_sel.hw
 		},
@@ -4535,9 +4536,11 @@ static struct clk_regmap sm1_nna_axi_clk_sel = {
 	},
 	.hw.init = &(struct clk_init_data){
 		.name = "nna_axi_clk_sel",
-		.ops = &clk_regmap_mux_ops,
+		.ops = &clk_regmap_mux_retune_ops,
 		.parent_data = sm1_nna_clk_parents,
 		.num_parents = ARRAY_SIZE(sm1_nna_clk_parents),
+		/* a rate above the fixed dividers is made by a GP0 / HiFi PLL */
+		.flags = CLK_SET_RATE_PARENT,
 	},
 };
 
@@ -4549,7 +4552,7 @@ static struct clk_regmap sm1_nna_axi_clk_div = {
 	},
 	.hw.init = &(struct clk_init_data){
 		.name = "nna_axi_clk_div",
-		.ops = &clk_regmap_divider_ops,
+		.ops = &clk_regmap_divider_retune_ops,
 		.parent_hws = (const struct clk_hw *[]) {
 			&sm1_nna_axi_clk_sel.hw
 		},
@@ -4582,9 +4585,11 @@ static struct clk_regmap sm1_nna_core_clk_sel = {
 	},
 	.hw.init = &(struct clk_init_data){
 		.name = "nna_core_clk_sel",
-		.ops = &clk_regmap_mux_ops,
+		.ops = &clk_regmap_mux_retune_ops,
 		.parent_data = sm1_nna_clk_parents,
 		.num_parents = ARRAY_SIZE(sm1_nna_clk_parents),
+		/* a rate above the fixed dividers is made by a GP0 / HiFi PLL */
+		.flags = CLK_SET_RATE_PARENT,
 	},
 };
 
@@ -4596,7 +4601,7 @@ static struct clk_regmap sm1_nna_core_clk_div = {
 	},
 	.hw.init = &(struct clk_init_data){
 		.name = "nna_core_clk_div",
-		.ops = &clk_regmap_divider_ops,
+		.ops = &clk_regmap_divider_retune_ops,
 		.parent_hws = (const struct clk_hw *[]) {
 			&sm1_nna_core_clk_sel.hw
 		},

@@ -158,6 +158,8 @@ static DEFINE_NOIRQ_DEV_PM_OPS(meson_dmc_port_priority_pm_ops, NULL,
 
 static const struct of_device_id meson_dmc_port_priority_of_match[] = {
 	{ .compatible = "amlogic,g12b-dmc-port-priority" },
+	/* same window and field; port 16 carries the OSD scanout on SM1 too */
+	{ .compatible = "amlogic,sm1-dmc-port-priority" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, meson_dmc_port_priority_of_match);

@@ -704,9 +704,20 @@ static int mt8183_afe_runtime_suspend(struct device *dev)
 	regmap_update_bits(afe->regmap, AFE_IRQ_MCU_CLR, 0xffff, 0xffff);
 	regmap_update_bits(afe->regmap, AFE_IRQ_MCU_CLR, 0xffff, 0xffff);
 
+	/*
+	 * The audiosys clock gates (AUDIO_TOP_CON0/1) are written through this
+	 * same syscon regmap, and those registers are volatile: a gate update
+	 * made while the regmap is cache-only fails with -EBUSY, which the clk
+	 * gate ops do not report. So gate the clocks while the regmap still
+	 * reaches the hardware, and only then go cache-only.
+	 */
+	ret = mt8183_afe_disable_clock(afe);
+
 	/* cache only */
 	regcache_cache_only(afe->regmap, true);
 	regcache_mark_dirty(afe->regmap);
+
+	return ret;
 
 skip_regmap:
 	return mt8183_afe_disable_clock(afe);
@@ -716,31 +727,33 @@ static int mt8183_afe_runtime_resume(struct device *dev)
 {
 	struct mtk_base_afe *afe = dev_get_drvdata(dev);
 	struct mt8183_afe_private *afe_priv = afe->platform_priv;
+	bool reg_ctl = afe->regmap && !afe_priv->pm_runtime_bypass_reg_ctl;
 	int ret;
 
-	ret = mt8183_afe_enable_clock(afe);
-	if (ret)
-		return ret;
+	/*
+	 * Leave cache-only before the clocks are enabled: the aud_afe and
+	 * aud_i2s*_bclk_sw gates are bits of AUDIO_TOP_CON0/1 in this regmap,
+	 * and an enable issued while it is cache-only is dropped (-EBUSY on a
+	 * volatile register) while the clk framework counts the clock as on.
+	 * The I2S bit clocks then never reach the pads, so no I2S codec or
+	 * amplifier is clocked. Nothing touches the hardware between here and
+	 * mt8183_afe_enable_clock(), which turns the bus clocks on before it
+	 * writes any audiosys gate.
+	 */
+	if (reg_ctl)
+		regcache_cache_only(afe->regmap, false);
 
-	if (!afe->regmap || afe_priv->pm_runtime_bypass_reg_ctl)
+	ret = mt8183_afe_enable_clock(afe);
+	if (ret) {
+		if (reg_ctl)
+			regcache_cache_only(afe->regmap, true);
+		return ret;
+	}
+
+	if (!reg_ctl)
 		goto skip_regmap;
 
-	regcache_cache_only(afe->regmap, false);
 	regcache_sync(afe->regmap);
-
-	/*
-	 * regcache_sync() above writes back the AUDIO_TOP_CON0 value cached
-	 * while the AFE was runtime-suspended, in which the aud_afe gate
-	 * (CON0 bit 2 -- an active-low power-down bit owned by the audiosys
-	 * clock driver) reads as powered down. That clobbers the gate that
-	 * mt8183_afe_enable_clock() just enabled, leaving the AFE DMA engine
-	 * unclocked: the memif cursor never advances, no period IRQ fires, and
-	 * the first write returns -EIO. Re-clear the aud_afe power-down bit so
-	 * the engine clock the clk framework already reference-counted actually
-	 * runs. (DAPM clock supplies such as aud_dac are enabled per-stream
-	 * after this point, so they are not affected by the stale sync.)
-	 */
-	regmap_update_bits(afe->regmap, AUDIO_TOP_CON0, 0x1 << 2, 0);
 
 	/* enable audio sys DCM for power saving */
 	regmap_update_bits(afe->regmap, AUDIO_TOP_CON0, 0x1 << 29, 0x1 << 29);

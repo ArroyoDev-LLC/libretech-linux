@@ -48,8 +48,10 @@
 
 	/*
 	 * SCMI (ARM DEN 0056), served by the Libre Computer BL31 from the
-	 * SoC's Cortex-M0 and reached by SMC 0x82000010 (RK_SIP_SCMI_AGENT0),
-	 * the id every other Rockchip SoC upstream uses for arm,scmi-smc.
+	 * SoC's Cortex-M0. Linux reaches it over the mailbox transport:
+	 * the message sits in scmi_shmem and mbox1 channel 0 is the
+	 * doorbell (A2B request, B2A completion). SMC 0x82000010
+	 * (RK_SIP_SCMI_AGENT0) serves U-Boot and BL31 only.
 	 * The server is board firmware, not silicon, so the agent lives in
 	 * the board dtsi rather than rk3399.dtsi. Every consumer stays on
 	 * &cru; the protocols are the ten read-mostly clocks and four reset
@@ -434,6 +436,17 @@
 	cpu-supply = <&vdd_cpu_b>;
 };
 
+/*
+ * Over-temperature ends in power-off on this board. The kernel's critical
+ * trip powers it off in order; at the SoC default of 95 C the TSADC's
+ * hardware shutdown (also 95 C, sampled every 2.5 ms) resets the SoC first,
+ * so the trip is set 5 C below it. The hardware shutdown stays as the
+ * backstop, and the boot after it powers off too.
+ */
+&cpu_crit {
+	temperature = <90000>;
+};
+
 &dfi {
 	status = "okay";
 };
@@ -521,6 +534,11 @@
 	status = "okay";
 };
 
+/* below the hardware shutdown, as &cpu_crit */
+&gpu_crit {
+	temperature = <90000>;
+};
+
 &hdmi {
 	avdd-0v9-supply = <&vcca0v9_hdmi>;
 	avdd-1v8-supply = <&vcca1v8_hdmi>;
@@ -573,8 +591,14 @@
 				regulator-min-microvolt = <750000>;
 				regulator-max-microvolt = <1350000>;
 				regulator-ramp-delay = <6001>;
+				/*
+				 * Kept on in suspend: the BL31 sleep mode keeps the
+				 * center domain powered so DRAM stays trained, and
+				 * the RK808 applies this state once the SoC drives
+				 * PMIC_SLEEP_H (POWER_OFF_REQ_CFG).
+				 */
 				regulator-state-mem {
-					regulator-off-in-suspend;
+					regulator-on-in-suspend;
 				};
 			};
 
@@ -1408,8 +1432,12 @@
 };
 
 &tsadc {
-	/* tshut mode 0:CRU 1:GPIO */
-	rockchip,hw-tshut-mode = <1>;
+	/*
+	 * tshut mode 0:CRU 1:GPIO. CRU: the GPIO path drives OTP_OUT_H
+	 * (GPIO1_A6) high, and on a V1.2A that does not restart the RK808,
+	 * so the SoC keeps running; the CRU global reset does stop it.
+	 */
+	rockchip,hw-tshut-mode = <0>;
 	/* tshut polarity 0:LOW 1:HIGH */
 	rockchip,hw-tshut-polarity = <1>;
 	status = "okay";

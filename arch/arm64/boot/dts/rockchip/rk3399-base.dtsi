@@ -1164,19 +1164,27 @@
 		reg = <0x0 0xffac0080 0x0 0x20>;
 	};
 
+	/*
+	 * Scanout cannot wait: both VOPs get the top NoC priority (P1 = P0 = 3).
+	 * At the reset priority (0) VOPB's post buffer underflows continuously
+	 * at 3840x2160@60 and the picture flickers.
+	 */
 	qos_vop_big_r: qos@ffac8000 {
 		compatible = "rockchip,rk3399-qos", "syscon";
 		reg = <0x0 0xffac8000 0x0 0x20>;
+		priority-init = <0x303>;
 	};
 
 	qos_vop_big_w: qos@ffac8080 {
 		compatible = "rockchip,rk3399-qos", "syscon";
 		reg = <0x0 0xffac8080 0x0 0x20>;
+		priority-init = <0x303>;
 	};
 
 	qos_vop_little: qos@ffad0000 {
 		compatible = "rockchip,rk3399-qos", "syscon";
 		reg = <0x0 0xffad0000 0x0 0x20>;
+		priority-init = <0x303>;
 	};
 
 	qos_perihp: qos@ffad8080 {

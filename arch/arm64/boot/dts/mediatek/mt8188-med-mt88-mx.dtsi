@@ -37,13 +37,112 @@
 };
 
 /*
- * Memory map: this board keeps the reserved-memory of
- * mt8390-genio-common.dtsi (BL31 0x54600000, OP-TEE 0x43200000, SCP
- * 0x50000000, APU 0x55000000, VPU 0x57000000, ADSP 0x60000000), the map
- * upstream TF-A -- the MT8188 Chromebook firmware -- places and fences, and
- * the default of our TF-A fork. The kernel must run under either, with no
- * bootloader rewriting the device tree, so nothing here moves a carve-out.
+ * Memory map. The secure runtime on this board is NOT at the addresses
+ * mt8390-genio-common.dtsi reserves for the MT8188 EVKs (BL31 TZRAM
+ * 0x54600000, OP-TEE 0x43200000). Our TF-A fork packs it at the DRAM base:
+ * plat/mediatek/mt8188/include/platform_def.h:331 TZRAM_BASE 0x40000000,
+ * :332 TZRAM_SIZE 2 MiB, :344/:363 BL31_BASE = TZRAM_BASE + 0x1000,
+ * :348 BL32_BASE 0x40200000, :349 BL32_LIMIT 10 MiB (master-gaema
+ * 75f1e6b60 "mt8188: pack TZRAM/BL32 at DRAM base"). Inherited unchanged,
+ * the DT handed Linux 4 GiB from 0x40000000 with nothing reserved below
+ * 0x43200000, i.e. BL31 and OP-TEE as ordinary System RAM, and no
+ * bootloader can fix it from the other side. U-Boot derives the bank from
+ * its own constant, not from the DT: u-boot common/board_f.c:351-352
+ * gd->ram_base = CFG_SYS_SDRAM_BASE (u-boot include/configs/mt8188.h:96 =
+ * 0x40000000), :247-248 bi_dram[0].start = gd->ram_base, and at bootm
+ * u-boot arch/arm/lib/bootm.c:409 -> arch/arm/lib/bootm-fdt.c:34,44-45,54
+ * fdt_fixup_memory_banks() writes that start/size back into /memory. The
+ * base Linux boots with is therefore 0x40000000 either way, so a
+ * reserved-memory node is the only thing that can fence the secure runtime.
+ * That is the configuration that made BL31 unbootable behind this BL2: the
+ * EL3 image was loaded to the vendor address while its text links at ours.
+ *
+ * So the two inherited secure carve-outs are deleted below and replaced at
+ * the addresses this board's BL31 actually occupies:
+ *   0x40000000  2 MiB  BL31  (TZRAM_BASE .. BL31_LIMIT)
+ *   0x40200000 12 MiB  BL32  OP-TEE: TEE_RAM 2 + TA_RAM 8 + SHMEM 2, the
+ *                         same layout genio-common documents at
+ *                         :83-96 for 0x43200000 -- 2 MiB wider than
+ *                         BL32_LIMIT on purpose, so the SHMEM that sits
+ *                         above the limit is never Linux RAM.
+ * Everything else in the genio-common map stays -- SCP 0x50000000, VPU
+ * 0x57000000, ADSP 0x60000000 and the DMA pools are loaded by other firmware
+ * at the same addresses under both maps -- except the APU pool, which moves
+ * below for the reason its own comment gives. The change is in this MX board
+ * dtsi, not in the shared EVK dtsi, because the Genio EVKs do boot the vendor
+ * map and must keep the inherited nodes.
+ *
+ * Deleting the inherited nodes is safe: nothing references them. `git grep
+ * '&optee_reserved\|&bl31_secmon_reserved' linux-6.18.y-lc -- arch/arm64/boot/dts`
+ * is empty; the only memory-region user in genio-common is scp_mem at
+ * :1333 (the scp_cluster), and /chosen there carries only stdout-path
+ * (:47-49). The bl31_secmon_reserved string the old DTB showed lives in
+ * /__symbols__ -- it is generated from the label, not written by hand.
+ *
+ * The two copies of this file (linux
+ * arch/arm64/boot/dts/mediatek/mt8188-med-mt88-mx.dtsi and u-boot
+ * dts/upstream/src/arm64/mediatek/mt8188-med-mt88-mx.dtsi) are kept
+ * byte-identical except for the pre-existing vcu power-domains hunk --
+ * /device-tree-sync: this tree builds U-Boot's own DTB from dts/upstream/,
+ * and U-Boot is the stage that fixes up /memory on its way to Linux.
  */
+&{/reserved-memory} {
+	/delete-node/ memory@54600000;
+	/delete-node/ optee@43200000;
+
+	/* 2 MiB for ARM Trusted Firmware (BL31) at TZRAM_BASE */
+	bl31_secmon_tzram: memory@40000000 {
+		no-map;
+		reg = <0 0x40000000 0 0x00200000>;
+	};
+
+	/* 12 MiB for OP-TEE (BL32) at BL32_BASE, see the map comment above */
+	optee_tzram_reserved: optee@40200000 {
+		no-map;
+		reg = <0 0x40200000 0 0x00c00000>;
+	};
+};
+
+/*
+ * The APU (RV33) pool is the one inherited reservation this board must not
+ * keep at the EVK's address, because EL3 does not read the DT here: BL31's
+ * LOAD_IMAGE handler (SiP op 28) compares the address the kernel hands it
+ * against compile-time constants. master-gaema 9f2826101
+ * plat/mediatek/mt8188/drivers/apusys/apusys_rv/2.0/apusys_rv.h:163-164
+ * pins APUSYS_RESERVED_MEM_START 0x41800000 / APUSYS_RESERVED_MEM_SZ
+ * 0x1400000 -- its own comment reads "below setting aligned dts (G5 packed
+ * CMA after 10 MiB SCP)" -- and the common copy states the contract outright
+ * (apusys_rv/2.0/apusys_rv_load_img.h:29-30, "Need same with
+ * DTS:apusys-reserve-memory"). is_valid_pa_dram_range() (apusys_rv.c:
+ * 2068-2082) is an equality test, not a bounds check, so with the inherited
+ * 0x55000000 the size agreed and the base did not: the SMC answered -EINVAL,
+ * mtk-apu logged "apusys_rv_loadimage_smc_call: smc call 28 return
+ * error(-22)", the driver's probe failed with -22 and MDLA never appeared
+ * (audit 2026-11-04-labtest1-mt88-8gb-apusys-boot.md, rows 5n and 5o).
+ *
+ * 0x41800000 is free on this board, three ways: the secure carve-outs above
+ * end at 0x40E00000, the next inherited reservation starts at 0x50000000, and
+ * U-Boot's own lmb already holds [0x41800000-0x43ffffff] no-overwrite, so the
+ * BL33 never allocates there and Linux stops doing so once this node exists.
+ * The size stays 20 MB and the node keeps no no-map, exactly as inherited --
+ * the APU maps it itself through apusys_rv's dma-ranges, and BL31 requires
+ * 0 < apusys_img_size < res_mem_size with img/sec_info/sec_mem/coredump packed
+ * inside it (apusys_rv.c:3075-3105).
+ */
+&{/reserved-memory} {
+	/delete-node/ memory@55000000;
+
+	/* 20 MB for the APU RV33 firmware, where BL31's op-28 gate reads it */
+	apu_mem: memory@41800000 {
+		compatible = "shared-dma-pool";
+		reg = <0 0x41800000 0 0x01400000>;	/* 20 MB */
+	};
+};
+
+&{/chosen} {
+	/* where the EL3 runtime lives, named where a reader looks for it */
+	bl31_secmon_reserved = "/reserved-memory/memory@40000000";
+};
 
 &mmc0 {
 	/*

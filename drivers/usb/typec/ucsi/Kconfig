@@ -104,4 +104,17 @@ config UCSI_HUAWEI_GAOKUN
 	  To compile the driver as a module, choose M here: the module will be
 	  called ucsi_huawei_gaokun.
 
+config UCSI_SCMI
+	tristate "UCSI Interface Driver for the Libre Computer SCMI Type-C protocol"
+	depends on ARM_SCMI_PROTOCOL && TYPEC_UCSI
+	depends on LIBRE_SCMI_TYPEC
+	help
+	  This driver enables UCSI support for a USB Type-C port owned by
+	  an SCMI server that implements the Libre Computer vendor protocol
+	  0x80 ("lc-typec") as a UCSI PPM, such as the RK3399 Cortex-M0
+	  firmware on ROC-RK3399-PC.
+
+	  To compile the driver as a module, choose M here: the module will be
+	  called ucsi_scmi.
+
 endif

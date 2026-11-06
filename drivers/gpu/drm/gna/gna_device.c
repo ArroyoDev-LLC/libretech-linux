@@ -59,20 +59,10 @@ const struct dev_pm_ops __maybe_unused gna_pm = {
 };
 
 
-static void gna_drm_dev_fini(struct drm_device *dev, void *ptr)
-{
-	drm_dev_unregister(dev);
-}
-
+/* undone by drm_dev_unplug() in gna_remove(), not at the final put: a client can keep its file open past the device */
 static int gna_drm_dev_init(struct drm_device *dev)
 {
-	int err;
-
-	err = drm_dev_register(dev, 0);
-	if (err)
-		return err;
-
-	return drmm_add_action_or_reset(dev, gna_drm_dev_fini, NULL);
+	return drm_dev_register(dev, 0);
 }
 
 static void gna_pm_init(struct device *dev)
@@ -94,10 +84,19 @@ static void gna_pm_init(struct device *dev)
 void gna_remove(struct device *parent)
 {
 	struct drm_device *drm_dev = dev_get_drvdata(parent);
+	struct gna_device *gna_priv = to_gna_device(drm_dev);
 
-	gna_hw_acquire(to_gna_device(drm_dev));             /* no request on the hardware */
-	gna_mmu_release(to_gna_device(drm_dev));            /* objects the page tables were kept for */
-	gna_hw_release(to_gna_device(drm_dev));
+	/*
+	 * Devres unmaps the registers, frees the interrupt, the descriptor and the page tables once this returns, while a
+	 * client may still hold its file open. So: refuse every new ioctl and wait out a COMPUTE in flight (it may start
+	 * the hardware), run what is queued while the registers are still mapped, and finish what is on the hardware.
+	 * After that nothing reaches the hardware: direct_req stays NULL, and nothing can be queued again.
+	 */
+	drm_dev_unplug(drm_dev);
+	flush_workqueue(gna_priv->request_wq);
+	gna_hw_acquire(gna_priv);             /* no request on the hardware (a hung one after the recovery timeout) */
+	gna_mmu_release(gna_priv);            /* objects the page tables were kept for */
+	gna_hw_release(gna_priv);
 	pm_runtime_dont_use_autosuspend(parent);
 	pm_runtime_forbid(parent);
 	pm_runtime_get_noresume(parent);
@@ -106,23 +105,33 @@ void gna_remove(struct device *parent)
 static irqreturn_t gna_interrupt(int irq, void *priv)
 {
 	struct gna_device *gna_priv;
-	struct gna_request *direct;
+	struct gna_request *direct, *req;
 	unsigned long flags;
 	u32 sts;
 
 	gna_priv = (struct gna_device *)priv;
 
-	/* a request started from COMPUTE is completed here, with no thread woken (gna_request_complete_direct) */
+	/*
+	 * Ours only when a request is on the hardware -- started from COMPUTE (completed here, with no thread woken:
+	 * gna_request_complete_direct) or by the worker (woken) -- with its START written (hw_started, set with START
+	 * under this lock), and STS reports a completion or an error. The line may be shared: before START STS still
+	 * carries the previous request's completion, all ones means the device is suspended, and an idle device has
+	 * nothing to complete.
+	 */
 	spin_lock_irqsave(&gna_priv->direct_lock, flags);
 	direct = gna_priv->direct_req;
-	if (direct) {
-		sts = gna_reg_read(gna_priv, GNA_MMIO_STS);
-		if (!(sts & (GNA_STS_SCORE_COMPLETED | GNA_ERROR))) {
-			spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
-			return IRQ_NONE;            /* the line is shared: not ours */
-		}
-		gna_priv->direct_req = NULL;
+	req = direct ? direct : gna_priv->queued_req;
+	if (!req || !req->hw_started) {
+		spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+		return IRQ_NONE;
 	}
+	sts = gna_reg_read(gna_priv, GNA_MMIO_STS);
+	if (sts == ~0U || !(sts & (GNA_STS_SCORE_COMPLETED | GNA_ERROR))) {
+		spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+		return IRQ_NONE;
+	}
+	if (direct)
+		gna_priv->direct_req = NULL;
 	spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
 	if (direct) {
 		gna_priv->dev_busy = false;
@@ -161,16 +170,22 @@ static struct drm_gem_object *gna_create_gem_object(struct drm_device *dev,
 
 	shmem = kzalloc(sizeof(*shmem), GFP_KERNEL);
 	if (!shmem)
-		return NULL;
+		return ERR_PTR(-ENOMEM);   /* the shmem helper tests IS_ERR() only: NULL would be used as the object */
 
 	dshmem = &shmem->base;
 
 	return &dshmem->base;
 }
 
+static void gna_postclose(struct drm_device *dev, struct drm_file *file)
+{
+	gna_request_file_close(to_gna_device(dev), file);
+}
+
 static const struct drm_driver gna_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_RENDER,
 	.gem_create_object = gna_create_gem_object,
+	.postclose = gna_postclose,
 
 	.ioctls = gna_drm_ioctls,
 	.num_ioctls = ARRAY_SIZE(gna_drm_ioctls),
@@ -204,8 +219,14 @@ int gna_probe(struct device *parent, struct gna_dev_info *dev_info, void __iomem
 
 	atomic_set(&gna_priv->enqueued_requests, 0);
 
+	/*
+	 * The descriptor base, the page directory and the page tables hold 32-bit page frame numbers (addr >> PAGE_SHIFT,
+	 * gna_mmu_set / gna_mmu_add_locked / gna_score): the device reaches 44 bits of address, not 64. With a 64-bit mask
+	 * an IOMMU could hand out an IOVA above 2^44 (its 32-bit space used up, or iommu.forcedac) and the tables would
+	 * hold it truncated -- DMA to the wrong address.
+	 */
 	if (!(sizeof(dma_addr_t) > 4) ||
-		dma_set_mask(parent, DMA_BIT_MASK(64))) {
+		dma_set_mask(parent, DMA_BIT_MASK(32 + PAGE_SHIFT))) {
 		err = dma_set_mask(parent, DMA_BIT_MASK(32));
 		if (err)
 			return err;
@@ -226,7 +247,7 @@ int gna_probe(struct device *parent, struct gna_dev_info *dev_info, void __iomem
 
 	mutex_init(&gna_priv->mmu_lock);
 
-	atomic_set(&gna_priv->request_count, 0);
+	atomic64_set(&gna_priv->request_count, 0);
 
 	mutex_init(&gna_priv->reqlist_lock);
 	INIT_LIST_HEAD(&gna_priv->request_list);

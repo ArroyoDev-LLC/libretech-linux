@@ -982,6 +982,13 @@
 	/delete-property/ interrupts;
 	interrupts-extended = <&sysirq GIC_SPI 92 IRQ_TYPE_LEVEL_LOW>,
 			      <&pio 121 IRQ_TYPE_EDGE_FALLING>;
+	/*
+	 * The QCA6174 runs this port at 3 Mbit/s. In PIO mode a CPU waking
+	 * from cpu-sleep / cluster-sleep (200-400 us exit latency) misses
+	 * the RX FIFO and the HCI stream loses bytes.
+	 */
+	dmas = <&apdma 2>, <&apdma 3>;
+	dma-names = "tx", "rx";
 
 	bluetooth: bluetooth {
 		pinctrl-names = "default";

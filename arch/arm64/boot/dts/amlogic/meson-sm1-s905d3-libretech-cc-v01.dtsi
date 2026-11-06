@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 /*
- * Libre Computer AML-S905D3-CC-V01 (Solitude V0.1 pre-production)
+ * Libre Computer AML-S905D3-CC-V01 (Solitude V0.1 pre-production): the
+ * board, without the firmware layout or the CPU clocking. V0.1 has no
+ * vendor-chain DT; the board's DT is meson-sm1-s905d3-libretech-cc-v01-libre.dts.
  */
-
-/dts-v1/;
 
 #include <dt-bindings/clock/g12a-clkc.h>
 #include "meson-sm1.dtsi"
 #include "meson-libretech-cottonwood.dtsi"
 #include "meson-libretech-cottonwood-v01.dtsi"
-#include "meson-g12-vendor-firmware.dtsi"
-#include "meson-libretech-ramoops.dtsi"
 
 / {
 	compatible = "libretech,aml-s905d3-cc-v01", "amlogic,sm1";
@@ -60,34 +58,6 @@
 				"Lineout", "ACODEC LOLP",
 				"Lineout", "ACODEC LORP";
 	};
-};
-
-&cpu0 {
-	cpu-supply = <&vddcpu_b>;
-	operating-points-v2 = <&cpu_opp_table>;
-	clocks = <&clkc CLKID_CPU_CLK>;
-	clock-latency = <50000>;
-};
-
-&cpu1 {
-	cpu-supply = <&vddcpu_b>;
-	operating-points-v2 = <&cpu_opp_table>;
-	clocks = <&clkc CLKID_CPU1_CLK>;
-	clock-latency = <50000>;
-};
-
-&cpu2 {
-	cpu-supply = <&vddcpu_b>;
-	operating-points-v2 = <&cpu_opp_table>;
-	clocks = <&clkc CLKID_CPU2_CLK>;
-	clock-latency = <50000>;
-};
-
-&cpu3 {
-	cpu-supply = <&vddcpu_b>;
-	operating-points-v2 = <&cpu_opp_table>;
-	clocks = <&clkc CLKID_CPU3_CLK>;
-	clock-latency = <50000>;
 };
 
 / {

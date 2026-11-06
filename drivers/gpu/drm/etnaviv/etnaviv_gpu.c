@@ -282,7 +282,7 @@ MODULE_PARM_DESC(npu_axi_config,
 static int npu_credit_limit = -1;
 module_param_named(npu_credit_limit, npu_credit_limit, int, 0644);
 MODULE_PARM_DESC(npu_credit_limit,
-	"NPU-only drm_sched credit_limit post-correction: -1 = leave the sched_init race in place (default), >0 = set this many in-flight jobs (1 is what sched_init's comment demands). Takes effect at the next gpu_init");
+	"NPU-only drm_sched credit_limit post-correction: -1 = leave the sched_init race in place (default), >0 = set this many in-flight jobs (1 is what sched_init's comment demands). Takes effect at the next gpu_init; on S905D3 also at the next submit, where >1 completes each job on its FROM_PE (npu_claim_pe)");
 
 static int npu_hangdump_compact;
 module_param_named(npu_hangdump_compact, npu_hangdump_compact, int, 0644);
@@ -2988,17 +2988,20 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 			gpu->sched.timeout = msecs_to_jiffies(2000);
 
 		/*
-		 * S905D3 (VIPPico v3): one in-flight NPU job, as sched_init
-		 * intends. Its credit_limit ternary ran before hw_identify and
-		 * left 4. buffer_v8_pico tracks one deferred completion
-		 * (npu_poll_event); a second job overwrites it, the first job's
-		 * fence is never signalled and the 2 s watchdog recovers it.
-		 * 6.12 had this as 933f3bd8ed65c; the 6.18 port dropped it.
-		 * A311D (0x88) keeps the default. npu_credit_limit below still
-		 * overrides for A/B.
+		 * S905D3 (VIPPico v3): two in-flight NPU jobs, each completed on
+		 * its own FROM_PE (npu_claim_pe). sched_init's credit_limit
+		 * ternary runs before hw_identify and would leave 4. Two in
+		 * flight once returned a wholly wrong frame on YOLOv12-x's stream
+		 * (5 of 3000): the completion poll took the FE anywhere in the
+		 * ring for home and completed the next job before it ran; with
+		 * the poll requiring the ring's tail WAIT (etnaviv_gpu_npu_fe_home)
+		 * that stream reads 0 of 3000, and YOLO26n's runs at 94.5% of its
+		 * one-in-flight frame time (vippico-v3 audit
+		 * 2026-11-01-npu-credit2-poll). npu_credit_limit still sets 1 for
+		 * A/B. A311D (0x88) keeps the default.
 		 */
 		if (gpu->identity.customer_id == 0x99)
-			gpu->sched.credit_limit = 1;
+			gpu->sched.credit_limit = 2;
 
 		/*
 		 * qi:N1437 (N1435-b): the OTHER half of the same race. See
@@ -3138,6 +3141,7 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 				"NPU: GL_EVENT immediate (FE stalls)\n");
 		}
 		gpu->npu_poll_event = -1;
+		spin_lock_init(&gpu->npu_claim_lock);
 		INIT_DELAYED_WORK(&gpu->npu_poll_work,
 				  etnaviv_gpu_npu_poll_work);
 
@@ -3833,6 +3837,12 @@ struct dma_fence *etnaviv_gpu_submit(struct etnaviv_gem_submit *submit)
 
 	mutex_lock(&gpu->lock);
 
+	/* S905D3: a runtime write of npu_credit_limit applies from the next
+	 * submit (drm_sched reads credit_limit each time it queues a job) */
+	if (gpu->identity.customer_id == 0x99 && npu_credit_limit > 0 &&
+	    gpu->sched.credit_limit != (u32)npu_credit_limit)
+		WRITE_ONCE(gpu->sched.credit_limit, npu_credit_limit);
+
 	gpu_fence = etnaviv_gpu_fence_alloc(gpu);
 	if (!gpu_fence) {
 		for (i = 0; i < nr_events; i++)
@@ -3915,27 +3925,161 @@ MODULE_PARM_DESC(npu_poll_fe_home,
 
 static bool etnaviv_gpu_npu_fe_home(struct etnaviv_gpu *gpu)
 {
-	u32 ring_va, dma;
+	u32 ring_va, dma, off, tail;
 
 	if (!npu_poll_fe_home || !gpu->mmu_context)
 		return true;
 	ring_va = etnaviv_cmdbuf_get_va(&gpu->buffer,
 					&gpu->mmu_context->cmdbuf_mapping);
 	dma = gpu_read(gpu, VIVS_FE_DMA_ADDRESS);
-	return dma - ring_va < gpu->buffer.size;
+	off = dma - ring_va;
+	if (off >= gpu->buffer.size)
+		return false;
+	if (gpu->sched.credit_limit <= 1)
+		return true;
+	/*
+	 * More than one job in flight: between two jobs the FE runs through
+	 * the ring (the earlier job's event, then the LINK into the next
+	 * job's cmdbuf) with NN and TP idle before the next job starts, and
+	 * a poll for that next job would complete it before it ran -- a
+	 * wholly wrong frame (YOLOv12-x's stream at credit 2, 5 of 3000;
+	 * vippico-v3 audit 2026-11-01-npu-credit2-poll). Only the WAIT/LINK
+	 * at the ring's tail means the FE has no job left.
+	 */
+	tail = READ_ONCE(gpu->buffer.user_size);
+	return off + 16 >= tail && off <= tail;
+}
+
+/*
+ * S905D3 (0x99) completion in the ISR. The job's GL_EVENT is FROM_PE, so when
+ * it fires the PE has finished the job's work. If NN, TP and the FE are idle
+ * at that moment -- the poll's own exit test -- the ISR signals the fence
+ * itself. The poll then runs only for a job that is not idle yet (or whose
+ * FROM_PE never fires: the proactive 100 ms schedule). Before this, every job
+ * waited for the poll work item to be scheduled: with every A55 busy (four
+ * attention threads beside the NPU) that wait was ~0.79 ms per job, 19.7 ms of
+ * a 25-job YOLOv12n frame, on the frame's critical path (vippico-v3 audit
+ * 2026-10-29-own-nbg-stream-threads, st8). 0 = always defer to the poll.
+ */
+static int npu_isr_complete = 1;
+module_param_named(npu_isr_complete, npu_isr_complete, int, 0644);
+MODULE_PARM_DESC(npu_isr_complete,
+	"S905D3 0x99: signal the fence from the FROM_PE ISR when NN/TP/FE are idle (1 = on, default)");
+
+static bool etnaviv_gpu_npu_idle(struct etnaviv_gpu *gpu, u32 *idle)
+{
+	*idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
+	return (*idle & VIVS_HI_IDLE_STATE_NN) &&
+	       (*idle & VIVS_HI_IDLE_STATE_TP) &&
+	       etnaviv_gpu_npu_fe_home(gpu);
+}
+
+/*
+ * Take the armed 0x99 job for completion. @seqno is the fence seqno the caller
+ * saw when it started (0: whatever is armed now). Event ids are reused, so a
+ * poll that outlived its job (the ISR completed it, the next job took the same
+ * event) must not complete the next job: the seqno check refuses it. On
+ * success the poll slot is released and the event's fence handed to the
+ * caller, which signals it.
+ */
+static struct dma_fence *npu_claim(struct etnaviv_gpu *gpu, int event,
+				   u64 seqno)
+{
+	struct dma_fence *fence;
+	unsigned long flags;
+
+	spin_lock_irqsave(&gpu->npu_claim_lock, flags);
+	fence = gpu->event[event].fence;
+	if (gpu->npu_poll_event != event || !fence ||
+	    (seqno && fence->seqno != seqno)) {
+		spin_unlock_irqrestore(&gpu->npu_claim_lock, flags);
+		return NULL;
+	}
+	/*
+	 * Release the poll slot BEFORE the fence is signalled: signalling lets
+	 * drm_sched submit the next job at once (credit_limit 1), and that
+	 * submit re-arms npu_poll_event for its own event (a job whose FROM_PE
+	 * never fired was otherwise never signalled; S905D3 FE parked at WAIT,
+	 * ~1 in 10 fresh-init EfficientDet runs).
+	 */
+	gpu->npu_poll_event = -1;
+	clear_bit(event, &gpu->npu_pe_armed);
+	gpu->event[event].fence = NULL;
+	spin_unlock_irqrestore(&gpu->npu_claim_lock, flags);
+
+	if (fence_after(fence->seqno, gpu->completed_fence))
+		gpu->completed_fence = fence->seqno;
+	return fence;
+}
+
+/*
+ * More than one job in flight (credit_limit > 1): take any armed event on its
+ * FROM_PE interrupt. The PE has finished the job's work (FROM_PE fires after
+ * the writeback), and the GL_EVENT sits in the kernel ring after the LINK back
+ * from the job's cmdbuf, so the FE has left that cmdbuf. NN/TP idle and FE home
+ * cannot be waited for here: the next job may already be running.
+ */
+static struct dma_fence *npu_claim_pe(struct etnaviv_gpu *gpu, int event)
+{
+	struct dma_fence *fence;
+	unsigned long flags;
+
+	spin_lock_irqsave(&gpu->npu_claim_lock, flags);
+	fence = gpu->event[event].fence;
+	if (!fence || !test_and_clear_bit(event, &gpu->npu_pe_armed)) {
+		spin_unlock_irqrestore(&gpu->npu_claim_lock, flags);
+		return NULL;
+	}
+	if (gpu->npu_poll_event == event)
+		gpu->npu_poll_event = -1;
+	gpu->event[event].fence = NULL;
+	spin_unlock_irqrestore(&gpu->npu_claim_lock, flags);
+
+	if (fence_after(fence->seqno, gpu->completed_fence))
+		gpu->completed_fence = fence->seqno;
+	return fence;
+}
+
+/*
+ * Consume one of @event's owed FROM_PE interrupts (npu_pe_owed). True when it
+ * was not the last one owed, i.e. it belongs to a job the poll completed before
+ * its interrupt arrived, and the event has since been re-armed.
+ */
+static bool npu_pe_late(struct etnaviv_gpu *gpu, int event)
+{
+	unsigned long flags;
+	bool late = false;
+
+	spin_lock_irqsave(&gpu->npu_claim_lock, flags);
+	if (gpu->npu_pe_owed[event] > 1)
+		late = true;
+	if (gpu->npu_pe_owed[event] > 0)
+		gpu->npu_pe_owed[event]--;
+	spin_unlock_irqrestore(&gpu->npu_claim_lock, flags);
+	return late;
 }
 
 static void etnaviv_gpu_npu_poll_work(struct work_struct *work)
 {
 	struct etnaviv_gpu *gpu = container_of(work, struct etnaviv_gpu,
 					       npu_poll_work.work);
-	int event = gpu->npu_poll_event;
+	int event = READ_ONCE(gpu->npu_poll_event);
 	struct dma_fence *fence;
+	unsigned long flags;
 	ktime_t t_idle;
+	u64 seqno;
 	u32 idle;
 	int i;
 
 	if (event < 0 || event >= ETNA_NR_EVENTS)
+		return;
+
+	/* the job this poll is for; npu_claim() refuses any other */
+	spin_lock_irqsave(&gpu->npu_claim_lock, flags);
+	fence = gpu->npu_poll_event == event ? gpu->event[event].fence : NULL;
+	seqno = fence ? fence->seqno : 0;
+	spin_unlock_irqrestore(&gpu->npu_claim_lock, flags);
+	if (!fence)
 		return;
 
 	/*
@@ -3945,10 +4089,7 @@ static void etnaviv_gpu_npu_poll_work(struct work_struct *work)
 	 * npu_poll_fe_home: and for the FE back in the ring.
 	 */
 	for (i = 0; i < 100000; i++) {
-		idle = gpu_read(gpu, VIVS_HI_IDLE_STATE);
-		if ((idle & VIVS_HI_IDLE_STATE_NN) &&
-		    (idle & VIVS_HI_IDLE_STATE_TP) &&
-		    etnaviv_gpu_npu_fe_home(gpu))
+		if (etnaviv_gpu_npu_idle(gpu, &idle))
 			break;
 		usleep_range(100, 200);
 	}
@@ -3959,33 +4100,17 @@ static void etnaviv_gpu_npu_poll_work(struct work_struct *work)
 		dev_err(gpu->dev,
 			"NPU poll: timeout idle=0x%08x\n", idle);
 
-	/* Signal the fence -- NN/TP data is in DDR (AXI write-through) */
-	fence = gpu->event[event].fence;
-	if (fence) {
-		gpu->event[event].fence = NULL;
-		if (fence_after(fence->seqno, gpu->completed_fence))
-			gpu->completed_fence = fence->seqno;
-	}
+	/* Signal the fence -- NN/TP data is in DDR (AXI write-through); the
+	 * ISR may have completed this job meanwhile, then there is nothing to do */
+	fence = npu_claim(gpu, event, seqno);
+	if (!fence)
+		return;
 
 	/* deferred-poll path (0x99): real intermediate t_idle separates
 	 * FE-walk (t_irq - t_submit) from NN-exec (t_idle - t_irq). */
 	npu_phase_complete(gpu, event, t_idle, ktime_get(), i, 1);
-
-	/*
-	 * Release this job's poll slot BEFORE signalling its fence, and only if
-	 * it still names this event. Signalling lets drm_sched submit the next
-	 * job at once (credit_limit 1), and that submit re-arms npu_poll_event
-	 * for its own event; clearing the slot after the signal erased it, the
-	 * next job's ISR then took the plain path and its proactive poll found
-	 * -1, so a job whose FROM_PE never fired was never signalled and the
-	 * 2 s watchdog recovered it (S905D3: FE parked at WAIT after the job's
-	 * GL_EVENT, about 1 in 10 fresh-init EfficientDet runs).
-	 */
-	cmpxchg(&gpu->npu_poll_event, event, -1);
 	event_free(gpu, event);
-
-	if (fence)
-		dma_fence_signal(fence);
+	dma_fence_signal(fence);
 }
 
 /*
@@ -4053,6 +4178,7 @@ void etnaviv_gpu_recover_hang(struct etnaviv_gem_submit *submit, u32 dma_addr)
 	char *comm = NULL, *cmd = NULL;
 	struct task_struct *task;
 	unsigned int i;
+	unsigned long claim_flags;
 	unsigned int predump = npu_recover_predump;
 
 	/*
@@ -4215,6 +4341,26 @@ hangdump_done:
 	if (pm_runtime_get_sync(gpu->dev) < 0)
 		goto pm_put;
 
+	/*
+	 * zoo11 r37: drop the pending sync-point worker before the events it
+	 * is about to act on are completed, and before taking gpu->lock.
+	 * sync_point_worker() indexes gpu->event[gpu->sync_point_event]
+	 * unguarded, event_free()s that index and restarts the FE from the
+	 * VIVS_FE_DMA_ADDRESS it reads at entry; once the loop below has
+	 * completed every event, that worker would double-complete an event the
+	 * recover already finished and re-point the FE at a stale address. It
+	 * also does MMIO and calls etnaviv_submit_put(), so it is cancelled
+	 * here rather than under gpu->lock. Neither field is reset anywhere in
+	 * the recover today: INIT_WORK() runs at probe and struct etnaviv_gpu is
+	 * kzalloc'd there, which is exactly why a module reload cleared this
+	 * state and a recover left it behind. Cancelled with clocks up and
+	 * before the reset, so the worker's own MMIO can never fault.
+	 * See ai/vsi/vippico-v3/audit/2026-11-06-zoo11-npu-reset-mechanism/
+	 * 2026-11-06-zoo11-npu-reset-mechanism.md finding 6(b).
+	 */
+	cancel_work_sync(&gpu->sync_point_work);
+	gpu->sync_point_event = 0;
+
 	mutex_lock(&gpu->lock);
 
 	etnaviv_hw_reset(gpu);
@@ -4236,10 +4382,78 @@ hangdump_done:
 		gpu_read_power(gpu, VIVS_PM_POWER_CONTROLS));
 
 	/* complete all events, the GPU won't do it after the reset */
+	gpu->npu_pe_armed = 0;
+	memset(gpu->npu_pe_owed, 0, sizeof(gpu->npu_pe_owed));
+
+	/*
+	 * zoo11 r37: the other half of the same leak, beside the arm/owed
+	 * state it pairs with. At npu_credit_limit 1 the FROM_PE claim route is
+	 * unreachable -- the ISR takes it only when credit_limit > 1 -- so
+	 * npu_claim() is the only thing that can signal an NN/TP fence, and it
+	 * refuses any event other than the one npu_poll_event names. Nothing in
+	 * the recover cleared that slot: outside the two claim paths it is
+	 * written only by the submit path and at probe, so an event left pinned
+	 * there by the hang kept making every later npu_claim() return NULL
+	 * until a fresh submit re-armed it -- the re-arm whose absence the
+	 * comment above npu_claim() already records as the reason a job whose
+	 * FROM_PE never fired was "otherwise never signalled". Reset it the way
+	 * probe does, under the lock every other writer of the field holds.
+	 * This does not make a missing interrupt reappear; it stops the recover
+	 * from adding a driver-side reason for the fence never to be claimed.
+	 * See the audit above, finding 6(a).
+	 */
+	spin_lock_irqsave(&gpu->npu_claim_lock, claim_flags);
+	gpu->npu_poll_event = -1;
+	spin_unlock_irqrestore(&gpu->npu_claim_lock, claim_flags);
 	spin_lock(&gpu->event_spinlock);
 	for_each_set_bit(i, gpu->event_bitmap, ETNA_NR_EVENTS)
 		event_free(gpu, i);
 	spin_unlock(&gpu->event_spinlock);
+
+	/*
+	 * zoo11 r45: pulse RESET_NNA here -- in hang recovery, not at power-up.
+	 *
+	 * Why here and not on the power path. Our own board is the first reason: on c64a the NNA genpd domain
+	 * had already cycled 548 times (S0 Usage 548, Rejected 0) while the npu interrupt sat frozen at 851465,
+	 * so a great many genuine power transitions cured nothing -- and the one action that did cure it, the
+	 * unbind/bind, is the one that asserts RESET_NNA in probe (it moved the counter 851465 -> 853715, +2250,
+	 * with liveness RESULT PASS on the same boot id). The pulse correlates with the cure; the power
+	 * transition does not. The vendor's layout is the second reason, and it points the same way: in the
+	 * Amlogic nanoq/VIP galcore HAL drop the reset-line pulse exists only on the 0x88 path, in
+	 * Getpower_88 (gc_hal_kernel_hardware.c:284, bit 12 of RESET_LEVEL2) called from _GetPower at probe,
+	 * while for 0x99 there is no reset-line code at all -- Getpower_99 (:338) is clocks and the power-domain
+	 * call, and Downpower_88 and every *_99 variant never pulses it. There is therefore no vendor power-up
+	 * hook to imitate on this part, and no reason to pay an assert/deassert on every runtime resume.
+	 *
+	 * etnaviv_hw_reset() above is the generic in-block soft reset (the vendor's own _ResetGPU is the same
+	 * kind of thing: clock gate off, pulse-eater). What this adds on top is the SoC-level line, which is
+	 * the piece our wedged 0x99 state is missing. Placed after the diagnostic snapshot so those registers
+	 * still describe what etnaviv_hw_reset() alone left, and before etnaviv_gpu_hw_init() so the register
+	 * reprogramming below happens to a block that has just seen its reset line toggled. The two delays are
+	 * the ones the power-up helper documents: 32 core clock cycles before deassertion, 128 before any AHB
+	 * activity.
+	 *
+	 * Both edges print. Nothing in this driver logged reset activity, which is exactly why the c64a trial
+	 * could not be confirmed from dmesg and had to be inferred from a counter; a recovery whose pulse leaves
+	 * no trace cannot be tested for. See
+	 * ai/vsi/vippico-v3/audit/2026-11-06-zoo11-npu-reset-mechanism/2026-11-06-zoo11-npu-reset-mechanism.md
+	 * findings 6, 8, 9 and sec 10, and
+	 * ai/vsi/vippico-v3/audit/2026-11-06-zooreg-galcore-reset-path.md sections (c) and (d).
+	 */
+	{
+		int pret;
+
+		dev_info(gpu->dev, "hang recovery: npu reset pulse -- assert\n");
+		pret = reset_control_assert(gpu->rst);
+		if (pret)
+			dev_err(gpu->dev, "npu reset assert failed %d\n", pret);
+		usleep_range(1, 2);
+		dev_info(gpu->dev, "hang recovery: npu reset pulse -- deassert\n");
+		pret = reset_control_deassert(gpu->rst);
+		if (pret)
+			dev_err(gpu->dev, "npu reset deassert failed %d\n", pret);
+		usleep_range(1, 2);
+	}
 
 	etnaviv_gpu_hw_init(gpu);
 
@@ -4346,9 +4560,45 @@ static irqreturn_t irq_handler(int irq, void *data)
 			 * Defer fence signaling to npu_poll_work which
 			 * waits for NN/TP idle then signals.
 			 */
+			/*
+			 * An event that owes more than one FROM_PE: this one is
+			 * an earlier job's, which the poll already completed (the
+			 * FE raises an event's interrupts in its jobs' order), so
+			 * it completes nothing.
+			 */
+			if (gpu->npu_poll_completion && npu_pe_late(gpu, event))
+				continue;
+			if (gpu->npu_poll_completion && gpu->sched.credit_limit > 1 &&
+			    test_bit(event, &gpu->npu_pe_armed)) {
+				/* more than one job in flight: this job's
+				 * FROM_PE completes it (npu_claim_pe) */
+				fence = npu_claim_pe(gpu, event);
+				if (fence) {
+					npu_phase_complete(gpu, event, now,
+							   ktime_get(), 0, 0);
+					event_free(gpu, event);
+					dma_fence_signal(fence);
+					continue;
+				}
+			}
 			if (gpu->npu_poll_completion &&
 			    event == gpu->npu_poll_event) {
-				/* Run the deferred poll now (FROM_PE fired).
+				u32 idle;
+
+				/* FROM_PE fired: complete here when the poll's
+				 * own exit test already holds (npu_isr_complete) */
+				if (npu_isr_complete &&
+				    etnaviv_gpu_npu_idle(gpu, &idle)) {
+					fence = npu_claim(gpu, event, 0);
+					if (fence) {
+						npu_phase_complete(gpu, event, now,
+								   ktime_get(), 0, 0);
+						event_free(gpu, event);
+						dma_fence_signal(fence);
+						continue;
+					}
+				}
+				/* Otherwise run the deferred poll now.
 				 * mod_delayed_work(.,0) coalesces with the
 				 * proactive 100 ms schedule in buffer_v8_pico
 				 * so whichever fires first runs npu_poll_work
@@ -4412,10 +4662,15 @@ static irqreturn_t irq_handler(int irq, void *data)
 			 * Off-By-One Bug "BREAKTHROUGH" analysis
 			 * and subsequent matrix v1/v2/v3 sections.
 			 *
-			 * S905D3 (customer 0x99) does NOT need this --
-			 * that path uses npu_poll_completion deferral
-			 * which polls VIVS_HI_IDLE_STATE_NN/_TP before
-			 * signaling, providing the same effective wait.
+			 * S905D3 (customer 0x99) does not take this path:
+			 * it completes through npu_poll_completion, which
+			 * polls VIVS_HI_IDLE_STATE_NN/_TP. That idle read
+			 * alone is NOT a wait for the NN work: a 0x99
+			 * resident stream must end with the vendor
+			 * FullQueue barrier (npu_drain_barrier[] below,
+			 * inserted by this kernel only on 0x88), or the
+			 * fence signals while its last NN op still runs.
+			 * The etnaviv_ml runtime emits it on 0x99.
 			 *
 			 * skip-prime-drain lever (ETNA_SUBMIT_NO_DRAIN): a
 			 * throwaway-output submit (the mesa NN-priming prefix)
@@ -4827,6 +5082,19 @@ static int etnaviv_gpu_platform_probe(struct platform_device *pdev)
 	if (IS_ERR(gpu->clk_shader))
 		return PTR_ERR(gpu->clk_shader);
 	gpu->base_rate_shader = clk_get_rate(gpu->clk_shader);
+
+	/*
+	 * Hold the rates the clocks were assigned: a parent PLL shared with
+	 * another consumer (on Amlogic SM1, the NPU muxes reach GP0 and HiFi)
+	 * must not be retuned underneath a running core.  The holder may still
+	 * change its own rate, so frequency scaling is unaffected.
+	 */
+	err = devm_clk_rate_exclusive_get(&pdev->dev, gpu->clk_bus);
+	if (err)
+		return err;
+	err = devm_clk_rate_exclusive_get(&pdev->dev, gpu->clk_core);
+	if (err)
+		return err;
 
 	/* TODO: figure out max mapped size */
 	dev_set_drvdata(dev, gpu);

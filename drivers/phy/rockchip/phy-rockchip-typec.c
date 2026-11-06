@@ -1098,7 +1098,7 @@ static int rockchip_usb3_phy_power_on(struct phy *phy)
 	struct rockchip_typec_phy *tcphy = phy_get_drvdata(phy);
 	const struct rockchip_usb3phy_port_cfg *cfg = tcphy->port_cfgs;
 	const struct usb3phy_reg *reg = &cfg->pipe_status;
-	int timeout, new_mode, ret = 0;
+	int attempt, new_mode, ret = 0;
 	u32 val;
 
 	mutex_lock(&tcphy->lock);
@@ -1118,27 +1118,41 @@ static int rockchip_usb3_phy_power_on(struct phy *phy)
 	if (tcphy->mode == new_mode)
 		goto unlock_ret;
 
-	if (tcphy->mode == MODE_DISCONNECT) {
-		ret = tcphy_phy_init(tcphy, new_mode);
-		if (ret)
-			goto unlock_ret;
-	}
+	/*
+	 * Bringing the PHY up from cold (after a resume from S3, when its
+	 * power domain was off) occasionally fails: either the PMA never
+	 * reports ready, or the PIPE status does not clear in time. Both are
+	 * transient, so give the PIPE wait the same budget as the other mode
+	 * waits and re-init the PHY once before giving up.
+	 */
+	for (attempt = 0; attempt < 2; attempt++) {
+		if (attempt)
+			dev_warn(tcphy->dev, "usb3 phy not ready, retrying init\n");
 
-	/* wait TCPHY for pipe ready */
-	for (timeout = 0; timeout < 100; timeout++) {
-		regmap_read(tcphy->grf_regs, reg->offset, &val);
-		if (!(val & BIT(reg->enable_bit))) {
+		if (tcphy->mode == MODE_DISCONNECT) {
+			ret = tcphy_phy_init(tcphy, new_mode);
+			if (ret == -ETIMEDOUT)
+				continue;
+			if (ret)
+				goto unlock_ret;
+		}
+
+		/* wait TCPHY for pipe ready */
+		ret = regmap_read_poll_timeout(tcphy->grf_regs, reg->offset,
+					       val,
+					       !(val & BIT(reg->enable_bit)),
+					       10, PHY_MODE_SET_TIMEOUT);
+		if (!ret) {
 			tcphy->mode |= new_mode & (MODE_DFP_USB | MODE_UFP_USB);
 
 			/* enable usb3 host */
 			tcphy_cfg_usb3_to_usb2_only(tcphy, false);
 			goto unlock_ret;
 		}
-		usleep_range(10, 20);
-	}
 
-	if (tcphy->mode == MODE_DISCONNECT)
-		tcphy_phy_deinit(tcphy);
+		if (tcphy->mode == MODE_DISCONNECT)
+			tcphy_phy_deinit(tcphy);
+	}
 
 	ret = -ETIMEDOUT;
 

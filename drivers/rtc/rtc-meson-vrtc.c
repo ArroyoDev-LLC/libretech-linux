@@ -22,6 +22,8 @@
  * words in share SRAM that the SoC keeps across a WARM reset but not a power
  * cut. On the libre firmware chain the open SC reserves them and never writes
  * them. Layout: magic, epoch low, epoch high, check = ~(magic ^ low ^ high).
+ * A valid kept time read at probe also sets the system clock, if that is
+ * behind it (meson_vrtc_keep_to_system()).
  */
 #define MESON_VRTC_KEEP_MAGIC		0x4b545256	/* "VRTK" */
 #define MESON_VRTC_KEEP_WORD_MAGIC	0x0
@@ -141,6 +143,29 @@ static void meson_vrtc_keep_stop(void *data)
 	cancel_delayed_work_sync(&vrtc->keep_work);
 }
 
+/*
+ * Hand the kept time to the system clock at probe. The kernel sets the system
+ * time at boot only from rtc0 (CONFIG_RTC_HCTOSYS), and the SoC DTs alias the
+ * vRTC rtc1, leaving rtc0 for a battery RTC chip; on a board without one, a
+ * kept time would otherwise never reach the system clock. Only forward: if a
+ * chip RTC or anything else already set a later time, it stands. The clock
+ * set this makes is seen by meson_vrtc_clock_notify() like any other, so from
+ * here the system clock is the answer.
+ */
+static void meson_vrtc_keep_to_system(struct device *dev, struct meson_vrtc_data *vrtc)
+{
+	struct timespec64 ts = { .tv_sec = meson_vrtc_kept_time(vrtc) };
+	int ret;
+
+	if (ktime_get_real_seconds() >= ts.tv_sec)
+		return;
+	ret = do_settimeofday64(&ts);
+	if (ret)
+		dev_warn(dev, "kept time not set as the system time: %d\n", ret);
+	else
+		dev_info(dev, "system time set from the kept time %lld\n", ts.tv_sec);
+}
+
 static int meson_vrtc_keep_init(struct device *dev, struct meson_vrtc_data *vrtc)
 {
 	struct of_phandle_args args;
@@ -173,6 +198,7 @@ static int meson_vrtc_keep_init(struct device *dev, struct meson_vrtc_data *vrtc
 		vrtc->keep_boot = ktime_get_boottime_seconds();
 		vrtc->keep_valid = true;
 		dev_info(dev, "kept time %lld\n", vrtc->keep_base);
+		meson_vrtc_keep_to_system(dev, vrtc);
 	}
 
 	INIT_DELAYED_WORK(&vrtc->keep_work, meson_vrtc_keep_work);
@@ -283,12 +309,25 @@ static int meson_vrtc_probe(struct platform_device *pdev)
 	return devm_rtc_register_device(rtc);
 }
 
+/*
+ * A poweroff wakes on the alarm too, where the firmware counts it (the open
+ * SM1 SC; claude amlogic/software/boot/g12/plan/
+ * 2026-11-05-sm1-sc-wake-sources.md R2): hand it the seconds to the alarm
+ * as suspend does, or 0, so a value left from earlier never arms it.
+ */
 static void meson_vrtc_shutdown(struct platform_device *pdev)
 {
 	struct meson_vrtc_data *vrtc = platform_get_drvdata(pdev);
+	time64_t now = meson_vrtc_now(vrtc);
+	unsigned long secs = 0;
 
 	if (vrtc->io_keep)
-		meson_vrtc_keep_store(vrtc, meson_vrtc_now(vrtc));
+		meson_vrtc_keep_store(vrtc, now);
+	if (vrtc->alarm_time && vrtc->alarm_time > now)
+		secs = vrtc->alarm_time - now;
+	meson_vrtc_set_wakeup_time(vrtc, secs);
+	if (secs)
+		dev_info(&pdev->dev, "poweroff wakes in %lus\n", secs);
 }
 
 static int __maybe_unused meson_vrtc_suspend(struct device *dev)

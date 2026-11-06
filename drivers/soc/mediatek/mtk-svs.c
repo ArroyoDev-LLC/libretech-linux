@@ -2508,7 +2508,7 @@ static struct svs_bank svs_mt8186_banks[] = {
 			.set_freq_pct		= svs_set_bank_freq_pct_v3,
 			.get_volts		= svs_get_bank_volts_v3,
 			.cpu_id			= 6,
-			.tzone_name		= "cpu-big",
+			.tzone_name		= "cpu-big0",
 			.opp_count		= MAX_OPP_ENTRIES,
 			.turn_freq_base		= 1670000000,
 			.volt_step		= 6250,
@@ -2542,7 +2542,7 @@ static struct svs_bank svs_mt8186_banks[] = {
 			.set_freq_pct		= svs_set_bank_freq_pct_v2,
 			.get_volts		= svs_get_bank_volts_v2,
 			.cpu_id			= 0,
-			.tzone_name		= "cpu-little",
+			.tzone_name		= "cpu-little0",
 			.opp_count		= MAX_OPP_ENTRIES,
 			.volt_step		= 6250,
 			.volt_base		= 400000,
@@ -2574,7 +2574,8 @@ static struct svs_bank svs_mt8186_banks[] = {
 			.sw_id			= SVSB_SWID_CCI,
 			.set_freq_pct		= svs_set_bank_freq_pct_v2,
 			.get_volts		= svs_get_bank_volts_v2,
-			.tzone_name		= "cci",
+			/* CCI shares the little cluster's rail; MT8186 has no CCI sensor */
+			.tzone_name		= "cpu-little0",
 			.opp_count		= MAX_OPP_ENTRIES,
 			.volt_step		= 6250,
 			.volt_base		= 400000,
@@ -2621,7 +2622,7 @@ static struct svs_bank svs_mt8186_banks[] = {
 			.tzone_ltemp		= 25000,
 			.tzone_ltemp_voffset	= 7,
 			.dev_fuse_map		= (const struct svs_fusemap[BDEV_MAX]) {
-				{ 6, 16 }, { 6, 24 }, { 6, 0 }, { 15, 8 }, { 15, 0 }
+				{ 6, 16 }, { 6, 24 }, { 6, 0 }, { 15, 0 }, { 15, 8 }
 			}
 		},
 		.volt_flags	= SVSB_REMOVE_DVTFIXED_VOLT | SVSB_MON_VOLT_IGNORE,

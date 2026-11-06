@@ -83,6 +83,20 @@
 			sc-heartbeat-sram@200 {
 				reg = <0x200 0x20>;
 			};
+
+			/*
+			 * Kept time for the vRTC (rtc-meson-vrtc "amlogic,keep-sram"):
+			 * four words at the top of the low AP->SC half, which no
+			 * channel uses.  On SM1 this window is the only SRAM
+			 * non-secure software can reach, and these 16 bytes keep
+			 * their contents across a reset and a poweroff on the open
+			 * chain (claude amlogic/software/boot/g12/plan/
+			 * 2026-11-05-sm1-sc-wake-sources.md K1b).  Reserved from the
+			 * sram pool.
+			 */
+			vrtc_keep_sram: vrtc-keep-sram@3f0 {
+				reg = <0x3f0 0x10>;
+			};
 		};
 
 		/*
@@ -112,4 +126,9 @@
 			status = "disabled";
 		};
 	};
+};
+
+/* The kept clock (vrtc_keep_sram above): the board keeps time across a reboot. */
+&vrtc {
+	amlogic,keep-sram = <&vrtc_keep_sram 0>;
 };

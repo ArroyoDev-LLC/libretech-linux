@@ -55,8 +55,15 @@
 	clkreq-gpios = <&gpio GPIOC_7 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
 };
 
+/*
+ * Module pin 76 (card detect, GPIOC_6) is "Reserved" on the CM4IO and VBAT
+ * (the RTC coin cell) on the CM5IO: neither carrier wires the microSD socket's
+ * card-detect switch, so poll for the card instead.
+ */
 &sd_emmc_b {
 	status = "okay";
+	/delete-property/ cd-gpios;
+	broken-cd;
 };
 
 &usb {

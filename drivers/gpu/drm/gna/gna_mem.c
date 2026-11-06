@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright(c) 2017-2022 Intel Corporation
 
+#include <drm/drm_drv.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
@@ -218,7 +219,7 @@ out:
 	return ret;
 }
 
-/* An object is being freed: if the page tables are kept for it, drop them (runs on the request workqueue). */
+/* An object is being freed: if the page tables are kept for it, drop them (with the hardware held). */
 void gna_mmu_forget(struct gna_device *gna_priv, struct drm_gem_object *obj)
 {
 	struct gna_mmu_object *mmu = &gna_priv->mmu;
@@ -242,44 +243,55 @@ void gna_mmu_release(struct gna_device *gna_priv)
 	mutex_unlock(&gna_priv->mmu_lock);
 }
 
-static void gna_delete_score_requests(u32 handle, struct gna_device *gna_priv)
+/*
+ * GEM_FREE of a handle: drop the client's requests still to run that name it, and the page tables if they are kept
+ * for its object.
+ * Only this file's requests: handles are per file, so the same number names a different object in another client.
+ * Runs in the ioctl, not on the request workqueue: the hardware is held only while the requests are taken off the list
+ * and, at the end, while the tables are dropped; a queued request is cancelled -- or waited for, if it is already
+ * waiting for the hardware in gna_request_process() -- in between, with the hardware given back.
+ */
+void gna_gem_free_requests(struct gna_device *gna_priv, struct drm_file *file, u32 handle,
+			   struct drm_gem_object *obj)
 {
-	struct gna_request *req, *temp_req;
-	struct list_head *reqs_list;
-	int i;
+	struct gna_request *req, *tmp;
+	LIST_HEAD(gone);
+	u64 i;
 
+	gna_hw_acquire(gna_priv);   /* no request on the hardware: one started from COMPUTE has completed */
 	mutex_lock(&gna_priv->reqlist_lock);
-
-	reqs_list = &gna_priv->request_list;
-	if (!list_empty(reqs_list)) {
-		list_for_each_entry_safe(req, temp_req, reqs_list, node) {
-			for (i = 0; i < req->buffer_count; ++i) {
-				if (req->buffer_list[i].gna.handle == handle) {
-					list_del_init(&req->node);
-					cancel_work_sync(&req->work);
-					atomic_dec(&gna_priv->enqueued_requests);
-					kref_put(&req->refcount, gna_request_release);
-					break;
-				}
+	list_for_each_entry_safe(req, tmp, &gna_priv->request_list, node) {
+		/* only requests still to run: one that has completed holds a result for its WAIT, whichever way it ran
+		 * (a queued one has released its buffers by now, one started from COMPUTE not), so it stays collectable */
+		if (req->drm_f != file || READ_ONCE(req->state) == DONE)
+			continue;
+		for (i = 0; i < req->buffer_count; i++) {
+			if (req->buffer_list[i].gna.handle == handle) {
+				/* off the list for good (an empty node tells a racing WAIT the list's reference is taken),
+				 * onto ours through reap, which nothing else touches */
+				list_del_init(&req->node);
+				list_add_tail(&req->reap, &gone);
+				break;
 			}
 		}
 	}
-
 	mutex_unlock(&gna_priv->reqlist_lock);
-}
+	gna_hw_release(gna_priv);
 
-void gna_gem_obj_release_work(struct work_struct *work)
-{
-	struct gna_gem_object *gnagemo;
+	list_for_each_entry_safe(req, tmp, &gone, reap) {
+		list_del(&req->reap);
+		/* queued and cancelled: it never runs -- complete it -ECANCELED and count it out (a WAIT of another thread
+		 * may be sleeping on it), and its work's own reference is ours to put; one that already ran did all that */
+		if (cancel_work_sync(&req->work)) {
+			gna_request_cancelled(gna_priv, req);
+			kref_put(&req->refcount, gna_request_release);
+		}
+		kref_put(&req->refcount, gna_request_release);   /* the list's reference */
+	}
 
-	gnagemo = container_of(work, struct gna_gem_object, work);
-
-	/* a request started from COMPUTE completes in the interrupt, outside this workqueue: wait for it before its
-	 * request or its mapping goes */
-	gna_hw_acquire(to_gna_device(gnagemo->base.base.dev));
-	gna_delete_score_requests(gnagemo->handle, to_gna_device(gnagemo->base.base.dev));
-	gna_mmu_forget(to_gna_device(gnagemo->base.base.dev), &gnagemo->base.base);
-	gna_hw_release(to_gna_device(gnagemo->base.base.dev));
-
-	wake_up_interruptible(&gnagemo->waitq);
+	/* after the requests the loop waited for: one already waiting for the hardware may have mapped the object again */
+	gna_hw_acquire(gna_priv);
+	if (!drm_dev_is_unplugged(&gna_priv->drm))   /* after remove the descriptor is freed (see gna_request_file_close) */
+		gna_mmu_forget(gna_priv, obj);
+	gna_hw_release(gna_priv);
 }

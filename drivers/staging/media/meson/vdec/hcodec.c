@@ -116,15 +116,19 @@ static const u8 qp_to_qpc[] = {
 };
 
 /*
- * HCODEC encoder turbo clock level (0-2).
+ * HCODEC encoder turbo clock level (0-1; a higher value is level 1).
  *
  *   0: 800 MHz -- default, matches VDEC_1/HEVC thermal state 0
- *   1: 1000 MHz -- +4% fps gain (requires gp0_pll on G12B+)
- *   2: 1200 MHz -- +7% fps gain, max stable (requires gp0_pll on G12B+)
+ *   1: 1000 MHz -- +4% fps gain (a GP0 / HiFi PLL on G12A+)
  *
- * Levels 1-2 are silently ignored on GXL (no gp0_pll); the encoder falls
- * back to the thermal-state rate.  On G12A/G12B/SM1 gp0_pll is available
- * and the target rate is applied on the next hcodec_poweron().
+ * The cap is 1000 MHz.  1200 MHz (+7% fps) is not a rate every unit's
+ * encoder runs: on S905D3 two of four units stall or emit a corrupt SPS
+ * at 1200 MHz from either PLL, while each unit tested at 1000 MHz ran clean.
+ *
+ * Level 1 is silently ignored on GXL (no PLL on its HCODEC mux); the
+ * encoder falls back to the thermal-state rate.  On G12A/G12B/SM1 the
+ * clock framework picks a free PLL (see hcodec_holds_rate()); the target
+ * rate is applied on the next hcodec_poweron().
  *
  * Note: turbo only affects HCODEC (encoder).  VDEC_1 and VDEC_HEVC
  * (decoders) remain at the thermal cooling rate.
@@ -132,7 +136,7 @@ static const u8 qp_to_qpc[] = {
 static unsigned int hcodec_turbo;
 module_param(hcodec_turbo, uint, 0644);
 MODULE_PARM_DESC(hcodec_turbo,
-		 "HCODEC encoder turbo: 0=800MHz 1=1000MHz 2=1200MHz (default=0)");
+		 "HCODEC encoder turbo: 0=800MHz 1=1000MHz, the cap (default=0)");
 
 /*
  * Auto-clock gate settle delay in microseconds.
@@ -157,8 +161,7 @@ MODULE_PARM_DESC(hcodec_settle_us,
  */
 static const unsigned long hcodec_turbo_rates[] = {
 	800000000,	/* 0: default */
-	1000000000,	/* 1: +4% fps */
-	1200000000,	/* 2: +7% fps, max stable */
+	1000000000,	/* 1: +4% fps, the cap */
 };
 
 #define HCODEC_TURBO_MAX (ARRAY_SIZE(hcodec_turbo_rates) - 1)
@@ -203,45 +206,33 @@ void hcodec_thermal_update(struct amvdec_core *core, unsigned long rate)
 		clk_set_rate(core->hcodec_clk, rate);
 }
 
+/*
+ * On G12A/G12B/SM1 the HCODEC mux reaches the GP0 and HiFi PLLs, which
+ * other consumers (the NPU, MIPI DSI) also run from.  The encoder asks its
+ * own clock for the rate and the clock framework picks the input: a fixed
+ * divider for any rate one makes, a free PLL above them.  The rate is held
+ * (clk_rate_exclusive_get) while the encoder is powered, so no other
+ * consumer retunes that PLL underneath it; a PLL another consumer holds
+ * offers only its held rate, and a level no free input makes falls to the
+ * closest rate below it.  GXL's mux reaches no PLL and takes no hold.
+ */
+static bool hcodec_holds_rate(struct amvdec_core *core)
+{
+	return core->hcodec_clk &&
+	       core->platform->revision >= VDEC_REVISION_G12A;
+}
+
 static void hcodec_clk_enable(struct amvdec_core *core)
 {
 	if (core->hcodec_clk) {
 		unsigned long target = hcodec_target_rate(core);
 
-		/*
-		 * If gp0_pll is available and target > fclk_div2p5 (800 MHz),
-		 * switch the mux parent to gp0_pll so the PLL can be
-		 * programmed to the exact rate. Without clk_set_parent the
-		 * mux stays on fclk_div2p5 and clk_set_rate silently caps
-		 * at 800 MHz (the mux lacks CLK_SET_RATE_PARENT).
-		 */
-		/*
-		 * clk_set_parent must target the MUX (vdec_hcodec_sel),
-		 * not the gate (vdec_hcodec). The chain is:
-		 *   gate -> div -> mux -> {fclk_div2p5, gp0_pll, ...}
-		 * clk_get_parent twice to reach the mux.
-		 */
-		if (core->gp0_pll && target > 800000000) {
-			/*
-			 * gp0_pll must be enabled at the target rate BEFORE
-			 * switching the mux. Otherwise CLK_MUX_ROUND_CLOSEST
-			 * sees gp0_pll at 0 Hz and picks fclk_div2p5 instead.
-			 */
-			clk_set_rate(core->gp0_pll, target);
-			clk_prepare_enable(core->gp0_pll);
-
-			struct clk *div = clk_get_parent(core->hcodec_clk);
-			struct clk *mux = div ? clk_get_parent(div) : NULL;
-
-			if (mux)
-				clk_set_parent(mux, core->gp0_pll);
-		}
-
 		clk_set_rate(core->hcodec_clk, target);
+		if (hcodec_holds_rate(core))
+			clk_rate_exclusive_get(core->hcodec_clk);
 		clk_prepare_enable(core->hcodec_clk);
-		dev_info(core->dev, "HCODEC: clk=%lu target=%lu gp0=%lu\n",
-			 clk_get_rate(core->hcodec_clk), target,
-			 core->gp0_pll ? clk_get_rate(core->gp0_pll) : 0);
+		dev_info(core->dev, "HCODEC: clk=%lu target=%lu\n",
+			 clk_get_rate(core->hcodec_clk), target);
 	} else if (core->regmap_hhi) {
 		/* Direct HHI programming: fclk_div3 (~667MHz), div=1, gate=on */
 		regmap_update_bits(core->regmap_hhi, HHI_VDEC_CLK_CNTL,
@@ -253,6 +244,8 @@ static void hcodec_clk_disable(struct amvdec_core *core)
 {
 	if (core->hcodec_clk) {
 		clk_disable_unprepare(core->hcodec_clk);
+		if (hcodec_holds_rate(core))
+			clk_rate_exclusive_put(core->hcodec_clk);
 	} else if (core->regmap_hhi) {
 		regmap_update_bits(core->regmap_hhi, HHI_VDEC_CLK_CNTL,
 				   HCODEC_CLK_GATE, 0);

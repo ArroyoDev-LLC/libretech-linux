@@ -474,9 +474,9 @@ static const struct meson_pmx_group meson_gxl_periphs_groups[] = {
 	GROUP(i2s_out_lr_clk,	6,	24),
 	GROUP(i2s_out_ch01,	6,	23),
 	GROUP(spdif_out_h,	6,	28),
-	GROUP(tsin_b_d0,	6,	17),
+	GROUP(tsin_b_d0,	6,	19),
 	GROUP(tsin_b_sop,	6,	18),
-	GROUP(tsin_b_d_valid,	6,	19),
+	GROUP(tsin_b_d_valid,	6,	17),
 	GROUP(tsin_b_clk,	6,	20),
 
 	/* Bank DV */

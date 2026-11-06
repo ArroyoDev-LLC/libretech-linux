@@ -208,8 +208,18 @@ static int meson_pinconf_set_gpio_bit(struct meson_pinctrl *pc,
 	meson_calc_reg_and_bit(bank, pin, reg_type, &reg, &bit);
 	/* TEST_N pin direction needs to be set using a Secure Monitor call */
 	if (reg_type == MESON_REG_DIR && bank->smc) {
-		u32 smc_ret = 0;
-		return meson_sm_call(pc->fw, SM_TEST_N_DIR, &smc_ret, arg ? 0 : bit, 0, 0, 0, 0);
+		s32 smc_ret = 0;
+
+		ret = meson_sm_call(pc->fw, SM_TEST_N_DIR, &smc_ret, arg ? 0 : bit, 0, 0, 0, 0);
+		if (ret)
+			return ret;
+		/*
+		 * The vendor monitor answers 0. One that does not implement the
+		 * call answers SMC_UNK, and the direction is then unknown, not
+		 * the one asked for.
+		 */
+		pc->smc_dir = smc_ret ? -1 : !arg;
+		return 0;
 	}
 	return regmap_update_bits(pc->reg_gpio, reg, BIT(bit),
 				  arg ? BIT(bit) : 0);
@@ -226,6 +236,18 @@ static int meson_pinconf_get_gpio_bit(struct meson_pinctrl *pc,
 	ret = meson_get_bank(pc, pin, &bank);
 	if (ret)
 		return ret;
+
+	/*
+	 * The SMC bank's DIR "register" is the secure monitor's command index,
+	 * not a gpio regmap offset: reading it would return an unrelated bit
+	 * (GPIOAO_1's input level on GXL). Report the direction the monitor last
+	 * confirmed instead, as the DIR bit (1 = input).
+	 */
+	if (reg_type == MESON_REG_DIR && bank->smc) {
+		if (pc->smc_dir < 0)
+			return -EOPNOTSUPP;
+		return !pc->smc_dir;
+	}
 
 	meson_calc_reg_and_bit(bank, pin, reg_type, &reg, &bit);
 	ret = regmap_read(pc->reg_gpio, reg, &val);
@@ -1003,6 +1025,7 @@ int meson_pinctrl_probe(struct platform_device *pdev)
 		return -EPROBE_DEFER;
 
 	pc->dev = dev;
+	pc->smc_dir = -1;
 	pc->data = (struct meson_pinctrl_data *) of_device_get_match_data(dev);
 
 	ret = meson_pinctrl_parse_dt(pc);

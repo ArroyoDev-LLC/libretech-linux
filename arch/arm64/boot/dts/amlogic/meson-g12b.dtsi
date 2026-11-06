@@ -205,14 +205,15 @@
 &dmc {
 	/*
 	 * The DMC's per-port channel-control window (DMC_AM0_CHAN_CTRL at word
-	 * 0x60 through DMC_AXI11_HOLD_CTRL at 0xad). Disabled here: a board
-	 * that raises a port's arbitration priority enables it and lists the
-	 * ports; every other board keeps the firmware default of 0 everywhere.
+	 * 0x60 through DMC_AXI11_HOLD_CTRL at 0xad). Scanout cannot wait, so
+	 * every G12B board gives the VPU read ports (16/17/18) the top weight;
+	 * the firmware leaves every port at 0. A board that raises another port
+	 * restates these three in its own list, keeping them above it.
 	 */
 	dmc_qos: qos@180 {
 		compatible = "amlogic,g12b-dmc-port-priority";
 		reg = <0x0 0x180 0x0 0x140>;
-		status = "disabled";
+		amlogic,port-priority = <16 7>, <17 7>, <18 7>;
 	};
 };
 

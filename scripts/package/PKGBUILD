@@ -40,8 +40,9 @@ _prologue() {
 	# Bypass this override with a custom variable.
 	export MAKEFLAGS="${KBUILD_MAKEFLAGS}"
 
-	# Kbuild works in the output directory, where this PKGBUILD is located.
-	cd "$(dirname "${BASH_SOURCE[0]}")"
+	# Kbuild works in the output directory, where this PKGBUILD is located
+	# unless makepkg runs elsewhere (PACMAN_STARTDIR).
+	cd "${KBUILD_OBJTREE:-$(dirname "${BASH_SOURCE[0]}")}"
 }
 
 build() {

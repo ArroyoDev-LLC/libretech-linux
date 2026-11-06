@@ -3,6 +3,7 @@
  * Copyright (c) 2015, Fuzhou Rockchip Electronics Co., Ltd
  */
 
+#include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -44,6 +45,9 @@ struct rockchip_mbox {
 	struct clk *pclk;
 	bool doorbell;
 	void __iomem *mbox_base;
+
+	/* Serialises the read-modify-write of B2A_INTEN */
+	spinlock_t inten_lock;
 
 	/* The maximum size of buf for each channel */
 	u32 buf_size;
@@ -92,13 +96,32 @@ static int rockchip_mbox_send_data(struct mbox_chan *chan, void *data)
 	return 0;
 }
 
+/*
+ * B2A_INTEN holds one enable bit per channel in a plain read/write
+ * register (no write-enable half), so each channel flips only its own bit:
+ * releasing one client must not silence the others.
+ */
+static void rockchip_mbox_b2a_inten(struct rockchip_mbox *mb, int idx,
+				    bool enable)
+{
+	unsigned long flags;
+	u32 val;
+
+	spin_lock_irqsave(&mb->inten_lock, flags);
+	val = readl_relaxed(mb->mbox_base + MAILBOX_B2A_INTEN);
+	if (enable)
+		val |= BIT(idx);
+	else
+		val &= ~BIT(idx);
+	writel_relaxed(val, mb->mbox_base + MAILBOX_B2A_INTEN);
+	spin_unlock_irqrestore(&mb->inten_lock, flags);
+}
+
 static int rockchip_mbox_startup(struct mbox_chan *chan)
 {
 	struct rockchip_mbox *mb = dev_get_drvdata(chan->mbox->dev);
 
-	/* Enable all B2A interrupts */
-	writel_relaxed((1 << mb->mbox.num_chans) - 1,
-		       mb->mbox_base + MAILBOX_B2A_INTEN);
+	rockchip_mbox_b2a_inten(mb, chan_idx(chan), true);
 
 	return 0;
 }
@@ -106,12 +129,11 @@ static int rockchip_mbox_startup(struct mbox_chan *chan)
 static void rockchip_mbox_shutdown(struct mbox_chan *chan)
 {
 	struct rockchip_mbox *mb = dev_get_drvdata(chan->mbox->dev);
-	struct rockchip_mbox_chan *chans = mb->chans;
+	int idx = chan_idx(chan);
 
-	/* Disable all B2A interrupts */
-	writel_relaxed(0, mb->mbox_base + MAILBOX_B2A_INTEN);
+	rockchip_mbox_b2a_inten(mb, idx, false);
 
-	mb->chans[chans->idx].msg = NULL;
+	mb->chans[idx].msg = NULL;
 }
 
 static const struct mbox_chan_ops rockchip_mbox_chan_ops = {
@@ -148,11 +170,6 @@ static irqreturn_t rockchip_mbox_isr(int irq, void *dev_id)
 		if (irq != mb->chans[idx].irq)
 			continue;
 
-		if (mb->doorbell) {
-			mbox_chan_received_data(&mb->mbox.chans[idx], NULL);
-			break;
-		}
-
 		msg = mb->chans[idx].msg;
 		if (!msg) {
 			dev_err(mb->mbox.dev,
@@ -170,6 +187,34 @@ static irqreturn_t rockchip_mbox_isr(int irq, void *dev_id)
 	}
 
 	return IRQ_HANDLED;
+}
+
+/*
+ * A doorbell carries no data, so the B2A interrupt is delivered to the
+ * client from the hard IRQ, as mbox_chan_received_data() allows: every
+ * client here (SCMI, the M0 I2C offload) is IRQ-safe. A threaded handler
+ * is bound to the IRQ's CPU and runs only when that CPU can schedule, so
+ * any long non-preemptible stretch there -- a printk burst flushed to the
+ * 115200 baud legacy console holds one for 30 ms and more at boot --
+ * pushed the reply past SCMI's 30 ms deadline although the M0 had
+ * answered in 5 ms. Interrupts still run between console records.
+ */
+static irqreturn_t rockchip_mbox_doorbell_irq(int irq, void *dev_id)
+{
+	struct rockchip_mbox *mb = dev_id;
+	u32 status = readl_relaxed(mb->mbox_base + MAILBOX_B2A_STATUS);
+	int idx;
+
+	for (idx = 0; idx < mb->mbox.num_chans; idx++) {
+		if ((status & BIT(idx)) && irq == mb->chans[idx].irq) {
+			writel_relaxed(BIT(idx),
+				       mb->mbox_base + MAILBOX_B2A_STATUS);
+			mbox_chan_received_data(&mb->mbox.chans[idx], NULL);
+			return IRQ_HANDLED;
+		}
+	}
+
+	return IRQ_NONE;
 }
 
 static const struct rockchip_mbox_data rk3368_drv_data = {
@@ -216,6 +261,7 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, mb);
 
+	spin_lock_init(&mb->inten_lock);
 	mb->mbox.dev = &pdev->dev;
 	mb->mbox.num_chans = drv_data->num_chans;
 	mb->mbox.ops = &rockchip_mbox_chan_ops;
@@ -239,17 +285,23 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
 		if (irq < 0)
 			return irq;
 
-		ret = devm_request_threaded_irq(&pdev->dev, irq,
-						rockchip_mbox_irq,
-						rockchip_mbox_isr, IRQF_ONESHOT,
-						dev_name(&pdev->dev), mb);
-		if (ret < 0)
-			return ret;
-
 		mb->chans[i].idx = i;
 		mb->chans[i].irq = irq;
 		mb->chans[i].mb = mb;
 		mb->chans[i].msg = NULL;
+
+		if (mb->doorbell)
+			ret = devm_request_irq(&pdev->dev, irq,
+					       rockchip_mbox_doorbell_irq, 0,
+					       dev_name(&pdev->dev), mb);
+		else
+			ret = devm_request_threaded_irq(&pdev->dev, irq,
+							rockchip_mbox_irq,
+							rockchip_mbox_isr,
+							IRQF_ONESHOT,
+							dev_name(&pdev->dev), mb);
+		if (ret < 0)
+			return ret;
 	}
 
 	ret = devm_mbox_controller_register(&pdev->dev, &mb->mbox);

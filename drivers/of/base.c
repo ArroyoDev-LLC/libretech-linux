@@ -108,6 +108,15 @@ static bool of_coreboot_present(void)
 	of_coreboot_present() \
 )
 
+/*
+ * Platforms whose firmware omits #address-cells / #size-cells and which keep
+ * the deprecated walk to the parent node without a warning.
+ */
+bool of_default_cells_excluded(void)
+{
+	return EXCLUDED_DEFAULT_CELLS_PLATFORMS;
+}
+
 int of_bus_n_addr_cells(struct device_node *np)
 {
 	u32 cells;

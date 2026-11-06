@@ -2669,8 +2669,14 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
 	unsigned int bytes_compl = 0, pkts_compl = 0;
 	unsigned int entry, xmits = 0, count = 0;
 	u32 tx_packets = 0, tx_errors = 0;
+	struct netdev_queue *txq = netdev_get_tx_queue(priv->dev, queue);
 
-	__netif_tx_lock_bh(netdev_get_tx_queue(priv->dev, queue));
+	/* Only NAPI polls call this: from softirq or threaded NAPI with BH
+	 * already disabled, or from netpoll with IRQs disabled. A _bh unlock
+	 * would run pending softirqs inside netpoll with IRQs re-enabled;
+	 * napi_poll() there spins on the poll_owner this CPU already holds.
+	 */
+	__netif_tx_lock(txq, smp_processor_id());
 
 	tx_q->xsk_frames_done = 0;
 
@@ -2840,7 +2846,7 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
 
 	priv->xstats.tx_errors += tx_errors;
 
-	__netif_tx_unlock_bh(netdev_get_tx_queue(priv->dev, queue));
+	__netif_tx_unlock(txq);
 
 	/* Combine decisions from TX clean and XSK TX */
 	return max(count, xmits);

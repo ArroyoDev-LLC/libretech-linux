@@ -309,6 +309,8 @@
 		compatible = "jedec,spi-nor";
 		reg = <0>;
 		spi-max-frequency = <83333333>;
+		/* NOR_D and NOR_Q carry read data; GXL has no IO2/IO3 pins */
+		spi-rx-bus-width = <2>;
 	};
 };
 

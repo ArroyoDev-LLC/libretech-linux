@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright(c) 2017-2022 Intel Corporation
 
+#include <drm/drm_drv.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
@@ -47,6 +48,13 @@ int gna_validate_score_config(struct gna_compute_cfg *compute_cfg,
 		return -EINVAL;
 	}
 
+	/* a buffer is at least a page of the device's address space; more cannot be mapped, and the duplicate check is
+	 * quadratic in the count */
+	if (compute_cfg->buffer_count > gna_priv->info.max_hw_mem / PAGE_SIZE) {
+		dev_dbg(gna_dev(gna_priv), "too many buffers: %llu\n", compute_cfg->buffer_count);
+		return -EINVAL;
+	}
+
 	buffers_size = sizeof(struct gna_buffer) * compute_cfg->buffer_count;
 	if (!access_ok(u64_to_user_ptr(compute_cfg->buffers_ptr), buffers_size))
 		return -EACCES;
@@ -56,7 +64,7 @@ int gna_validate_score_config(struct gna_compute_cfg *compute_cfg,
 
 static void gna_request_update_status(struct gna_request *score_request)
 {
-	struct gna_device *gna_priv = to_gna_device(score_request->drm_f->minor->dev);
+	struct gna_device *gna_priv = score_request->gna_priv;
 	/* The gna_priv's hw_status should be updated first */
 	u32 hw_status = gna_priv->hw_status;
 	u32 stall_cycles;
@@ -110,6 +118,58 @@ static int gna_pm_put(struct gna_device *gna_priv)
 	return pm_runtime_put_autosuspend(gna_dev(gna_priv));
 }
 
+/*
+ * Mark a request DONE and wake its waiters, under the wait queue's lock. Whoever completes a request calls this last
+ * before giving back the hardware, and touches the request no more: a WAIT that has seen DONE takes the lock once
+ * (gna_request_wait_done()), and the paths that drop requests take the hardware first, so neither can free the
+ * request while its completion still uses it.
+ */
+static void gna_request_set_done(struct gna_request *score_request)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&score_request->waitq.lock, flags);
+	score_request->state = DONE;
+	wake_up_all_locked(&score_request->waitq);
+	spin_unlock_irqrestore(&score_request->waitq.lock, flags);
+}
+
+void gna_request_wait_done(struct gna_request *score_request)
+{
+	spin_lock_irq(&score_request->waitq.lock);
+	spin_unlock_irq(&score_request->waitq.lock);
+}
+
+/* Queue a listed request's work, which holds its own reference: put when it has run, or by whoever cancels it. */
+static void gna_request_queue_locked(struct gna_device *gna_priv, struct gna_request *score_request)
+{
+	lockdep_assert_held(&gna_priv->reqlist_lock);
+	kref_get(&score_request->refcount);
+	queue_work(gna_priv->request_wq, &score_request->work);
+}
+
+/*
+ * A request that will never run -- its queued work cancelled, or dropped before it was queued -- by GEM_FREE or close:
+ * count it out and complete it, -ECANCELED, so a WAIT already sleeping on it (another thread of the client) returns.
+ */
+void gna_request_cancelled(struct gna_device *gna_priv, struct gna_request *score_request)
+{
+	score_request->status = -ECANCELED;
+	score_request->drv_perf.completion = ktime_get_ns();
+	atomic_dec(&gna_priv->enqueued_requests);
+	gna_request_set_done(score_request);
+}
+
+/* the queued request on the hardware, for the interrupt to recognise its completion; NULL when there is none */
+static void gna_set_queued_req(struct gna_device *gna_priv, struct gna_request *score_request)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&gna_priv->direct_lock, flags);
+	gna_priv->queued_req = score_request;
+	spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+}
+
 static void gna_request_process(struct work_struct *work)
 {
 	struct gna_request *score_request;
@@ -118,11 +178,13 @@ static void gna_request_process(struct work_struct *work)
 	int ret;
 
 	score_request = container_of(work, struct gna_request, work);
-	gna_priv = to_gna_device(score_request->drm_f->minor->dev);
+	gna_priv = score_request->gna_priv;
 
 	gna_hw_acquire(gna_priv);        /* after a directly started request, if one is on the hardware */
-	score_request->polled = false;   /* a queued request always completes by interrupt */
-	score_request->state = ACTIVE;
+	/* a queued request always completes by interrupt; a WAIT that read it polled meanwhile polls its state, which
+	 * reaches DONE just the same */
+	WRITE_ONCE(score_request->polled, false);
+	WRITE_ONCE(score_request->state, ACTIVE);
 
 	score_request->drv_perf.pre_processing = ktime_get_ns();
 
@@ -141,9 +203,11 @@ static void gna_request_process(struct work_struct *work)
 	 * isr: X -> false
 	 */
 	gna_priv->dev_busy = true;
+	gna_set_queued_req(gna_priv, score_request);   /* the interrupt claims only its completion (gna_interrupt) */
 
 	ret = gna_score(score_request);
 	if (ret) {
+		gna_set_queued_req(gna_priv, NULL);
 		if (gna_pm_put(gna_priv) < 0)
 			dev_warn(gna_dev(gna_priv), "pm_runtime_put_autosuspend() failed: %d\n", ret);
 		score_request->status = ret;
@@ -156,6 +220,7 @@ static void gna_request_process(struct work_struct *work)
 
 	hw_timeout = wait_event_timeout(gna_priv->dev_busy_waitq,
 			!gna_priv->dev_busy, hw_timeout);
+	gna_set_queued_req(gna_priv, NULL);
 
 	if (!hw_timeout)
 		dev_warn(gna_dev(gna_priv), "hardware timeout occurred\n");
@@ -175,12 +240,11 @@ static void gna_request_process(struct work_struct *work)
 	/* the page tables stay mapped for the next request (gna_mmu_map_request) */
 tail:
 	score_request->drv_perf.completion = ktime_get_ns();
-	score_request->state = DONE;
 	gna_request_make_zombie(score_request);
-	gna_hw_release(gna_priv);
-
 	atomic_dec(&gna_priv->enqueued_requests);
-	wake_up_interruptible_all(&score_request->waitq);
+	gna_request_set_done(score_request);
+	gna_hw_release(gna_priv);
+	kref_put(&score_request->refcount, gna_request_release);   /* the work's own reference (gna_enqueue_request) */
 }
 
 /*
@@ -190,7 +254,7 @@ tail:
  */
 void gna_request_complete_direct(struct gna_request *score_request, bool timed_out)
 {
-	struct gna_device *gna_priv = to_gna_device(score_request->drm_f->minor->dev);
+	struct gna_device *gna_priv = score_request->gna_priv;
 	int ret;
 
 	gna_priv->hw_status = gna_reg_read(gna_priv, GNA_MMIO_STS);
@@ -211,10 +275,9 @@ void gna_request_complete_direct(struct gna_request *score_request, bool timed_o
 	gna_pm_put(gna_priv);
 
 	score_request->drv_perf.completion = ktime_get_ns();
-	score_request->state = DONE;
 	atomic_dec(&gna_priv->enqueued_requests);
+	gna_request_set_done(score_request);
 	gna_hw_release(gna_priv);
-	wake_up_interruptible_all(&score_request->waitq);
 }
 
 /* how often a request started with its interrupt masked was completed, and by whom */
@@ -237,8 +300,13 @@ bool gna_hw_reclaim(struct gna_device *gna_priv)
 	struct gna_request *req = NULL;
 	unsigned long flags;
 
+	/*
+	 * Only once its START is written (hw_started): until then STS still carries the previous request's completion --
+	 * a clean finish clears only the saturation bit -- and the request would be completed before it ran, giving the
+	 * hardware to another request that its own START then overwrites.
+	 */
 	spin_lock_irqsave(&gna_priv->direct_lock, flags);
-	if (gna_priv->direct_req && gna_priv->direct_req->polled &&
+	if (gna_priv->direct_req && gna_priv->direct_req->polled && gna_priv->direct_req->hw_started &&
 	    (gna_reg_read(gna_priv, GNA_MMIO_STS) & (GNA_STS_SCORE_COMPLETED | GNA_ERROR))) {
 		req = gna_priv->direct_req;
 		gna_priv->direct_req = NULL;
@@ -252,8 +320,34 @@ bool gna_hw_reclaim(struct gna_device *gna_priv)
 }
 
 /*
+ * A request started from COMPUTE that has held the hardware past the recovery timeout: its completion is not coming
+ * (the accelerator hung) and its client may never WAIT, so nothing else would give the hardware back. Complete it as
+ * timed out, as its WAIT would -- the timeout a queued request gets in gna_request_process(). True when one was.
+ */
+static bool gna_hw_reclaim_stuck(struct gna_device *gna_priv)
+{
+	u64 limit_ns = jiffies_to_nsecs(gna_priv->recovery_timeout_jiffies);
+	struct gna_request *req;
+	unsigned long flags;
+
+	spin_lock_irqsave(&gna_priv->direct_lock, flags);
+	req = gna_priv->direct_req;
+	if (req && req->hw_started && ktime_get_ns() - req->drv_perf.processing > limit_ns)
+		gna_priv->direct_req = NULL;
+	else
+		req = NULL;
+	spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+	if (!req)
+		return false;
+	dev_warn(gna_dev(gna_priv), "hardware timeout occurred\n");
+	gna_request_complete_direct(req, true);
+	return true;
+}
+
+/*
  * Take the hardware. Every path that needs it goes through these, so a finished masked request is always reclaimed
- * by whoever needs the hardware next -- none of them can wait for an interrupt that will not come.
+ * by whoever needs the hardware next -- none of them can wait for an interrupt that will not come -- and a hung one
+ * after the recovery timeout.
  */
 static bool gna_hw_try_acquire(struct gna_device *gna_priv)
 {
@@ -267,9 +361,12 @@ static bool gna_hw_try_acquire(struct gna_device *gna_priv)
 
 void gna_hw_acquire(struct gna_device *gna_priv)
 {
-	while (down_timeout(&gna_priv->hw_sem, msecs_to_jiffies(1)))
+	while (down_timeout(&gna_priv->hw_sem, msecs_to_jiffies(1))) {
 		if (gna_hw_reclaim(gna_priv))
 			polled_reclaim_acquire++;
+		else
+			gna_hw_reclaim_stuck(gna_priv);
+	}
 }
 
 void gna_hw_release(struct gna_device *gna_priv)
@@ -278,16 +375,31 @@ void gna_hw_release(struct gna_device *gna_priv)
 }
 
 /*
- * WAIT on a request started with its interrupt masked: complete it if the hardware has finished, else poll at a
- * short interval until it has or the timeout passes. Returns as wait_event_interruptible_timeout does: > 0 done,
- * 0 timed out, -ERESTARTSYS on a signal.
+ * WAIT on a request submitted with GNA_FLAG_SCORE_POLLED: once it runs with its interrupt masked, complete it if the
+ * hardware has finished, else poll at a short interval until it has or the timeout passes. Until then -- not started
+ * yet, or queued behind another request, which the worker runs with its interrupt enabled -- there is nothing to
+ * poll: sleep until it completes or starts from COMPUTE (both wake the wait queue). Returns as
+ * wait_event_interruptible_timeout does: > 0 done, 0 timed out, -ERESTARTSYS on a signal.
  */
 long gna_request_wait_polled(struct gna_device *gna_priv, struct gna_request *score_request, u32 timeout_ms)
 {
 	unsigned long end = jiffies + msecs_to_jiffies(timeout_ms);
 	bool polled = false;
+	long left;
 
 	while (READ_ONCE(score_request->state) != DONE) {
+		if (READ_ONCE(score_request->state) == NEW || !READ_ONCE(score_request->polled)) {
+			left = (long)(end - jiffies);   /* one read: the macro below evaluates its timeout more than once */
+			if (left <= 0)
+				return 0;
+			left = wait_event_interruptible_timeout(score_request->waitq,
+					READ_ONCE(score_request->state) == DONE ||
+					(READ_ONCE(score_request->state) != NEW && READ_ONCE(score_request->polled)),
+					left);
+			if (left < 0)
+				return left;
+			continue;
+		}
 		if (gna_hw_reclaim(gna_priv)) {
 			if (!polled)
 				polled_reclaim_wait++;
@@ -310,7 +422,7 @@ long gna_request_wait_polled(struct gna_device *gna_priv, struct gna_request *sc
  * Nothing queued and nothing on the hardware: start the request here, in the submitting thread, and return
  * without waiting -- no workqueue thread is woken, and the interrupt completes it (gna_request_complete_direct).
  * Called with hw_sem held; false (hw_sem given back) when the device could not be resumed, for the workqueue to
- * report the failure as before.
+ * report the failure as before, or when a signal interrupted the mapping, for the workqueue to run it.
  */
 static bool gna_request_start_direct(struct gna_device *gna_priv, struct gna_request *score_request)
 {
@@ -325,13 +437,14 @@ static bool gna_request_start_direct(struct gna_device *gna_priv, struct gna_req
 		return false;
 	}
 
-	score_request->polled = !!(score_request->compute_cfg.flags & GNA_FLAG_SCORE_POLLED);
-	score_request->state = ACTIVE;
+	WRITE_ONCE(score_request->state, ACTIVE);
 	score_request->drv_perf.pre_processing = ktime_get_ns();
 	gna_priv->dev_busy = true;
 	spin_lock_irqsave(&gna_priv->direct_lock, flags);
 	gna_priv->direct_req = score_request;       /* before the hardware starts: its interrupt completes it */
 	spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+	if (score_request->polled)   /* a WAIT that slept on it before it started polls it from now on */
+		wake_up_all(&score_request->waitq);
 	score_request->drv_perf.processing = ktime_get_ns();
 
 	ret = gna_score(score_request);
@@ -339,7 +452,7 @@ static bool gna_request_start_direct(struct gna_device *gna_priv, struct gna_req
 	if (!ret && score_request->polled &&
 	    (gna_reg_read(gna_priv, GNA_MMIO_STS) & GNA_STS_SCORE_COMPLETED))
 		polled_sts_done_at_start++;
-	if (ret) {
+	if (ret) {   /* on success gna_score() set hw_started with START */
 		spin_lock_irqsave(&gna_priv->direct_lock, flags);
 		owned = gna_priv->direct_req == score_request;
 		if (owned)
@@ -347,12 +460,21 @@ static bool gna_request_start_direct(struct gna_device *gna_priv, struct gna_req
 		spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
 		if (owned) {
 			gna_pm_put(gna_priv);
+			if (ret == -EINTR || ret == -ERESTARTSYS) {
+				/*
+				 * A signal of the submitting thread cut short a lock wait in the mapping
+				 * (drm_gem_shmem_get_pages_sgt() takes the reservation lock interruptibly): no failure of
+				 * the request, and COMPUTE has succeeded. Give it to the worker, which takes no signals.
+				 */
+				WRITE_ONCE(score_request->state, NEW);
+				up(&gna_priv->hw_sem);
+				return false;
+			}
 			score_request->status = ret;
 			score_request->drv_perf.completion = ktime_get_ns();
-			score_request->state = DONE;
 			atomic_dec(&gna_priv->enqueued_requests);
+			gna_request_set_done(score_request);
 			up(&gna_priv->hw_sem);
-			wake_up_interruptible_all(&score_request->waitq);
 		}
 	}
 	return true;
@@ -373,10 +495,13 @@ static struct gna_request *gna_request_create(struct drm_file *file,
 	dev_dbg(gna_dev(gna_priv), "labase: %d, lacount: %d\n",
 		compute_cfg->layer_base, compute_cfg->layer_count);
 
-	score_request->request_id = atomic_inc_return(&gna_priv->request_count);
+	score_request->request_id = atomic64_inc_return(&gna_priv->request_count);
 	score_request->compute_cfg = *compute_cfg;
 	score_request->drm_f = file;
+	score_request->gna_priv = gna_priv;
 	score_request->state = NEW;
+	/* before it is listed: a WAIT can find it from then on and picks how to wait by this (gna_wait_ioctl) */
+	score_request->polled = !!(compute_cfg->flags & GNA_FLAG_SCORE_POLLED);
 	init_waitqueue_head(&score_request->waitq);
 	INIT_WORK(&score_request->work, gna_request_process);
 	INIT_LIST_HEAD(&score_request->node);
@@ -432,7 +557,13 @@ static int gna_buffer_fill_patches(struct gna_buffer *buffer, struct gna_device 
 	if (!patch_count)
 		return 0;
 
-	patches = kvmalloc_array(patch_count, sizeof(struct gna_memory_patch), GFP_KERNEL);
+	/* every patch writes at least one byte of the buffer: more patches than bytes is no request at all */
+	if (patch_count > buffer->size)
+		return -EINVAL;
+
+	/* a client-sized allocation: past INT_MAX kvmalloc refuses it, and without __GFP_NOWARN it WARNs (a panic with
+	 * panic_on_warn) on the client's behalf */
+	patches = kvmalloc_array(patch_count, sizeof(struct gna_memory_patch), GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (!patches)
 		return -ENOMEM;
 
@@ -473,17 +604,17 @@ static int gna_request_fill_buffers(struct gna_request *score_request,
 	int ret;
 
 
-	gna_priv = to_gna_device(score_request->drm_f->minor->dev);
+	gna_priv = score_request->gna_priv;
 
 	buffer_count = compute_cfg->buffer_count;
-	buffer_list = kvmalloc_array(buffer_count, sizeof(*buffer_list), GFP_KERNEL);
+	buffer_list = kvmalloc_array(buffer_count, sizeof(*buffer_list), GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (!buffer_list)
 		return -ENOMEM;
 
 	cfg_buffers = u64_to_user_ptr(compute_cfg->buffers_ptr);
 	for (i = 0; i < buffer_count; ++i) {
 		if (copy_from_user(&buffer_list[i].gna, cfg_buffers+i,
-					sizeof(*buffer_list))) {
+					sizeof(buffer_list[i].gna))) {
 			ret = -EFAULT;
 			goto err_free_buffers;
 		}
@@ -497,9 +628,11 @@ static int gna_request_fill_buffers(struct gna_request *score_request,
 		if (buffer->gna.offset != 0) {
 			dev_dbg(gna_dev(gna_priv), "buffer->offset = %llu for handle %u in score config\n",
 				buffer->gna.offset, buffer->gna.handle);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto err_zero_patch_user_ptr;   /* not a bare return: the buffers before this one hold references */
 		}
 
+		cond_resched();   /* the duplicate check is quadratic in a count the client chooses */
 		for (j = 0; j < i; j++) {
 			if (buffer_list[j].gna.handle == handle) {
 				dev_dbg(gna_dev(gna_priv),
@@ -507,14 +640,6 @@ static int gna_request_fill_buffers(struct gna_request *score_request,
 				ret = -EINVAL;
 				goto err_zero_patch_user_ptr;
 			}
-		}
-
-		buffers_total_size +=
-			round_up(buffer->gna.size, PAGE_SIZE);
-		if (buffers_total_size > gna_priv->info.max_hw_mem) {
-			dev_dbg(gna_dev(gna_priv), "buffers' %p total size too big\n", buffer);
-			ret = -EINVAL;
-			goto err_zero_patch_user_ptr;
 		}
 
 		drmgemo = drm_gem_object_lookup(score_request->drm_f, handle);
@@ -536,6 +661,17 @@ static int gna_request_fill_buffers(struct gna_request *score_request,
 			dev_dbg(gna_dev(gna_priv),
 				"buffer out of bounds. mo size: %zu, buffer size:%llu\n",
 				gem_obj_size, buffer->gna.size);
+			ret = -EINVAL;
+			goto err_zero_patch_user_ptr;
+		}
+
+		/*
+		 * The page tables map every page of the object (gna_mmu_add_locked), not only buffer->gna.size of it: count
+		 * the object, or a request whose objects outgrow the tables is mapped in part and run anyway.
+		 */
+		buffers_total_size += gem_obj_size;
+		if (buffers_total_size > gna_priv->info.max_hw_mem) {
+			dev_dbg(gna_dev(gna_priv), "buffers' %p total size too big\n", buffer);
 			ret = -EINVAL;
 			goto err_zero_patch_user_ptr;
 		}
@@ -578,6 +714,7 @@ int gna_enqueue_request(struct gna_compute_cfg *compute_cfg,
 	struct gna_device *gna_priv = to_gna_device(file->minor->dev);
 	struct gna_request *score_request;
 	u64 pos_in_queue;
+	bool direct;
 	int ret;
 
 	/* a finished masked request still counts as queued until reclaimed: reclaim it first, so this one can start
@@ -602,17 +739,37 @@ int gna_enqueue_request(struct gna_compute_cfg *compute_cfg,
 		goto ERR_UNQUEUE_REQUEST;
 	}
 
+	*request_id = score_request->request_id;   /* now: once it is on the list it may be dropped before the put below */
+
+	/*
+	 * A request to start here takes the hardware BEFORE it is listed: GEM_FREE and close take requests off the list
+	 * only with the hardware held, so they cannot drop one between its listing and its start -- it lives on the
+	 * list's and this function's references alone, and would be freed on the hardware.
+	 */
+	direct = pos_in_queue == 1 && gna_hw_try_acquire(gna_priv);
+
+	/* a queued request is listed and queued under one hold of reqlist_lock: GEM_FREE and close, which take requests
+	 * off the list under it, never find one listed but not yet queued -- cancel_work_sync() would find nothing, and
+	 * the request would run (and map its objects) after they were done with it */
 	kref_get(&score_request->refcount);
 	mutex_lock(&gna_priv->reqlist_lock);
 	list_add_tail(&score_request->node, &gna_priv->request_list);
+	if (!direct)
+		gna_request_queue_locked(gna_priv, score_request);
 	mutex_unlock(&gna_priv->reqlist_lock);
 
-	if (!(pos_in_queue == 1 && gna_hw_try_acquire(gna_priv) &&
-	      gna_request_start_direct(gna_priv, score_request)))
-		queue_work(gna_priv->request_wq, &score_request->work);
+	if (direct && !gna_request_start_direct(gna_priv, score_request)) {
+		/* not started (the device could not be resumed, or a signal interrupted the mapping) and the hardware
+		 * given back: queue it instead -- unless GEM_FREE or close took it off the list in between, which leaves it
+		 * to be counted out here */
+		mutex_lock(&gna_priv->reqlist_lock);
+		if (!list_empty(&score_request->node))
+			gna_request_queue_locked(gna_priv, score_request);
+		else
+			gna_request_cancelled(gna_priv, score_request);
+		mutex_unlock(&gna_priv->reqlist_lock);
+	}
 	kref_put(&score_request->refcount, gna_request_release);
-
-	*request_id = score_request->request_id;
 
 	return 0;
 
@@ -628,4 +785,63 @@ void gna_request_release(struct kref *ref)
 	gna_request_make_zombie(score_request);
 	wake_up_interruptible_all(&score_request->waitq);
 	kfree(score_request);
+}
+
+/*
+ * The client's file is closing: drop the requests it never collected. WAIT takes a request off the list only when it
+ * completes in time, so one the client never waited for, or whose WAIT timed out, stayed there with its buffers' GEM
+ * references until the device went away ("Memory manager not clean during takedown" on unbind). No ioctl of this
+ * file can be running here.
+ */
+void gna_request_file_close(struct gna_device *gna_priv, struct drm_file *file)
+{
+	struct gna_request *req, *tmp;
+	unsigned long flags;
+	LIST_HEAD(closing);
+
+	/* one of them started from COMPUTE and still on the hardware: nobody will read it, so stop it as a timed-out
+	 * WAIT does -- before its buffers go */
+	spin_lock_irqsave(&gna_priv->direct_lock, flags);
+	req = gna_priv->direct_req;
+	if (req && req->drm_f == file)
+		gna_priv->direct_req = NULL;
+	else
+		req = NULL;
+	spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
+	if (req)
+		gna_request_complete_direct(req, true);
+
+	/* with the hardware held, a completion already under way (the interrupt, a reclaim) has finished with its
+	 * request: completions give the hardware back last (gna_request_set_done) */
+	gna_hw_acquire(gna_priv);
+	mutex_lock(&gna_priv->reqlist_lock);
+	list_for_each_entry_safe(req, tmp, &gna_priv->request_list, node) {
+		if (req->drm_f == file) {
+			list_del_init(&req->node);
+			list_add_tail(&req->reap, &closing);
+		}
+	}
+	mutex_unlock(&gna_priv->reqlist_lock);
+	gna_hw_release(gna_priv);
+
+	list_for_each_entry_safe(req, tmp, &closing, reap) {
+		list_del(&req->reap);
+		/* queued but not started: it will not run, so it is no longer queued either and its own reference is ours
+		 * to put; already running: wait for it (bounded by the worker's own hardware timeout) */
+		if (cancel_work_sync(&req->work)) {
+			gna_request_cancelled(gna_priv, req);
+			kref_put(&req->refcount, gna_request_release);
+		}
+		kref_put(&req->refcount, gna_request_release);   /* the list's reference */
+	}
+
+	/* last, after any request of this client the loop waited for has mapped them: the page tables may be kept for
+	 * its objects, pinning their pages (up to the whole 256 MiB) after it has gone -- drop them, the next request
+	 * maps its own */
+	gna_hw_acquire(gna_priv);
+	/* not after remove: devres has freed the descriptor the tables hang off (gna_remove() dropped them already).
+	 * Checked with the hardware held: remove marks the device unplugged before it waits for the hardware. */
+	if (!drm_dev_is_unplugged(&gna_priv->drm))
+		gna_mmu_release(gna_priv);
+	gna_hw_release(gna_priv);
 }

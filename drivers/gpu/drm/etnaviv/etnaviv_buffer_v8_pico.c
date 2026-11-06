@@ -346,6 +346,16 @@ void etnaviv_buffer_queue_v8_pico(struct etnaviv_gpu *gpu, u32 exec_state,
 		fe_event = !has_nn_tp;
 
 		if (has_nn_tp) {
+			set_bit(event, &gpu->npu_pe_armed);
+			if (gpu->sched.credit_limit > 1) {
+				unsigned long flags;
+
+				/* this job owes the event one FROM_PE */
+				spin_lock_irqsave(&gpu->npu_claim_lock, flags);
+				if (gpu->npu_pe_owed[event] < U8_MAX)
+					gpu->npu_pe_owed[event]++;
+				spin_unlock_irqrestore(&gpu->npu_claim_lock, flags);
+			}
 			gpu->npu_poll_event = event;
 			/*
 			 * Proactively schedule the completion poll. conv12

@@ -131,6 +131,19 @@ static void mtk8250_dma_rx_complete(void *param)
 	uart_port_unlock_irqrestore(&up->port, flags);
 }
 
+/*
+ * The 8250 core's interrupt path calls dma->rx_dma() for an RX interrupt
+ * and defaults it to serial8250_rx_dma(), which queues its own descriptor
+ * (with its own completion) on the RX channel this driver already keeps
+ * running from mtk8250_rx_dma(); a later RX timeout then makes the core
+ * terminate the channel, and this driver's RX loop is gone. RX DMA is
+ * owned here: tell the core it is running and leave the channel alone.
+ */
+static int mtk8250_rx_dma_owned(struct uart_8250_port *up)
+{
+	return 0;
+}
+
 static void mtk8250_rx_dma(struct uart_8250_port *up)
 {
 	struct uart_8250_dma *dma = up->dma;
@@ -175,6 +188,16 @@ static void mtk8250_dma_enable(struct uart_8250_port *up)
 	serial_out(up, UART_LCR, UART_LCR_CONF_MODE_B);
 	serial_out(up, MTK_UART_EFR, UART_EFR_ECB);
 	serial_out(up, UART_LCR, lcr);
+
+	/*
+	 * RX now goes through the DMA channel, which raises its own
+	 * completions. Leave the UART's RX data and line-status interrupts
+	 * off: the 8250 core answers them by reading the FIFO with PIO
+	 * (serial8250_rx_chars), taking bytes out from under the DMA stream.
+	 * up->ier is written to the port by serial8250_do_set_termios().
+	 */
+	up->ier &= ~(UART_IER_RLSI | UART_IER_RDI);
+	serial_out(up, UART_IER, up->ier);
 
 	if (dmaengine_slave_config(dma->rxchan, &dma->rxconf) != 0)
 		pr_err("failed to configure rx dma channel\n");
@@ -506,6 +529,8 @@ static int mtk8250_probe_of(struct platform_device *pdev, struct uart_port *p,
 			return -ENOMEM;
 
 		data->dma->fn = mtk8250_dma_filter;
+		/* RX DMA is driven by mtk8250_rx_dma() alone (see the hook) */
+		data->dma->rx_dma = mtk8250_rx_dma_owned;
 		data->dma->rx_size = MTK_UART_RX_SIZE;
 		data->dma->rxconf.src_maxburst = MTK_UART_RX_TRIGGER;
 		data->dma->txconf.dst_maxburst = MTK_UART_TX_TRIGGER;

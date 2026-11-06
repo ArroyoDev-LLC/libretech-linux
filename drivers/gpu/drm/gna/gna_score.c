@@ -89,6 +89,7 @@ static int gna_patch_memory(struct gna_device *gna_priv, struct gna_buffer_with_
 
 	kvfree((void *)(uintptr_t)gnab->patches_ptr);
 	gnab->patches_ptr = 0;
+	gnab->patch_count = 0;   /* applied: a request scored again (gna_request_start_direct's retry) skips them */
 	drm_gem_vunmap(&drmshmemo->base, &vmap);
 	return ret;
 }
@@ -101,10 +102,11 @@ static struct gna_buffer_with_object *gna_find_buffer(struct gna_buffer_with_obj
 	u32 offset;
 	u32 i;
 
+	/* the device address space as gna_mmu_add_locked() lays it out: each object's every page, in order */
 	offset = 0;
 	for (i = 0; i < buffer_count; i++) {
 		buffer = buffer_list + i;
-		memory_size = round_up(buffer->gna.size, PAGE_SIZE);
+		memory_size = buffer->gem->base.base.size;
 		if (mmu_offset < offset + memory_size) {
 			*memory_offset = offset;
 			return buffer;
@@ -135,6 +137,14 @@ static int gna_copy_gmm_config(struct gna_device *gna_priv,
 	if (!buffer)
 		return -EINVAL;
 
+	/*
+	 * The descriptor must lie inside the buffer, not only start in it: gna_find_buffer() matches an offset anywhere
+	 * in the buffer's page-rounded span, so an offset in its last bytes read past the end of the object's vmap.
+	 */
+	if (mmu_offset - memory_offset > buffer->gna.size ||
+	    buffer->gna.size - (mmu_offset - memory_offset) < sizeof(struct gna_xnn_descriptor))
+		return -EINVAL;
+
 	drmgemo = &buffer->gem->base.base;
 
 	ret = drm_gem_vmap(drmgemo, &vmap);
@@ -156,6 +166,7 @@ int gna_score(struct gna_request *score_request)
 	struct gna_compute_cfg *compute_cfg;
 	struct gna_device *gna_priv;
 	struct gna_mmu_object *mmu;
+	unsigned long flags;
 	u64 buffer_count;
 	u32 desc_base;
 	int ret;
@@ -163,7 +174,7 @@ int gna_score(struct gna_request *score_request)
 
 	ret = 0;
 
-	gna_priv = to_gna_device(score_request->drm_f->minor->dev);
+	gna_priv = score_request->gna_priv;   /* the worker may run after the client closed its file */
 
 	mmu = &gna_priv->mmu;
 	xnn_config = &mmu->hwdesc->xnn_config;
@@ -209,7 +220,15 @@ int gna_score(struct gna_request *score_request)
 		if (ret)
 			goto err;
 	}
+	/*
+	 * START and hw_started together, under direct_lock: until START, STS still carries the previous request's
+	 * completion (a clean finish clears only the saturation bit), so everything that reads STS for this request --
+	 * the interrupt, a reclaim, a timed-out WAIT -- does so only once hw_started is set, and so only after START.
+	 */
+	spin_lock_irqsave(&gna_priv->direct_lock, flags);
 	gna_start_scoring(gna_priv, compute_cfg, !score_request->polled);
+	score_request->hw_started = true;
+	spin_unlock_irqrestore(&gna_priv->direct_lock, flags);
 
 err:
 	return ret;
